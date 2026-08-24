@@ -626,14 +626,116 @@ def gen_encoder(sd, scales):
           f"(signal {sig:.4f}, snr {20 * np.log10(sig / max(err, 1e-9)):.1f} dB)")
 
 
+# --- microphone + mel frontend tapes -----------------------------------------
+
+CMD_MEL = 23
+CMD_MELNORM = 24
+CMD_RECORD = 25
+
+
+def mel_tables():
+    """Hann window, DFT cosine table, and whisper's mel filterbank."""
+    import whisper
+    import torch
+
+    n = np.arange(400, dtype=np.float32)
+    hann = (0.5 * (1 - np.cos(2 * np.pi * n / 400))).astype(np.float32)
+    cos_tab = np.cos(2 * np.pi * n / 400).astype(np.float32)
+    filt = whisper.audio.mel_filters(torch.device("cpu"), 80).numpy()
+    return hann, cos_tab, filt.astype(np.float32)  # filt [80, 201]
+
+
+def mel_mirror(pcm_i16, n_frames, hann, cos_tab, filt):
+    """Numpy mirror of firmware mel.rs (table DFT, reflect pad, log10)."""
+    x = pcm_i16.astype(np.float32) / 32768.0
+    n = len(x)
+    frames = np.empty((n_frames, 400), np.float32)
+    for t in range(n_frames):
+        idx = np.arange(t * 160 - 200, t * 160 + 200)
+        idx = np.abs(idx)
+        idx = np.where(idx >= n, 2 * n - 2 - idx, idx)
+        frames[t] = x[idx] * hann
+    k = np.arange(201)[:, None] * np.arange(400)[None, :] % 400
+    re = frames @ cos_tab[k].T
+    im = -frames @ cos_tab[(k + 300) % 400].T
+    power = (re * re + im * im).astype(np.float32)  # [T, 201]
+    mel = power @ filt.T  # [T, 80]
+    return np.log10(np.maximum(mel, 1e-10)).T.astype(np.float32)  # [80, T]
+
+
+def gen_mel(sd, scales):
+    """Half a second of the JFK clip through the on-device mel frontend,
+    checked against the numpy mirror; also reports mirror-vs-whisper error."""
+    t = Tape(os.path.join(common.OUT, "tape-mel"))
+    ref = np.load(os.path.join(common.OUT, "ref.npz"))
+    pcm = np.clip(np.round(ref["audio"][:8000] * 32768), -32768, 32767
+                  ).astype(np.int16)
+    n_frames, chunk = 50, 25
+    hann, cos_tab, filt = mel_tables()
+    in_q = Submodel("wconv1").in_q
+
+    g_mel = mel_mirror(pcm, n_frames, hann, cos_tab, filt)  # [80, 50]
+    # offline sanity: the mirror vs whisper's torch stft pipeline
+    import whisper
+    import torch
+    wm = whisper.log_mel_spectrogram(
+        torch.from_numpy(pcm.astype(np.float32) / 32768.0)).numpy()
+    print(f"mirror vs whisper (post-norm): "
+          f"{np.abs(((np.maximum(g_mel, g_mel.max() - 8) + 4) / 4) - wm[:, :n_frames]).max():.5f}")
+
+    mx = np.float32(g_mel.max())
+    g_i8 = common.quantize((np.maximum(g_mel, mx - 8) + 4) / 4,
+                           in_q[0], in_q[1])
+
+    a_pcm = t.write("pcm.bin", pcm.tobytes())
+    a_hann = t.write("hann.bin", hann.tobytes())
+    a_cos = t.write("cos.bin", cos_tab.tobytes())
+    a_filt = t.write("filt.bin", np.ascontiguousarray(filt).tobytes())
+    a_max = t.write("max0.bin", struct.pack("<f", -1e30))
+    a_out = t.alloc(80 * n_frames * 4)
+    for ci in range(n_frames // chunk):
+        params = struct.pack("<9I", a_pcm, len(pcm), ci * chunk, chunk,
+                             a_hann, a_cos, a_filt,
+                             a_out + ci * 80 * chunk * 4, a_max)
+        a_p = t.write(f"mel_c{ci}_p.bin", params)
+        t.cmd(CMD_MEL, [a_p])
+        # no f32 check (the checker is integer-typed); the int8 result
+        # below covers the whole chain
+    a_i8 = t.alloc(80 * chunk)
+    for ci in range(n_frames // chunk):
+        params = struct.pack("<4I", a_out + ci * 80 * chunk * 4,
+                             80 * chunk, a_max, a_i8) \
+            + pack_quant(*in_q)
+        a_p = t.write(f"norm_c{ci}_p.bin", params)
+        t.cmd(CMD_MELNORM, [a_p])
+        t.check(f"norm_c{ci}_exp.bin",
+                np.ascontiguousarray(
+                    g_i8[:, ci * chunk:(ci + 1) * chunk]).tobytes(),
+                a_i8, f"melnorm[{ci}]", tol=1)
+    t.save()
+
+
+def gen_mic(sd, scales):
+    """Record one second from the PDM mic and pull it back as raw PCM."""
+    t = Tape(os.path.join(common.OUT, "tape-mic"))
+    t.steps.append({"op": "cmd", "code": CMD_RECORD,
+                    "args": [ARENA_BASE, 16000]})
+    t.steps.append({"op": "read", "file": "mic.pcm", "addr": ARENA_BASE,
+                    "len": 32000})
+    t.save()
+    print("after the run: python -c \"import numpy as np,soundfile as sf; "
+          "sf.write('mic.wav', np.fromfile('out/tape-mic/mic.pcm', "
+          "np.int16)/32768.0, 16000)\"")
+
+
 def main():
     _, sd = common.load_weights()
     with open(os.path.join(common.OUT, "scales.json")) as f:
         scales = {k: (v["scale"], v["zp"], v["bits"])
                   for k, v in json.load(f).items()}
     which = sys.argv[1] if len(sys.argv) > 1 else "block0"
-    {"ln1q": gen_ln1q, "block0": gen_block0,
-     "encoder": gen_encoder}[which](sd, scales)
+    {"ln1q": gen_ln1q, "block0": gen_block0, "encoder": gen_encoder,
+     "mel": gen_mel, "mic": gen_mic}[which](sd, scales)
 
 
 if __name__ == "__main__":

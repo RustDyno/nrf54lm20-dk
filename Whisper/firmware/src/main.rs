@@ -22,6 +22,9 @@ use rtt_target::{rprintln, rtt_init, ChannelMode};
 mod bindings;
 mod kernels;
 mod libm_shims;
+mod mel;
+#[allow(dead_code)]
+mod pdm;
 mod platform;
 mod sd;
 mod slot;
@@ -170,6 +173,9 @@ const CMD_FC2SUM: u32 = 13; // args: param block addr (Fc2SumParams)
 const CMD_SD_INIT: u32 = 20;
 const CMD_SD_READ: u32 = 21; // args: lba, dst addr, block count
 const CMD_SD_WRITE: u32 = 22; // args: lba, src addr, block count
+const CMD_MEL: u32 = 23; // args: param block addr (mel::MelParams)
+const CMD_MELNORM: u32 = 24; // args: param block addr (mel::MelNormParams)
+const CMD_RECORD: u32 = 25; // args: dst addr, sample count (16 kHz i16 mono)
 
 /// Host-written parameter block for CMD_LN (all addresses absolute).
 /// Layout is channel-planar: src is i16[ch][w], dst i8[ch][w].
@@ -397,6 +403,18 @@ unsafe fn dispatch(cmd: u32, a: &[u32; 8]) -> i32 {
             let _wd = WdogGuard::arm();
             sd::write_blocks(a[0], a[1] as *const u8, a[2])
         }
+        CMD_MEL => {
+            let _wd = WdogGuard::arm();
+            mel::mel_frames(&*(a[0] as *const mel::MelParams));
+            0
+        }
+        CMD_MELNORM => {
+            mel::mel_normalize(&*(a[0] as *const mel::MelNormParams));
+            0
+        }
+        // Recording runs longer than the watchdog budget; the PDM stream is
+        // hardware-validated (KWS) and self-limiting, so it is not armed.
+        CMD_RECORD => record(a[0] as *mut i16, a[1] as usize),
         CMD_LOGITS_MAX => {
             kernels::logits_max(
                 sl(a[0], a[3]),
@@ -408,6 +426,37 @@ unsafe fn dispatch(cmd: u32, a: &[u32; 8]) -> i32 {
         }
         _ => -100,
     }
+}
+
+// PDM mic (same pins the KWS project validated on this DK).
+const MIC_CLK: pdm::Pin = pdm::Pin { port: 1, pin: 23 };
+const MIC_DIN: pdm::Pin = pdm::Pin { port: 1, pin: 24 };
+
+// One PDM hop = 20 ms; ping-pong pair for the record command.
+#[repr(C, align(4))]
+struct PdmBuf([i16; 320]);
+static mut PDM_BUF0: PdmBuf = PdmBuf([0; 320]);
+static mut PDM_BUF1: PdmBuf = PdmBuf([0; 320]);
+
+/// Record `n` 16 kHz samples into `dst` (blocking). Returns overrun count.
+unsafe fn record(dst: *mut i16, n: usize) -> i32 {
+    let b0 = &mut (*core::ptr::addr_of_mut!(PDM_BUF0)).0;
+    let b1 = &mut (*core::ptr::addr_of_mut!(PDM_BUF1)).0;
+    let mut stream = pdm::Pdm::init(MIC_CLK, MIC_DIN).start(b0, b1);
+    // Drop the first hop: the very first session after flashing counts one
+    // startup overrun (KWS finding) and the mic's DC settle lands there too.
+    stream.next_buffer();
+    stream.overruns = 0;
+    let mut written = 0usize;
+    while written < n {
+        let hop = stream.next_buffer();
+        let take = hop.len().min(n - written);
+        core::ptr::copy_nonoverlapping(hop.as_ptr(), dst.add(written), take);
+        written += take;
+    }
+    let overruns = stream.overruns;
+    stream.stop();
+    overruns as i32
 }
 
 #[entry]
