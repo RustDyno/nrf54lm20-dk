@@ -12,7 +12,7 @@
 //! image builder and `Plan::load` are ONE contract: same field order.
 
 use crate::kernels::{self, Quant};
-use crate::{mel, pdm, sd, slot};
+use crate::{display, mel, pdm, sd, slot};
 use rtt_target::{rprint, rprintln};
 
 const C: usize = 384;
@@ -391,10 +391,16 @@ fn lut_apply(lut_off: usize, buf_off: usize, len: usize) {
 // --- entry ------------------------------------------------------------------------
 
 pub fn run() -> ! {
+    // Optional transcript display; every display call no-ops when absent.
+    if display::init() {
+        rprintln!("standalone: OLED found");
+        display::print("Whisper standalone\n");
+    }
     rprintln!("standalone: SD init");
     let rc = sd::init();
     if rc != 0 {
         rprintln!("standalone: no SD ({}), staying in mailbox mode", rc);
+        display::print("no SD card\n");
         crate::mailbox_loop();
     }
     unsafe {
@@ -402,6 +408,7 @@ pub fn run() -> ! {
         let idx = &*core::ptr::addr_of!(INDEX);
         if rc != 0 || &idx[..8] != IMG_MAGIC {
             rprintln!("standalone: no image (rc={}), staying in mailbox mode", rc);
+            display::print("no card image\n");
             crate::mailbox_loop();
         }
     }
@@ -409,6 +416,7 @@ pub fn run() -> ! {
         Ok(p) => p,
         Err(rc) => {
             rprintln!("standalone: bad plan ({}), staying in mailbox mode", rc);
+            display::print("bad card plan\n");
             crate::mailbox_loop();
         }
     };
@@ -417,6 +425,7 @@ pub fn run() -> ! {
         let mut ctx = Ctxt { scratch: plan.scratch, loaded: Entry::default() };
         if utterance(&plan, &mut ctx).is_err() {
             rprintln!("(utterance aborted; retrying in a moment)");
+            display::print("(retry)\n");
             cortex_m::asm::delay(128_000_000);
         }
     }
@@ -428,6 +437,8 @@ static mut STREAM_MEL_OK: bool = true;
 fn utterance(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     rprintln!("");
     rprintln!("=== speak now (12 s) ===");
+    display::clear();
+    display::print("== speak now (12 s)\n");
     if unsafe { STREAM_MEL_OK } {
         // mel pass 1 overlaps the recording (chunk-sized PDM buffers); an
         // overrun means the M33 could not keep up -- lost audio, so abort
@@ -450,10 +461,12 @@ fn utterance(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     }
     mel_pass2(plan, c)?;
     rprintln!("encoder...");
+    display::print("encoding...\n");
     encoder(plan, c)?;
     rprintln!("cross K/V...");
     cross_kv(plan, c)?;
     rprintln!("decoding...");
+    display::print("decoding:\n");
     decode(plan, c)
 }
 
@@ -1111,6 +1124,7 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         if best == plan.eot {
             rprintln!("");
             rprintln!("=== done ({} tokens) ===", printed);
+            display::print("\n== done\n");
             return Ok(());
         }
         print_token(vtb, kept_position(ids, best)?)?;
@@ -1119,6 +1133,7 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         if n_tok >= MAX_TOKENS {
             rprintln!("");
             rprintln!("=== token budget reached ===");
+            display::print("\n== token budget\n");
             return Ok(());
         }
     }
@@ -1260,6 +1275,7 @@ fn print_token(vtb: Entry, kept_pos: usize) -> Result<(), i32> {
     try_rc!(sd_read_bytes(vtb, base + o0, &mut sbuf[..len]), "vtb s");
     if let Ok(s) = core::str::from_utf8(&sbuf[..len]) {
         rprint!("{}", s);
+        display::print(s);
     }
     Ok(())
 }

@@ -21,6 +21,7 @@ use rtt_target::{rprintln, rtt_init, ChannelMode};
 
 mod app;
 mod bindings;
+mod display;
 mod kernels;
 mod libm_shims;
 mod mel;

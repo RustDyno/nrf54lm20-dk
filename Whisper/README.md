@@ -56,6 +56,9 @@ attn matmuls, argmax]
       SLOT[weight slot RAM]
       IL[interlayer buffer]
     end
+    OLED[SSD1306 OLED
+TWIM22, optional]
+    EXEC -->|transcript| OLED
     subgraph axon [Axon NPU]
       DRV[Nordic driver blob]
       ENG[cmd-buffer engine]
@@ -133,6 +136,10 @@ activations| ORCH
       bit-exact vs the sequential pass, which stays as an automatic
       fallback if the M33 ever falls behind the mic). Expected effect:
       ~10 min -> ~3 min per utterance, decode ~18 -> ~5 s/token.
+- [x] OPTIONAL OLED (built blind): an SSD1306 128x64 on TWIM22 (the
+      serial box and P3 pins the SD card vacated) shows status and the
+      transcript token by token in standalone mode. Probed at boot;
+      absent hardware degrades to RTT-only output.
 
 ## Testing the standalone build (when the SD breakout is wired)
 
@@ -145,6 +152,9 @@ activations| ORCH
    the pin headers (by default the analog switches connect them to the
    on-board NOR flash), and set VDD:nRF to 3.3 V (SD cards need 2.7 V+;
    the default is 1.8 V).
+   OPTIONAL: an SSD1306 128x64 I2C OLED shows the live transcript
+   (probed at boot; everything works without it):
+       SCL -> P3.03 (P17 pin 14)   SDA -> P3.02 (P17 pin 13)
 2. Write the image (44 MB) with a USB reader:
        sudo dd if=model/out/sd.img of=/dev/sdX bs=4M conv=fsync
 3. SD smoke test (round-trip + image magic):
