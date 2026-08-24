@@ -7,7 +7,7 @@ target = "thumbv8m.main-none-eabihf"
 rustflags = ["-C", "link-arg=-Tlink.x"]
 # probe-rs ships no nRF54LM20B target, so we supply one (cloned from its A
 # definition, which is what physically flashes this DK). See targets/.
-runner = "probe-rs run --chip nRF54LM20B --chip-description-path targets/nRF54LM20B.yaml"
+runner = "probe-rs run --disable-double-buffering --chip nRF54LM20B --chip-description-path targets/nRF54LM20B.yaml"
 
 # bindgen needs libclang. The system one (llvm-18) rather than the esp toolchain's.
 [env]

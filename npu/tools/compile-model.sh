@@ -78,12 +78,20 @@ yaml_path="$work_dir/${model_name}.yaml"
 	[[ -n "$psum" ]] && echo "  psum_buffer_size: ${psum}"
 } >"$yaml_path"
 
-echo "==> Building Axon Compiler image with ${engine}"
-( cd "$compiler_dir" && "$engine" build -t "$container_image_name" ./ \
-	--build-arg compiler_root="$compiler_root_dir" \
-	--build-arg yaml_file="${model_name}.yaml" \
-	--build-arg root_dir="$executor_root_dir" \
-	--build-arg work_dir="$executor_work_dir" )
+# Build the image only when missing (or REBUILD=1). The Dockerfile echoes its
+# build args in RUN layers, so passing per-model values (as this script once
+# did with yaml_file) busts the layer cache and re-runs the whole pip install
+# (~9 min); the yaml is supplied at run time anyway, so use a constant.
+if [[ "${REBUILD:-0}" == "1" ]] || ! "$engine" image exists "$container_image_name" 2>/dev/null; then
+	echo "==> Building Axon Compiler image with ${engine}"
+	( cd "$compiler_dir" && "$engine" build -t "$container_image_name" ./ \
+		--build-arg compiler_root="$compiler_root_dir" \
+		--build-arg yaml_file="input.yaml" \
+		--build-arg root_dir="$executor_root_dir" \
+		--build-arg work_dir="$executor_work_dir" )
+else
+	echo "==> Reusing Axon Compiler image (REBUILD=1 to force)"
+fi
 
 # The container reads the yaml and writes the generated header into the mounted
 # workspace. For rootless podman, keep the host uid and relabel the volume so the
