@@ -469,6 +469,13 @@ const OSC_PLL_FREQ: *mut u32 = 0x5012_0800 as *mut u32;
 const OSC_PLL_CURRENTFREQ: *const u32 = 0x5012_0804 as *const u32;
 const PLL_CK128M: u32 = 1;
 
+// The instruction cache (ICACHE, PPB region) is DISABLED at reset; without
+// it every taken branch refetches from RRAM through fixed wait states.
+// Measured on this loop-heavy firmware: ~16 CPU cycles per 2-instruction
+// delay iteration, i.e. code ran ~5x slower than the core clock suggests.
+const ICACHE_TASKS_INVALIDATE: *mut u32 = 0xE008_2008 as *mut u32;
+const ICACHE_ENABLE: *mut u32 = 0xE008_2404 as *mut u32;
+
 #[entry]
 fn main() -> ! {
     unsafe {
@@ -478,6 +485,10 @@ fn main() -> ! {
                 break;
             }
         }
+        core::ptr::write_volatile(ICACHE_TASKS_INVALIDATE, 1);
+        cortex_m::asm::delay(64);
+        core::ptr::write_volatile(ICACHE_ENABLE, 1);
+        cortex_m::asm::isb();
     }
     let channels = rtt_init! {
         up: {
