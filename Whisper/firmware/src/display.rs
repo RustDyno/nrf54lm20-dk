@@ -75,8 +75,10 @@ fn twi_write(addr: u32, buf: &[u8]) -> bool {
         write_volatile(twim(TX_PTR), buf.as_ptr() as u32);
         write_volatile(twim(TX_MAXCNT), buf.len() as u32);
         write_volatile(twim(TASKS_TX_START), 1);
+        // Generous vs the longest frame (129 B at 400 kHz = 3.3 ms), tiny
+        // vs the boot budget when the bus is stuck.
         let mut ok = false;
-        for _ in 0..4_000_000u32 {
+        for _ in 0..1_000_000u32 {
             if read_volatile(twim(EVENTS_ERROR)) != 0 {
                 break;
             }
@@ -87,7 +89,7 @@ fn twi_write(addr: u32, buf: &[u8]) -> bool {
         }
         write_volatile(twim(TASKS_STOP), 1);
         let mut stopped = false;
-        for _ in 0..4_000_000u32 {
+        for _ in 0..1_000_000u32 {
             if read_volatile(twim(EVENTS_STOPPED)) != 0 {
                 stopped = true;
                 break;
@@ -134,8 +136,9 @@ pub fn init() -> bool {
         if !cmd(&[0xAE]) {
             ADDR7 = 0x3D;
             if !cmd(&[0xAE]) {
+                // Leave TWIM enabled: erratum [105] wedges the peripheral
+                // if it is disabled while a target stretches the clock.
                 PRESENT = false;
-                write_volatile(twim(ENABLE), 0);
                 return false;
             }
         }

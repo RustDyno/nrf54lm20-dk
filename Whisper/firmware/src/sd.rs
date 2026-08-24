@@ -30,11 +30,19 @@ const HSPAD_BASE: usize = 0x5005_0400; // GPIOHSPADCTRL overlays the P2 block
 
 // SPIM register offsets (SVD: GLOBAL_SPIM00, all instances share the map).
 const TASKS_START: usize = 0x000;
+const EVENTS_STARTED: usize = 0x100;
 const EVENTS_END: usize = 0x108;
 const ENABLE: usize = 0x500;
 const PRESCALER: usize = 0x52C;
 const CONFIG: usize = 0x554;
+const IFTIMING_CSNDUR: usize = 0x5B0;
 const ORC: usize = 0x5C0;
+// Erratum [8] "SPIM: Wrong data is transmitted on MOSI" (Engineering B):
+// with CPHA=0 and PRESCALER > 2 (always true on SPIM00, minimum 4), a
+// first transmitted bit of 1 corrupts the data. Workaround per the errata
+// doc: CSNDUR >= PRESCALER/2 + 1, write 0x82 to offset 0xC84 before each
+// START, and 0x00 back once STARTED has fired.
+const ERRATA8_REG: usize = 0xC84;
 const PSEL_SCK: usize = 0x600;
 const PSEL_MOSI: usize = 0x604;
 const PSEL_MISO: usize = 0x608;
@@ -135,8 +143,12 @@ fn xfer(tx: &[u8], rx: &mut [u8]) {
         write_volatile(spim(TX_MAXCNT), tx.len() as u32);
         write_volatile(spim(RX_PTR), rx.as_mut_ptr() as u32);
         write_volatile(spim(RX_MAXCNT), rx.len() as u32);
+        write_volatile(spim(EVENTS_STARTED), 0);
         write_volatile(spim(EVENTS_END), 0);
+        write_volatile(spim(ERRATA8_REG), 0x82);
         write_volatile(spim(TASKS_START), 1);
+        while read_volatile(spim(EVENTS_STARTED)) == 0 {}
+        write_volatile(spim(ERRATA8_REG), 0x00);
         while read_volatile(spim(EVENTS_END)) == 0 {}
     }
 }
@@ -275,6 +287,7 @@ pub fn init() -> i32 {
         write_volatile(spim(CONFIG), 0); // mode 0, MSB first
         write_volatile(spim(ORC), 0xFF);
         write_volatile(spim(PRESCALER), DIV_FAST);
+        write_volatile(spim(IFTIMING_CSNDUR), DIV_FAST / 2 + 1); // erratum [8]
         write_volatile(spim(ENABLE), 7);
         BITBANG = false;
     }

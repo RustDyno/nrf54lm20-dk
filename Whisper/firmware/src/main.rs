@@ -461,8 +461,24 @@ unsafe fn record(dst: *mut i16, n: usize) -> i32 {
     overruns as i32
 }
 
+// OSCILLATORS.PLL.FREQ selects the MCU-domain (CPU) clock: the device
+// BOOTS AT 64 MHz (datasheet 5.5.3) and must be switched to 128 MHz when
+// the CPU starts, before any high-frequency peripheral is enabled. Found
+// the hard way: the 3 s host-grace window took 48 s on hardware.
+const OSC_PLL_FREQ: *mut u32 = 0x5012_0800 as *mut u32;
+const OSC_PLL_CURRENTFREQ: *const u32 = 0x5012_0804 as *const u32;
+const PLL_CK128M: u32 = 1;
+
 #[entry]
 fn main() -> ! {
+    unsafe {
+        core::ptr::write_volatile(OSC_PLL_FREQ, PLL_CK128M);
+        for _ in 0..1_000_000 {
+            if core::ptr::read_volatile(OSC_PLL_CURRENTFREQ) == PLL_CK128M {
+                break;
+            }
+        }
+    }
     let channels = rtt_init! {
         up: {
             0: {
