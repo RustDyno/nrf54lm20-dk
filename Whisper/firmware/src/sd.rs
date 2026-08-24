@@ -78,8 +78,16 @@ const PORT: u32 = 2;
 
 const DIV_FAST: u32 = 4; // 128 MHz / 4 = 32 MHz
 
-// Bit-bang half period for card init: 256 cycles at 128 MHz = 2 us -> 250 kHz.
+// Bit-bang half period for card init: 256 cycles at 128 MHz = 2 us ->
+// 250 kHz, timed with the DWT cycle counter (asm::delay pacing varies
+// with instruction fetch behavior; DWT is exact).
 const BB_HALF_CYCLES: u32 = 256;
+
+#[inline]
+fn dwt_delay(cycles: u32) {
+    let start = cortex_m::peripheral::DWT::cycle_count();
+    while cortex_m::peripheral::DWT::cycle_count().wrapping_sub(start) < cycles {}
+}
 
 pub const BLOCK: usize = 512;
 
@@ -113,12 +121,12 @@ fn bb_byte(tx: u8) -> u8 {
                 gpio(if tx & (1 << bit) != 0 { OUTSET } else { OUTCLR }),
                 1 << PIN_MOSI,
             );
-            cortex_m::asm::delay(BB_HALF_CYCLES);
+            dwt_delay(BB_HALF_CYCLES);
             write_volatile(gpio(OUTSET), 1 << PIN_SCK);
             if read_volatile(gpio(IN)) & (1 << PIN_MISO) != 0 {
                 rx |= 1 << bit;
             }
-            cortex_m::asm::delay(BB_HALF_CYCLES);
+            dwt_delay(BB_HALF_CYCLES);
             write_volatile(gpio(OUTCLR), 1 << PIN_SCK);
         }
     }
@@ -302,6 +310,52 @@ pub fn init() -> i32 {
         BITBANG = false;
     }
     0
+}
+
+/// Wiring diagnostic for a failed init: holds each driven line at
+/// DMM-visible static levels (measure at the CARD SOCKET pads, not the
+/// header, to test the whole path), exercises MISO's pulls, and runs a
+/// MOSI->MISO loopback probe (jumper the two at the breakout, card out,
+/// to prove the full digital path both ways). Assumes init() already
+/// configured the pins; leaves them in the idle state.
+pub fn diag(cycles: u32) {
+    use rtt_target::rprintln;
+    const SEC: u32 = 128_000_000; // 1 s of DWT cycles at 128 MHz
+    unsafe { BITBANG = true };
+    for c in 0..cycles {
+        rprintln!("sd diag {}/{} (measure at the card socket pads):", c + 1, cycles);
+        for (name, pin, idle_high) in [
+            ("SCK  P2.01", PIN_SCK, false),
+            ("MOSI P2.02", PIN_MOSI, true),
+            ("CS   P2.05", PIN_CS, true),
+        ] {
+            rprintln!("  {} LOW for 3 s...", name);
+            unsafe { write_volatile(gpio(OUTCLR), 1 << pin) };
+            dwt_delay(3 * SEC);
+            rprintln!("  {} HIGH for 3 s...", name);
+            unsafe { write_volatile(gpio(OUTSET), 1 << pin) };
+            dwt_delay(3 * SEC);
+            if !idle_high {
+                unsafe { write_volatile(gpio(OUTCLR), 1 << pin) };
+            }
+        }
+        rprintln!("  MISO P2.04 pull-DOWN for 3 s (expect ~0 V)...");
+        unsafe {
+            write_volatile(gpio(PIN_CNF + 4 * PIN_MISO as usize), 0x4);
+        }
+        dwt_delay(3 * SEC);
+        unsafe {
+            write_volatile(gpio(PIN_CNF + 4 * PIN_MISO as usize), CNF_IN_PULLUP);
+        }
+        rprintln!("  MISO pull-up restored (expect ~3.3 V)");
+        let mut ok = 0;
+        for &b in &[0xA5u8, 0x3C, 0x0F, 0x81] {
+            if bb_byte(b) == b {
+                ok += 1;
+            }
+        }
+        rprintln!("  MOSI->MISO loopback (needs jumper, card out): {}/4", ok);
+    }
 }
 
 /// Read `count` 512-byte blocks starting at `lba` into `dst` (CMD18).

@@ -401,6 +401,7 @@ pub fn run() -> ! {
     if rc != 0 {
         rprintln!("standalone: no SD ({}), staying in mailbox mode", rc);
         display::print("no SD card\n");
+        sd::diag(2);
         crate::mailbox_loop();
     }
     unsafe {
