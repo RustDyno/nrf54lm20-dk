@@ -22,11 +22,13 @@ use probe_rs::rtt::{Rtt, ScanRegion};
 use probe_rs::{flashing, Core, MemoryInterface, Permissions, Session};
 use serde::Deserialize;
 
+mod decode;
+
 const CHIP: &str = "nRF54LM20B";
 const CHIP_DESCRIPTION: &str = include_str!("../../firmware/targets/nRF54LM20B.yaml");
 
 /// Must match firmware/src/slot.rs and firmware/memory.x.
-const SLOT_BASE: u64 = 0x2004_B000;
+pub(crate) const SLOT_BASE: u64 = 0x2004_B000;
 const MAILBOX_MAGIC: u32 = 0x4C41_5952;
 
 // Mailbox field offsets (repr(C) in firmware/src/main.rs).
@@ -37,16 +39,16 @@ const MB_ARGS: u64 = 12;
 const MB_ACK_SEQ: u64 = 44;
 const MB_STATUS: u64 = 48;
 
-const CMD_PING: u32 = 1;
-const CMD_RUN_NPU: u32 = 2;
+pub(crate) const CMD_PING: u32 = 1;
+pub(crate) const CMD_RUN_NPU: u32 = 2;
 
-struct Mailbox {
-    base: u64,
-    seq: u32,
+pub(crate) struct Mailbox {
+    pub base: u64,
+    pub seq: u32,
 }
 
 impl Mailbox {
-    fn call(&mut self, core: &mut Core, cmd: u32, args: &[u32]) -> Result<i32> {
+    pub(crate) fn call(&mut self, core: &mut Core, cmd: u32, args: &[u32]) -> Result<i32> {
         let mut a = [0u32; 8];
         a[..args.len()].copy_from_slice(args);
         core.write_32(self.base + MB_ARGS, &a)?;
@@ -68,7 +70,7 @@ impl Mailbox {
 }
 
 /// Flash the firmware, reset, wait for the mailbox to come up.
-fn setup(elf: &str) -> Result<(Session, u64, Option<u64>)> {
+pub(crate) fn setup(elf: &str) -> Result<(Session, u64, Option<u64>)> {
     let elf_data = std::fs::read(elf).context("reading firmware ELF")?;
     let elf_obj = object::File::parse(&*elf_data).context("parsing ELF")?;
     let sym = |name: &str| -> Option<u64> {
@@ -155,10 +157,12 @@ fn main() -> Result<()> {
             selftest(&args[1], &args[2], &args[3], &args[4])
         }
         Some("tape") if args.len() == 3 => tape(&args[1], &args[2]),
+        Some("decode") if args.len() == 4 => decode::decode(&args[1], &args[2], &args[3]),
         Some("halt") => halt_info(),
         _ => bail!(
             "usage: whisper-host selftest <firmware.elf> <blob.bin> <input.bin> <expect.bin>\n\
-             \x20      whisper-host tape <firmware.elf> <tape.json>"
+             \x20      whisper-host tape <firmware.elf> <tape.json>\n\
+             \x20      whisper-host decode <firmware.elf> <plan_dir> <blobs_dir>"
         ),
     }
 }

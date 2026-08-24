@@ -85,15 +85,23 @@ def emit(name, w, b, stride, t_in, acts, out_dir):
 
 
 def capture_acts(sd):
-    """Float-pipeline activations at every submodel input site."""
+    """Float-pipeline activations at every submodel input site: an encoder
+    pass plus a greedy decode (decoder sites accumulate one row per step;
+    exact token-suppression parity is irrelevant for calibration)."""
     import layered
 
     ref = np.load(os.path.join(common.OUT, "ref.npz"))
-    sites = ["enc.mel", "enc.gelu1"]
+    sites = ["enc.mel", "enc.gelu1", "enc.out"]
     for l in range(common.N_LAYERS):
         sites += [f"enc.b{l}.{s}" for s in ("ln1", "ctx", "ln2", "gelu")]
+        sites += [f"dec.b{l}.{s}"
+                  for s in ("ln1", "ctx", "xln", "xctx", "ln2", "gelu")]
     eng = layered.Engine(sd, "float", record=set(sites))
-    layered.encoder(eng, ref["mel_chunk"], common.AUDIO_CTX)
+    enc = layered.encoder(eng, ref["mel_chunk"], common.AUDIO_CTX)
+    suppress = np.concatenate([ref["non_speech"],
+                               np.arange(int(ref["timestamp_begin"]), 51864)])
+    layered.greedy_decode(eng, enc, list(ref["sot_sequence"]),
+                          int(ref["eot"]), suppress, ref["blank"])
     return eng.recorded
 
 
@@ -148,6 +156,43 @@ def main():
                        sd[p + "mlp.2.weight"][:, cols][:, :, None],
                        sd[p + "mlp.2.bias"] if i == 0 else None,
                        1, t, acts[f"enc.b{l}.gelu"][:, cols])
+
+    # Decoder submodels. Token-rate pieces run at width 4 (pointwise conv
+    # rejects width < 4; only column 0 is meaningful); cross K/V run over
+    # encoder frame tiles like the encoder pieces.
+    for l in range(common.N_LAYERS):
+        p = f"decoder.blocks.{l}."
+        n = common.decoder_submodel_names(l)
+        for key, w, b, site, t_in in [
+            ("q", "attn.query.weight", "attn.query.bias",
+             f"dec.b{l}.ln1", 4),
+            ("k", "attn.key.weight", None, f"dec.b{l}.ln1", 4),
+            ("v", "attn.value.weight", "attn.value.bias",
+             f"dec.b{l}.ln1", 4),
+            ("out", "attn.out.weight", "attn.out.bias",
+             f"dec.b{l}.ctx", 4),
+            ("xq", "cross_attn.query.weight", "cross_attn.query.bias",
+             f"dec.b{l}.xln", 4),
+            ("xout", "cross_attn.out.weight", "cross_attn.out.bias",
+             f"dec.b{l}.xctx", 4),
+            ("xk", "cross_attn.key.weight", None, "enc.out", t),
+            ("xv", "cross_attn.value.weight", "cross_attn.value.bias",
+             "enc.out", t),
+        ]:
+            maybe_emit(n[key], sd[p + w][:, :, None],
+                       sd[p + b] if b else None, 1, t_in, acts[site])
+        for i, part in enumerate("abcd"):
+            rows = slice(384 * i, 384 * (i + 1))
+            maybe_emit(n[f"fc1{part}"],
+                       sd[p + "mlp.0.weight"][rows][:, :, None],
+                       sd[p + "mlp.0.bias"][rows],
+                       1, 4, acts[f"dec.b{l}.ln2"])
+        for i in range(4):
+            cols = slice(384 * i, 384 * (i + 1))
+            maybe_emit(n[f"fc2p{i}"],
+                       sd[p + "mlp.2.weight"][:, cols][:, :, None],
+                       sd[p + "mlp.2.bias"] if i == 0 else None,
+                       1, 4, acts[f"dec.b{l}.gelu"][:, cols])
     print(f"-> {out_dir}")
 
 

@@ -613,6 +613,9 @@ def gen_encoder(sd, scales):
     assert out_q[2] == 8
     g_out = ln_tiled("ln_post", x16, sq, "encoder.ln_post", out_q[:2])
     t.save()
+    # The decoder (decode_model.py / the host decode driver) consumes this.
+    np.savez(os.path.join(common.OUT, "enc_out.npz"), planar=g_out,
+             scale=out_q[0], zp=out_q[1])
 
     # offline: how far is the device pipeline from the int8 simulation?
     sim = capture(sd, scales, ["enc.out"])["enc.out"]  # [600, 384] f32

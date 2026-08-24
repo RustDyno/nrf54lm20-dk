@@ -91,6 +91,16 @@ def submodel_names(l):
     return n
 
 
+def decoder_submodel_names(l):
+    """Per-block decoder Axon submodel names."""
+    n = {"q": f"d{l}q", "k": f"d{l}k", "v": f"d{l}v", "out": f"d{l}out",
+         "xq": f"d{l}xq", "xout": f"d{l}xout",
+         "xk": f"d{l}xk", "xv": f"d{l}xv"}
+    n.update({f"fc1{p}": f"d{l}fc1{p}" for p in "abcd"})
+    n.update({f"fc2p{j}": f"d{l}fc2p{j}" for j in range(4)})
+    return n
+
+
 # --- weight loading --------------------------------------------------------
 
 def load_weights():

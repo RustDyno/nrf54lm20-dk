@@ -72,11 +72,18 @@ class Engine:
 
     # --- quantization sites ------------------------------------------------
 
+    def _record(self, name, x):
+        """Accumulate rows across calls (decoder sites fire once per step)."""
+        if name in self.recorded:
+            self.recorded[name] = np.concatenate([self.recorded[name], x])
+        else:
+            self.recorded[name] = x.copy()
+
     def site(self, name, x, sym=False, bits=8):
         x = np.ascontiguousarray(x, dtype=np.float32)
         if self.mode == "float":
             if self.record is not None and name in self.record:
-                self.recorded[name] = x.copy()
+                self._record(name, x)
             return Act(x)
         if self.mode == "calib":
             lo, hi = float(x.min()), float(x.max())
@@ -88,7 +95,7 @@ class Engine:
         q = quantize(x, scale, zp, bits)
         out = Act(dequantize(q, scale, zp), scale, zp)
         if self.record is not None and name in self.record:
-            self.recorded[name] = out.x.copy()
+            self._record(name, out.x)
         return out
 
     def finish_calib(self):

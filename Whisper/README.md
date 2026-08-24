@@ -108,8 +108,17 @@ activations| ORCH
       Submodels are calibrated on REAL recorded activations (random-data
       calibration saturated block-3's fc2 and destroyed accuracy; the
       per-stage SNR ladder in tape.py is the guard).
-- [ ] M4 greedy decoder -> first on-device transcript (single-token FC
-      needs width padding to 4; logits host-side first, on-device option)
+- [x] M4: FIRST ON-DEVICE TRANSCRIPT. The DK transcribed the JFK clip
+      PERFECTLY: "And so my fellow Americans ask not what your country
+      can do for you ask what you can do for your country." -- 23/23
+      tokens matching the device-model prediction, greedy, 252 MB
+      streamed through the slot, 58 min (~2.3 min/token, streaming
+      bound). Token-rate submodels run at width 4 (pointwise conv
+      minimum); the LM head (final LN + vocab projection) runs on the
+      host in f32 from the int16 residual.
+- [ ] M5 PDM mic + on-device log-mel frontend; single-command
+      encoder+decoder pipeline; throughput work (the SWD link is the
+      only thing between 58 minutes and a few minutes per utterance)
 - [ ] M4 greedy decoder -> first on-device transcript
 - [ ] M5 PDM mic + on-device log-mel frontend
 
