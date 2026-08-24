@@ -59,7 +59,7 @@ class Engine:
     PROBS_SCALE = 1.0 / 256.0  # fixed softmax output quantization
     PROBS_ZP = -128
 
-    def __init__(self, sd, mode="float", scales=None):
+    def __init__(self, sd, mode="float", scales=None, record=None):
         assert mode in ("float", "calib", "int8")
         self.sd = sd
         self.mode = mode
@@ -67,6 +67,8 @@ class Engine:
         self.ranges = {}             # calib: site -> [lo, hi]
         self.meta = {}               # calib: site -> (sym, bits)
         self._wq = {}                # weight name -> (q, per-channel scales)
+        self.record = record         # set of site names to capture
+        self.recorded = {}           # site -> value seen at that site
 
     # --- quantization sites ------------------------------------------------
 
@@ -82,7 +84,10 @@ class Engine:
             return Act(x)
         scale, zp, bits = self.scales[name]
         q = quantize(x, scale, zp, bits)
-        return Act(dequantize(q, scale, zp), scale, zp)
+        out = Act(dequantize(q, scale, zp), scale, zp)
+        if self.record is not None and name in self.record:
+            self.recorded[name] = out.x.copy()
+        return out
 
     def finish_calib(self):
         out = {}

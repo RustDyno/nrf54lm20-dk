@@ -94,8 +94,15 @@ activations| ORCH
       (block-0 q-projection, 166 KB) loads into the RAM slot over SWD and
       runs on the Axon BIT-EXACT vs the TFLite interpreter (40 ms inference,
       74 KB/s streaming). Device activations are channel-planar [C][W].
-- [ ] M2 rest: tape format + orchestrator, full ~40-submodel export
-- [ ] M3 full encoder on hardware vs golden vectors
+- [x] Tape machinery: model/tape.py emits stage-isolated schedules (5
+      generic ops) that host/ plays against the mailbox; goldens come from
+      chained TFLite interpreters + kernel-exact numpy glue.
+- [x] ENCODER BLOCK 0 fully verified on hardware: 25/25 stage checks
+      (LN, q/k/v, 6 fused CPU attention heads, out-proj, residuals, tiled
+      MLP with GELU LUTs and fc2 recombination), 12 streamed blobs, 65 s.
+- [ ] M3 rest: all 4 blocks + convs at full audio context, frame tiling,
+      host-paged activations; then the encoder end to end vs the simulation
+- [ ] M4 greedy decoder -> first on-device transcript
 - [ ] M4 greedy decoder -> first on-device transcript
 - [ ] M5 PDM mic + on-device log-mel frontend
 

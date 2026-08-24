@@ -40,33 +40,35 @@ impl Quant {
     }
 }
 
-/// Layernorm over `cols`-wide rows: int16 residual in -> int8 out.
-/// gamma/beta are f32, streamed into the arena by the host.
-pub fn ln_i16_to_i8(
+/// Layernorm over channels for each frame, channel-planar [C][W] layout:
+/// int16 residual in -> int8 out (an NPU submodel input). gamma/beta are
+/// f32[C], streamed into the arena by the host.
+pub fn ln_planar_i16_to_i8(
     src: &[i16],
     sq: Quant,
     gamma: &[f32],
     beta: &[f32],
     dst: &mut [i8],
     dq: Quant,
-    cols: usize,
+    ch: usize,
+    w: usize,
 ) {
-    for (row, out) in src.chunks_exact(cols).zip(dst.chunks_exact_mut(cols)) {
+    for f in 0..w {
         let mut mean = 0.0f32;
-        for &v in row {
-            mean += sq.dq16(v);
+        for c in 0..ch {
+            mean += sq.dq16(src[c * w + f]);
         }
-        mean /= cols as f32;
+        mean /= ch as f32;
         let mut var = 0.0f32;
-        for &v in row {
-            let d = sq.dq16(v) - mean;
+        for c in 0..ch {
+            let d = sq.dq16(src[c * w + f]) - mean;
             var += d * d;
         }
-        var /= cols as f32;
+        var /= ch as f32;
         let inv = 1.0 / libm::sqrtf(var + 1e-5);
-        for c in 0..cols {
-            let y = (sq.dq16(row[c]) - mean) * inv * gamma[c] + beta[c];
-            out[c] = dq.q8(y);
+        for c in 0..ch {
+            let y = (sq.dq16(src[c * w + f]) - mean) * inv * gamma[c] + beta[c];
+            dst[c * w + f] = dq.q8(y);
         }
     }
 }
@@ -79,7 +81,7 @@ pub fn lut_i8(lut: &[i8; 256], src: &[i8], dst: &mut [i8]) {
 }
 
 /// C[m,n] += A[m,k] * B[n,k]^T, int8 x int8 -> int32. `za` is A's zero-point
-/// (B must be symmetric). Used for QK^T (per head) and the logits tiles.
+/// (B must be symmetric). Used for the logits tiles.
 pub fn matmul_i8_bt(a: &[i8], za: i32, b: &[i8], acc: &mut [i32], m: usize, k: usize, n: usize) {
     for i in 0..m {
         let ar = &a[i * k..(i + 1) * k];
@@ -94,18 +96,83 @@ pub fn matmul_i8_bt(a: &[i8], za: i32, b: &[i8], acc: &mut [i32], m: usize, k: u
     }
 }
 
-/// C[m,n] = A[m,k] * B[k,n], int8 x int8 -> int32, B row-major [k,n].
-/// Used for probs x V (V stays in its natural [frames, head_dim] layout).
-pub fn matmul_i8_b(a: &[i8], za: i32, b: &[i8], acc: &mut [i32], m: usize, k: usize, n: usize) {
-    for i in 0..m {
-        let ar = &a[i * k..(i + 1) * k];
-        for j in 0..n {
+pub const MAX_KEYS: usize = 640;
+
+/// One attention head, fused QK^T -> softmax -> probs x V, channel-planar
+/// buffers. q/ctx are [hd, wq] (column stride qstride), k/v are [hd, tk]
+/// (column stride kstride; tk <= kstride masks padding frames out of the
+/// keys). zq/zk/zv are the q/k/v zero-points (the emitted submodels'
+/// converter-chosen output quantization); probs are quantized to the fixed
+/// 1/256 scale exactly as in the Python pipeline; ctx is written at
+/// `ctx_q` (the out-projection submodel's input quantization).
+#[allow(clippy::too_many_arguments)]
+pub fn attn_head(
+    q: &[i8],
+    k: &[i8],
+    v: &[i8],
+    ctx: &mut [i8],
+    hd: usize,
+    wq: usize,
+    qstride: usize,
+    tk: usize,
+    kstride: usize,
+    zq: i32,
+    zk: i32,
+    zv: i32,
+    score_mult: f32,
+    v_scale: f32,
+    ctx_q: Quant,
+) {
+    let mut scores = [0.0f32; MAX_KEYS];
+    let mut probs = [0i8; MAX_KEYS];
+    for qi in 0..wq {
+        let mut max = f32::MIN;
+        for t in 0..tk {
             let mut s = 0i32;
-            for t in 0..k {
-                s += (ar[t] as i32 - za) * b[t * n + j] as i32;
+            for c in 0..hd {
+                s += (q[c * qstride + qi] as i32 - zq) * (k[c * kstride + t] as i32 - zk);
             }
-            acc[i * n + j] = s;
+            scores[t] = s as f32 * score_mult;
+            if scores[t] > max {
+                max = scores[t];
+            }
         }
+        let mut sum = 0.0f32;
+        for t in 0..tk {
+            scores[t] = libm::expf(scores[t] - max);
+            sum += scores[t];
+        }
+        let inv = 1.0 / sum;
+        for t in 0..tk {
+            probs[t] = PROBS.q8(scores[t] * inv);
+        }
+        for c in 0..hd {
+            let mut acc = 0i32;
+            for t in 0..tk {
+                acc += (probs[t] as i32 + 128) * (v[c * kstride + t] as i32 - zv);
+            }
+            ctx[c * qstride + qi] = ctx_q.q8(acc as f32 * (PROBS.scale * v_scale));
+        }
+    }
+}
+
+/// MLP fc2 recombination, elementwise: dst16 = qd(q_res(a16) + sum of the
+/// four dequantized int8 partial outputs). Callers tile by element range to
+/// bound the arena working set.
+pub fn fc2_sum(
+    parts: [&[i8]; 4],
+    pq: &[Quant; 4],
+    a: &[i16],
+    qa: Quant,
+    dst: &mut [i16],
+    qd: Quant,
+) {
+    for i in 0..dst.len() {
+        let mut s = qa.dq16(a[i]);
+        for j in 0..4 {
+            s += pq[j].dq8(parts[j][i]);
+        }
+        dst[i] = qd.q16(s);
     }
 }
 

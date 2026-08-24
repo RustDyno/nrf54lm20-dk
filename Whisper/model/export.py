@@ -90,7 +90,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     t = FRAME_TILE
-    print("emitting Axon submodel shape set:")
+    print("emitting Axon submodels (convs + encoder block 0):")
     # conv1: k=3 s=1, 80 -> 384; halo-padded input tile in MEL frames
     # (2 per encoder frame).
     emit("wconv1", sd["encoder.conv1.weight"], sd["encoder.conv1.bias"],
@@ -99,18 +99,30 @@ def main():
     emit("wconv2a", sd["encoder.conv2.weight"][:128],
          sd["encoder.conv2.bias"][:128],
          2, 2 * t + 2, *in_range(scales, "enc.gelu1"), out_dir)
-    # attention projection: FC 384 -> 384 (q/k/v/out and cross flavors)
-    emit("wq0", sd["encoder.blocks.0.attn.query.weight"][:, :, None],
-         sd["encoder.blocks.0.attn.query.bias"],
-         1, t, *in_range(scales, "enc.b0.ln1"), out_dir)
-    # mlp fc1 output-channel tile: FC 384 -> 384 (of 1536)
-    emit("wfc1a", sd["encoder.blocks.0.mlp.0.weight"][:384][:, :, None],
-         sd["encoder.blocks.0.mlp.0.bias"][:384],
-         1, t, *in_range(scales, "enc.b0.ln2"), out_dir)
-    # mlp fc2 input-dim partial 0: FC 384 -> 384 (of 1536 in), carries bias
-    emit("wfc2p0", sd["encoder.blocks.0.mlp.2.weight"][:, :384][:, :, None],
-         sd["encoder.blocks.0.mlp.2.bias"],
-         1, t, *in_range(scales, "enc.b0.gelu"), out_dir)
+
+    p = "encoder.blocks.0."
+    # attention projections: FC 384 -> 384 over frame tiles
+    for name, w, b, site in [
+        ("wq0", "attn.query.weight", "attn.query.bias", "enc.b0.ln1"),
+        ("wk0", "attn.key.weight", None, "enc.b0.ln1"),
+        ("wv0", "attn.value.weight", "attn.value.bias", "enc.b0.ln1"),
+        ("wout0", "attn.out.weight", "attn.out.bias", "enc.b0.ctx"),
+    ]:
+        emit(name, sd[p + w][:, :, None],
+             sd[p + b] if b else None,
+             1, t, *in_range(scales, site), out_dir)
+    # mlp fc1 output-channel tiles (bias travels with its rows)
+    for i, part in enumerate("abcd"):
+        rows = slice(384 * i, 384 * (i + 1))
+        emit(f"wfc1{part}", sd[p + "mlp.0.weight"][rows][:, :, None],
+             sd[p + "mlp.0.bias"][rows],
+             1, t, *in_range(scales, "enc.b0.ln2"), out_dir)
+    # mlp fc2 input-dim partials (partial 0 carries the bias)
+    for i in range(4):
+        cols = slice(384 * i, 384 * (i + 1))
+        emit(f"wfc2p{i}", sd[p + "mlp.2.weight"][:, cols][:, :, None],
+             sd[p + "mlp.2.bias"] if i == 0 else None,
+             1, t, *in_range(scales, "enc.b0.gelu"), out_dir)
     print(f"-> {out_dir}")
 
 

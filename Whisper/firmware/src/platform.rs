@@ -84,9 +84,12 @@ pub fn init() -> i32 {
     unsafe {
         // Power-cycle first: probe-rs reflash is only a soft reset, so engine
         // state survives from a previous (possibly killed mid-inference)
-        // session. ENABLE=0 resets it.
+        // session. ENABLE=0 resets it. This crate dwells ~1 ms in the off
+        // state (the sibling projects use 64 cycles): host-driven development
+        // kills sessions mid-inference far more often, and the longer dwell
+        // is cheap insurance.
         core::ptr::write_volatile(enable_reg(), 0);
-        cortex_m::asm::delay(64);
+        cortex_m::asm::delay(128_000);
         core::ptr::write_volatile(enable_reg(), AXON_ENABLE_EN_BIT);
 
         let r = bindings::nrf_axon_driver_init(AXON_BASE_ADDR as *mut c_void);

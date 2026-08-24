@@ -1,14 +1,17 @@
-//! Blob selftest driver: flash the executor firmware, stream one compiled
-//! layer blob into the slot, run it on the NPU against a golden input, and
-//! compare the output with the TFLite interpreter's (bit-exactness is the
-//! pass bar, as established by the KWS project).
+//! Host driver for the layer-streaming Whisper firmware.
 //!
-//!   cargo run --release -- <firmware.elf> <blob.bin> <input.bin> <expect.bin>
+//!   whisper-host selftest <firmware.elf> <blob.bin> <input.bin> <expect.bin>
+//!   whisper-host tape <firmware.elf> <tape.json>
 //!
-//! This is the seed of the full tape orchestrator (M2): the mailbox client
-//! below is the complete device protocol; the tape player will drive the
-//! same calls from a schedule emitted by model/.
+//! selftest: stream one blob + golden input, run it on the NPU, compare.
+//! tape: play a schedule emitted by model/tape.py. The tape is five generic
+//! ops (load blob, write file to address, mailbox cmd, check memory against
+//! a file, read memory to a file), so new device kernels need no host
+//! changes; all structure lives in the generator. File paths are relative
+//! to the tape's directory. Addresses are absolute (ARENA and SLOT are at
+//! fixed addresses in the firmware).
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -16,7 +19,8 @@ use object::{Object, ObjectSymbol};
 use probe_rs::config::Registry;
 use probe_rs::probe::list::Lister;
 use probe_rs::rtt::{Rtt, ScanRegion};
-use probe_rs::{flashing, Core, MemoryInterface, Permissions};
+use probe_rs::{flashing, Core, MemoryInterface, Permissions, Session};
+use serde::Deserialize;
 
 const CHIP: &str = "nRF54LM20B";
 const CHIP_DESCRIPTION: &str = include_str!("../../firmware/targets/nRF54LM20B.yaml");
@@ -49,7 +53,7 @@ impl Mailbox {
         core.write_word_32(self.base + MB_CMD, cmd)?;
         self.seq += 1;
         core.write_word_32(self.base + MB_CMD_SEQ, self.seq)?;
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let ack = core.read_word_32(self.base + MB_ACK_SEQ)?;
             if ack == self.seq {
@@ -63,39 +67,27 @@ impl Mailbox {
     }
 }
 
-fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let [elf, blob, input, expect] = args.as_slice() else {
-        bail!("usage: whisper-host <firmware.elf> <blob.bin> <input.bin> <expect.bin>");
-    };
-    let blob_data = std::fs::read(blob).context("reading blob")?;
-    let input_data = std::fs::read(input).context("reading input")?;
-    let expect_data = std::fs::read(expect).context("reading expected output")?;
-
+/// Flash the firmware, reset, wait for the mailbox to come up.
+fn setup(elf: &str) -> Result<(Session, u64, Option<u64>)> {
     let elf_data = std::fs::read(elf).context("reading firmware ELF")?;
     let elf_obj = object::File::parse(&*elf_data).context("parsing ELF")?;
-    let sym = |name: &str| -> Result<u64> {
+    let sym = |name: &str| -> Option<u64> {
         elf_obj
             .symbols()
             .find(|s| s.name() == Ok(name))
             .map(|s| s.address())
-            .ok_or_else(|| anyhow!("symbol {name} not found in firmware ELF"))
     };
-    let mailbox_addr = sym("MAILBOX")?;
-    let arena_addr = sym("ARENA")?;
-    let interlayer_addr = sym("nrf_axon_interlayer_buffer")?;
-    let rtt_addr = sym("_SEGGER_RTT").ok();
+    let mailbox_addr = sym("MAILBOX").ok_or_else(|| anyhow!("MAILBOX not in ELF"))?;
+    let rtt_addr = sym("_SEGGER_RTT");
 
-    // Open the probe, flash, reset into the image (same flow as PDM-MIC).
     let lister = Lister::new();
     let probes = lister.list_all();
     let info = probes
         .first()
         .ok_or_else(|| anyhow!("no debug probe found (is the DK plugged in?)"))?;
     let mut probe = lister.open(info).context("opening probe")?;
-    // Raise the SWD clock if the probe allows it (the J-Link OB rejects
-    // values outside its table; throughput is link-command-bound anyway,
-    // ~26 KB/s -- see NOTES on the streaming bottleneck).
+    // Raise the SWD clock if the probe allows it (this J-Link OB caps at
+    // 2000 kHz; throughput is ~74 KB/s -- see NOTES on the bottleneck).
     for khz in [4000, 2000, 1000] {
         if let Ok(actual) = probe.set_speed(khz) {
             eprintln!("probe speed: {actual} kHz");
@@ -111,7 +103,17 @@ fn main() -> Result<()> {
         .context("attaching to target")?;
 
     eprintln!("flashing {elf} ...");
-    flashing::download_file(&mut session, elf, flashing::FormatKind::Elf).context("flashing")?;
+    // Double-buffered RRAM programming corrupts one word per 4 KB page on
+    // this target (probe-rs + cloned nRF54LM20B yaml); verify to make any
+    // recurrence loud instead of a heisen-crash.
+    let mut opts = flashing::DownloadOptions::default();
+    opts.disable_double_buffering = true;
+    opts.verify = true;
+    let loader = flashing::build_loader(&mut session, elf, flashing::Format::Elf(Default::default()), None)
+        .context("building flash loader")?;
+    loader
+        .commit(&mut session, opts)
+        .context("flashing (verified)")?;
     {
         let mut core = session.core(0)?;
         core.reset_and_halt(Duration::from_millis(500))?;
@@ -120,62 +122,215 @@ fn main() -> Result<()> {
         core.write_word_32(mailbox_addr + MB_MAGIC, 0)?;
         core.run()?;
     }
-
-    let mut core = session.core(0)?;
-
-    // Wait for the firmware to finish init (mailbox magic appears).
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if core.read_word_32(mailbox_addr + MB_MAGIC)? == MAILBOX_MAGIC {
-            break;
+    {
+        let mut core = session.core(0)?;
+        // The watchdog may reset once on a wedged engine; allow time for it.
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            match core.read_word_32(mailbox_addr + MB_MAGIC)? {
+                m if m == MAILBOX_MAGIC => break,
+                0x4641_494C => {
+                    let rc = core.read_word_32(mailbox_addr + MB_STATUS)? as i32;
+                    bail!("Axon driver init failed with rc {rc}");
+                }
+                m if Instant::now() > deadline => bail!(
+                    "firmware not ready (magic {m:#010x}: {})",
+                    match m {
+                        0x424F_4F54 => "hung in Axon init -- power-cycle the board",
+                        0 => "never reached main",
+                        _ => "unknown state",
+                    }
+                ),
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
         }
-        if Instant::now() > deadline {
-            bail!("firmware did not publish the mailbox magic (Axon init failed?)");
-        }
-        std::thread::sleep(Duration::from_millis(20));
     }
+    Ok((session, mailbox_addr, rtt_addr))
+}
+
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("selftest") if args.len() == 5 => {
+            selftest(&args[1], &args[2], &args[3], &args[4])
+        }
+        Some("tape") if args.len() == 3 => tape(&args[1], &args[2]),
+        Some("halt") => halt_info(),
+        _ => bail!(
+            "usage: whisper-host selftest <firmware.elf> <blob.bin> <input.bin> <expect.bin>\n\
+             \x20      whisper-host tape <firmware.elf> <tape.json>"
+        ),
+    }
+}
+
+// --- tape player ------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum Step {
+    /// Load a compiled layer blob into the slot (skipped if already loaded).
+    Blob { file: String },
+    /// Write a data file to an absolute device address.
+    Write { file: String, addr: u64 },
+    /// Issue a mailbox command; nonzero status aborts the tape.
+    Cmd { code: u32, #[serde(default)] args: Vec<u32> },
+    /// Compare device memory against a file (byte length = file length).
+    Check {
+        file: String,
+        addr: u64,
+        label: String,
+        #[serde(default)] tol: i32,
+    },
+    /// Dump device memory to a file.
+    Read { file: String, addr: u64, len: u32 },
+}
+
+#[derive(Deserialize)]
+struct Tape {
+    steps: Vec<Step>,
+}
+
+fn tape(elf: &str, tape_path: &str) -> Result<()> {
+    let tape: Tape = serde_json::from_str(
+        &std::fs::read_to_string(tape_path).context("reading tape")?,
+    )
+    .context("parsing tape")?;
+    let dir = Path::new(tape_path).parent().unwrap_or(Path::new("."));
+
+    let (mut session, mailbox_addr, rtt_addr) = setup(elf)?;
+    let mut core = session.core(0)?;
     let mut mb = Mailbox {
         base: mailbox_addr,
         seq: core.read_word_32(mailbox_addr + MB_CMD_SEQ)?,
     };
+    mb.call(&mut core, CMD_PING, &[])?;
 
+    let t0 = Instant::now();
+    let mut loaded_blob = String::new();
+    let mut streamed = 0usize;
+    let (mut checks, mut failed) = (0u32, 0u32);
+    for (i, step) in tape.steps.iter().enumerate() {
+        match step {
+            Step::Blob { file } => {
+                if *file != loaded_blob {
+                    let data = std::fs::read(dir.join(file))
+                        .with_context(|| format!("blob {file}"))?;
+                    core.write(SLOT_BASE, &data)?;
+                    streamed += data.len();
+                    loaded_blob = file.clone();
+                }
+            }
+            Step::Write { file, addr } => {
+                let data = std::fs::read(dir.join(file))
+                    .with_context(|| format!("data {file}"))?;
+                core.write(*addr, &data)?;
+                streamed += data.len();
+            }
+            Step::Cmd { code, args } => {
+                let rc = match mb.call(&mut core, *code, args) {
+                    Ok(rc) => rc,
+                    Err(e) => {
+                        drain_rtt(&mut core, rtt_addr);
+                        return Err(e);
+                    }
+                };
+                if rc != 0 {
+                    drain_rtt(&mut core, rtt_addr);
+                    bail!("step {i}: cmd {code} failed with status {rc}");
+                }
+            }
+            Step::Check { file, addr, label, tol } => {
+                let expect = std::fs::read(dir.join(file))
+                    .with_context(|| format!("expect {file}"))?;
+                let mut got = vec![0u8; expect.len()];
+                core.read_8(*addr, &mut got)?;
+                let (mut diffs, mut maxerr) = (0usize, 0i32);
+                for (g, e) in got.iter().zip(expect.iter()) {
+                    let d = (*g as i8 as i32 - *e as i8 as i32).abs();
+                    if d > *tol {
+                        diffs += 1;
+                    }
+                    maxerr = maxerr.max(d);
+                }
+                checks += 1;
+                if diffs == 0 {
+                    eprintln!("  check {label}: PASS ({} B, max |err| {maxerr})", got.len());
+                } else {
+                    failed += 1;
+                    eprintln!(
+                        "  check {label}: FAIL {diffs}/{} bytes over tol {tol} (max |err| {maxerr})",
+                        got.len()
+                    );
+                    std::fs::write(dir.join(format!("{label}.got.bin")), &got).ok();
+                }
+            }
+            Step::Read { file, addr, len } => {
+                let mut data = vec![0u8; *len as usize];
+                core.read_8(*addr, &mut data)?;
+                std::fs::write(dir.join(file), &data)?;
+            }
+        }
+    }
+    drain_rtt(&mut core, rtt_addr);
+    eprintln!(
+        "tape done: {} steps, {} KB streamed, {:.2} s, checks {}/{} passed",
+        tape.steps.len(),
+        streamed / 1024,
+        t0.elapsed().as_secs_f64(),
+        checks - failed,
+        checks
+    );
+    if failed > 0 {
+        bail!("{failed} checks failed");
+    }
+    Ok(())
+}
+
+// --- single-blob selftest ---------------------------------------------------
+
+fn selftest(elf: &str, blob: &str, input: &str, expect: &str) -> Result<()> {
+    let blob_data = std::fs::read(blob).context("reading blob")?;
+    let input_data = std::fs::read(input).context("reading input")?;
+    let expect_data = std::fs::read(expect).context("reading expected output")?;
+
+    let (mut session, mailbox_addr, rtt_addr) = setup(elf)?;
+    let mut core = session.core(0)?;
+    let mut mb = Mailbox {
+        base: mailbox_addr,
+        seq: core.read_word_32(mailbox_addr + MB_CMD_SEQ)?,
+    };
     let rc = mb.call(&mut core, CMD_PING, &[])?;
     eprintln!("ping -> {rc:#x}");
 
-    // Stream the blob into the slot and the golden input into the arena.
+    // Arena base mirrors firmware memory.x (fixed region).
+    let arena_addr: u64 = 0x2003_2000;
     eprintln!("loading blob ({} B) + input ({} B)", blob_data.len(), input_data.len());
     let t0 = Instant::now();
-    // `write` picks word-sized accesses (write_8 byte access crawls at
-    // ~7 KB/s over the J-Link OB); slot and arena are word-aligned.
     core.write(SLOT_BASE, &blob_data)?;
     core.write(arena_addr, &input_data)?;
-    eprintln!("  streamed in {:.2} s ({:.0} KB/s)",
+    eprintln!(
+        "  streamed in {:.2} s ({:.0} KB/s)",
         t0.elapsed().as_secs_f64(),
-        (blob_data.len() + input_data.len()) as f64 / 1024.0 / t0.elapsed().as_secs_f64());
+        (blob_data.len() + input_data.len()) as f64 / 1024.0 / t0.elapsed().as_secs_f64()
+    );
 
     let out_addr = arena_addr + input_data.len() as u64;
     let t0 = Instant::now();
     let rc = mb.call(&mut core, CMD_RUN_NPU, &[arena_addr as u32, out_addr as u32])?;
     eprintln!("run_npu -> {rc} in {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
     if rc != 0 {
-        drain_rtt(&mut core, &elf_data, rtt_addr);
+        drain_rtt(&mut core, rtt_addr);
         bail!("NPU run failed with {rc}");
     }
 
     let mut out = vec![0u8; expect_data.len()];
     core.read_8(out_addr, &mut out)?;
-    // Keep both the packed output and the raw interlayer image around for
-    // layout analysis when the comparison fails.
-    std::fs::write("out-packed.bin", &out).ok();
-    let mut il = vec![0u8; expect_data.len()];
-    core.read_8(interlayer_addr, &mut il)?;
-    std::fs::write("out-interlayer.bin", &il).ok();
     let diffs = out
         .iter()
         .zip(expect_data.iter())
         .filter(|(a, b)| a != b)
         .count();
-    drain_rtt(&mut core, &elf_data, rtt_addr);
+    drain_rtt(&mut core, rtt_addr);
     if diffs == 0 {
         eprintln!("PASS: output bit-exact vs the TFLite interpreter ({} B)", out.len());
         Ok(())
@@ -190,13 +345,34 @@ fn main() -> Result<()> {
     }
 }
 
+/// Debug aid: attach without flashing, halt, dump PC/LR/SP + PRIMASK.
+fn halt_info() -> Result<()> {
+    let lister = Lister::new();
+    let probes = lister.list_all();
+    let info = probes.first().ok_or_else(|| anyhow!("no probe"))?;
+    let probe = lister.open(info)?;
+    let mut registry = Registry::from_builtin_families();
+    registry.add_target_family_from_yaml(CHIP_DESCRIPTION)?;
+    let mut session = probe.attach_with_registry(CHIP, Permissions::default(), &registry)?;
+    let mut core = session.core(0)?;
+    core.halt(Duration::from_millis(500))?;
+    let pc: u64 = core.read_core_reg(core.program_counter())?;
+    let lr: u64 = core.read_core_reg(core.return_address())?;
+    let sp: u64 = core.read_core_reg(core.stack_pointer())?;
+    eprintln!("pc {pc:#010x}  lr {lr:#010x}  sp {sp:#010x}");
+    let mut stack = [0u32; 16];
+    core.read_32(sp, &mut stack)?;
+    eprintln!("stack: {:08x?}", stack);
+    core.run()?;
+    Ok(())
+}
+
 /// Print whatever the firmware logged so failures come with context.
-fn drain_rtt(core: &mut Core, elf_data: &[u8], rtt_addr: Option<u64>) {
+fn drain_rtt(core: &mut Core, rtt_addr: Option<u64>) {
     let region = match rtt_addr {
         Some(a) => ScanRegion::Exact(a),
         None => ScanRegion::Ram,
     };
-    let _ = elf_data;
     if let Ok(mut rtt) = Rtt::attach_region(core, &region) {
         if let Some(ch) = rtt.up_channel(0) {
             let mut buf = [0u8; 2048];

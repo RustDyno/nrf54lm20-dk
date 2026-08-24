@@ -1975,6 +1975,8 @@ dependencies = [
  "anyhow",
  "object 0.36.7",
  "probe-rs",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

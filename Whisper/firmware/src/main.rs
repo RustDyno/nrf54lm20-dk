@@ -13,7 +13,9 @@
 #![no_std]
 #![no_main]
 
-use cortex_m_rt::entry;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use cortex_m_rt::{entry, exception};
 use panic_halt as _;
 use rtt_target::{rprintln, rtt_init, ChannelMode};
 
@@ -37,12 +39,15 @@ pub static mut nrf_axon_interlayer_buffer: [u32; INTERLAYER_BUFFER_BYTES / 4] =
 #[no_mangle]
 pub static mut nrf_axon_psum_buffer: [u32; PSUM_BUFFER_BYTES / 4] = [0; PSUM_BUFFER_BYTES / 4];
 
-/// Activation / parameter arena. The host owns the layout: every mailbox
-/// command carries absolute addresses that the host computed from this
-/// symbol's ELF address plus its own allocation plan.
+/// Activation / parameter arena at a FIXED address (memory.x ARENA region,
+/// 0x20032000) so the tape generator can emit absolute addresses. The tape
+/// owns the layout: every mailbox command carries absolute addresses from
+/// its allocation plan. Activations are channel-planar [C][W]
+/// (hardware-verified Axon layout).
 pub const ARENA_BYTES: usize = 100 * 1024;
 
 #[no_mangle]
+#[link_section = ".arena"]
 pub static mut ARENA: [u8; ARENA_BYTES] = [0; ARENA_BYTES];
 
 // --- Device interrupt vector table (AXONS IRQ 86; see ../../npu/src/main.rs).
@@ -69,11 +74,64 @@ const fn vector_table() -> [unsafe extern "C" fn(); AXONS_IRQN + 1] {
 #[link_section = ".vector_table.interrupts"]
 pub static __INTERRUPTS: [unsafe extern "C" fn(); AXONS_IRQN + 1] = vector_table();
 
+// --- Crash breadcrumb ---------------------------------------------------------
+// Last word of the ARENA region (NOLOAD -> survives reset; the tape
+// generator never allocates it). Written at each execution milestone and
+// reported at the next boot, so a watchdog reset names its victim.
+
+const BREADCRUMB: *mut u32 = 0x2004_AFF8 as *mut u32;
+
+pub fn crumb(v: u32) {
+    unsafe { core::ptr::write_volatile(BREADCRUMB, v) };
+}
+
+// --- Hang watchdog (ported from the KWS firmware) ----------------------------
+// A debug session killed mid-inference can wedge the Axon engine across soft
+// resets; the next driver call then blocks forever. SysTick counts while a
+// driver call is in flight; over budget -> chip reset, and the boot-time
+// power cycle in platform::init clears the engine. (A wedge inside a
+// PRIMASK critical section still needs a board power cycle.)
+
+const WDOG_DISARMED: u32 = u32::MAX;
+const WDOG_LIMIT_TICKS: u32 = 200; // 200 x 10 ms = 2 s per driver call
+static WDOG_TICKS: AtomicU32 = AtomicU32::new(WDOG_DISARMED);
+
+#[exception]
+fn SysTick() {
+    let t = WDOG_TICKS.load(Ordering::Relaxed);
+    if t != WDOG_DISARMED {
+        if t >= WDOG_LIMIT_TICKS {
+            cortex_m::peripheral::SCB::sys_reset();
+        }
+        WDOG_TICKS.store(t + 1, Ordering::Relaxed);
+    }
+}
+
+struct WdogGuard;
+
+impl WdogGuard {
+    fn arm() -> Self {
+        WDOG_TICKS.store(0, Ordering::Relaxed);
+        WdogGuard
+    }
+}
+
+impl Drop for WdogGuard {
+    fn drop(&mut self) {
+        WDOG_TICKS.store(WDOG_DISARMED, Ordering::Relaxed);
+    }
+}
+
 // --- Mailbox protocol ---------------------------------------------------------
 // Host: write `args` + `cmd`, then increment `cmd_seq`. Firmware: on
 // cmd_seq != ack_seq, execute, write `status`, then set ack_seq = cmd_seq.
+// `magic` stages the boot so the host can tell a hang from a failure:
+// BOOT (entered main) -> LAYR (Axon init ok, executor running), or FAIL
+// with the init rc in `status`.
 
 pub const MAILBOX_MAGIC: u32 = 0x4C41_5952; // "LAYR"
+pub const MAILBOX_BOOT: u32 = 0x424F_4F54; // "BOOT"
+pub const MAILBOX_FAIL: u32 = 0x4641_494C; // "FAIL"
 
 #[repr(C)]
 pub struct Mailbox {
@@ -100,21 +158,23 @@ const CMD_PING: u32 = 1;
 const CMD_RUN_NPU: u32 = 2; // args: input addr|0, output addr|0
 const CMD_LUT8: u32 = 3; // args: lut, src, dst, len
 const CMD_MATMUL_BT: u32 = 4; // args: a, b, acc, m, k, n, za
-const CMD_MATMUL_B: u32 = 5; // args: a, b, acc, m, k, n, za
 const CMD_SOFTMAX: u32 = 6; // args: acc, dst, rows, cols, mult(f32 bits)
 const CMD_REQUANT: u32 = 7; // args: acc, dst, len, mult(f32), scale(f32), zp
 const CMD_LN: u32 = 8; // args: param block addr (LnParams)
 const CMD_ADD16: u32 = 9; // args: param block addr (AddParams)
 const CMD_ADDPOS: u32 = 10; // args: param block addr (AddPosParams)
 const CMD_LOGITS_MAX: u32 = 11; // args: acc, mults, idx, len, state
+const CMD_ATTN_HEAD: u32 = 12; // args: param block addr (AttnParams)
+const CMD_FC2SUM: u32 = 13; // args: param block addr (Fc2SumParams)
 
 /// Host-written parameter block for CMD_LN (all addresses absolute).
+/// Layout is channel-planar: src is i16[ch][w], dst i8[ch][w].
 #[repr(C)]
 struct LnParams {
     src: u32,
     dst: u32,
-    rows: u32,
-    cols: u32,
+    ch: u32,
+    w: u32,
     gamma: u32,
     beta: u32,
     sq: Quant,
@@ -144,6 +204,38 @@ struct AddPosParams {
     qd: Quant,
 }
 
+/// CMD_ATTN_HEAD: one fused attention head over channel-planar buffers.
+#[repr(C)]
+struct AttnParams {
+    q: u32,
+    k: u32,
+    v: u32,
+    ctx: u32,
+    hd: u32,
+    wq: u32,
+    qstride: u32,
+    tk: u32,
+    kstride: u32,
+    zq: i32,
+    zk: i32,
+    zv: i32,
+    score_mult: f32,
+    v_scale: f32,
+    ctx_q: Quant,
+}
+
+/// CMD_FC2SUM: residual + four dequantized fc2 partials -> int16.
+#[repr(C)]
+struct Fc2SumParams {
+    p: [u32; 4],
+    a: u32,
+    dst: u32,
+    len: u32,
+    pq: [Quant; 4],
+    qa: Quant,
+    qd: Quant,
+}
+
 // Softmax scratch: one dequantized score row. Bounds CMD_SOFTMAX cols.
 const MAX_SOFTMAX_COLS: usize = 640;
 static mut SOFTMAX_SCRATCH: [f32; MAX_SOFTMAX_COLS] = [0.0; MAX_SOFTMAX_COLS];
@@ -161,7 +253,10 @@ unsafe fn sl_mut<T>(addr: u32, len: u32) -> &'static mut [T] {
 unsafe fn dispatch(cmd: u32, a: &[u32; 8]) -> i32 {
     match cmd {
         CMD_PING => 0x50494E47, // "PING"
-        CMD_RUN_NPU => slot::run(a[0], a[1]),
+        CMD_RUN_NPU => {
+            let _wd = WdogGuard::arm();
+            slot::run(a[0], a[1])
+        }
         CMD_LUT8 => {
             let lut: &[i8] = sl(a[0], 256);
             kernels::lut_i8(
@@ -183,15 +278,44 @@ unsafe fn dispatch(cmd: u32, a: &[u32; 8]) -> i32 {
             );
             0
         }
-        CMD_MATMUL_B => {
-            kernels::matmul_i8_b(
-                sl(a[0], a[3] * a[4]),
-                a[6] as i32,
-                sl(a[1], a[4] * a[5]),
-                sl_mut(a[2], a[3] * a[5]),
-                a[3] as usize,
-                a[4] as usize,
-                a[5] as usize,
+        CMD_ATTN_HEAD => {
+            let p = &*(a[0] as *const AttnParams);
+            if p.tk as usize > kernels::MAX_KEYS {
+                return -1;
+            }
+            kernels::attn_head(
+                sl(p.q, p.hd * p.qstride),
+                sl(p.k, p.hd * p.kstride),
+                sl(p.v, p.hd * p.kstride),
+                sl_mut(p.ctx, p.hd * p.qstride),
+                p.hd as usize,
+                p.wq as usize,
+                p.qstride as usize,
+                p.tk as usize,
+                p.kstride as usize,
+                p.zq,
+                p.zk,
+                p.zv,
+                p.score_mult,
+                p.v_scale,
+                p.ctx_q,
+            );
+            0
+        }
+        CMD_FC2SUM => {
+            let p = &*(a[0] as *const Fc2SumParams);
+            kernels::fc2_sum(
+                [
+                    sl(p.p[0], p.len),
+                    sl(p.p[1], p.len),
+                    sl(p.p[2], p.len),
+                    sl(p.p[3], p.len),
+                ],
+                &p.pq,
+                sl(p.a, p.len),
+                p.qa,
+                sl_mut(p.dst, p.len),
+                p.qd,
             );
             0
         }
@@ -222,14 +346,15 @@ unsafe fn dispatch(cmd: u32, a: &[u32; 8]) -> i32 {
         }
         CMD_LN => {
             let p = &*(a[0] as *const LnParams);
-            kernels::ln_i16_to_i8(
-                sl(p.src, p.rows * p.cols),
+            kernels::ln_planar_i16_to_i8(
+                sl(p.src, p.ch * p.w),
                 p.sq,
-                sl(p.gamma, p.cols),
-                sl(p.beta, p.cols),
-                sl_mut(p.dst, p.rows * p.cols),
+                sl(p.gamma, p.ch),
+                sl(p.beta, p.ch),
+                sl_mut(p.dst, p.ch * p.w),
                 p.dq,
-                p.cols as usize,
+                p.ch as usize,
+                p.w as usize,
             );
             0
         }
@@ -283,7 +408,31 @@ fn main() -> ! {
     };
     rtt_target::set_print_channel(channels.up.0);
 
-    let rc = platform::init();
+    let died_at = unsafe { core::ptr::read_volatile(BREADCRUMB) };
+    rprintln!("boot (previous life died at {:#x})", died_at);
+    crumb(0x100);
+
+    let mb = core::ptr::addr_of_mut!(MAILBOX);
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*mb).magic), MAILBOX_BOOT);
+    }
+
+    // Cycle counter for timing; SysTick for the hang watchdog.
+    if let Some(mut cp) = cortex_m::Peripherals::take() {
+        cp.DCB.enable_trace();
+        cp.DWT.enable_cycle_counter();
+        cp.SYST
+            .set_clock_source(cortex_m::peripheral::syst::SystClkSource::Core);
+        cp.SYST.set_reload(1_280_000 - 1); // 10 ms at 128 MHz
+        cp.SYST.clear_current();
+        cp.SYST.enable_interrupt();
+        cp.SYST.enable_counter();
+    }
+
+    let rc = {
+        let _wd = WdogGuard::arm();
+        platform::init()
+    };
     rprintln!("whisper executor: axon init rc={}", rc);
     rprintln!(
         "slot @ {:#010x} ({}K)  arena @ {:#010x} ({}K)",
@@ -304,10 +453,12 @@ fn main() -> ! {
         PSUM_BUFFER_BYTES / 1024
     );
 
-    let mb = core::ptr::addr_of_mut!(MAILBOX);
     unsafe {
         if rc == 0 {
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*mb).magic), MAILBOX_MAGIC);
+        } else {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*mb).status), rc);
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*mb).magic), MAILBOX_FAIL);
         }
         loop {
             let seq = core::ptr::read_volatile(core::ptr::addr_of!((*mb).cmd_seq));
@@ -316,7 +467,9 @@ fn main() -> ! {
             }
             let cmd = core::ptr::read_volatile(core::ptr::addr_of!((*mb).cmd));
             let args = core::ptr::read_volatile(core::ptr::addr_of!((*mb).args));
+            crumb(0x300 + cmd);
             let status = dispatch(cmd, &args);
+            crumb(0x400 + cmd);
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*mb).status), status);
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*mb).ack_seq), seq);
         }
