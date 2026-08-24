@@ -221,15 +221,25 @@ pub fn init() -> i32 {
         write_volatile(gpio(PIN_CNF + 4 * PIN_MISO as usize), CNF_IN_PULLUP);
     }
 
-    // >= 74 clocks with CS high puts the card in SPI-command mode.
-    cs(false);
+    // >= 74 clocks with CS high puts the card in SPI-command mode; send
+    // 160 (some cards want extra right after power-up).
     cs(true);
-    let mut warmup = [0u8; 10];
+    let mut warmup = [0u8; 20];
     recv(&mut warmup);
 
-    // CMD0: software reset -> idle state.
-    cs(false);
-    let r = command(0, 0, 0x95);
+    // CMD0: software reset -> idle state. Retried: real cards commonly
+    // ignore the first attempt(s) after power-up.
+    let mut r = 0xFF;
+    for _ in 0..8 {
+        cs(false);
+        recv1(); // 8 clocks with CS low before the frame
+        r = command(0, 0, 0x95);
+        if r == 0x01 {
+            break;
+        }
+        cs(true);
+        recv1(); // 8 deselected clocks between attempts
+    }
     if r != 0x01 {
         cs(true);
         return -200 - r as i32;
