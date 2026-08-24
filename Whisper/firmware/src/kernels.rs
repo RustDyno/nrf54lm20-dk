@@ -12,7 +12,7 @@
 //!   zero-point correction; softmax output is fixed at scale 1/256, zp -128.
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct Quant {
     pub scale: f32,
     pub zp: i32,

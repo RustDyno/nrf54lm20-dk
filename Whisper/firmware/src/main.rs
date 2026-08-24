@@ -19,6 +19,7 @@ use cortex_m_rt::{entry, exception};
 use panic_halt as _;
 use rtt_target::{rprintln, rtt_init, ChannelMode};
 
+mod app;
 mod bindings;
 mod kernels;
 mod libm_shims;
@@ -33,8 +34,8 @@ use kernels::Quant;
 
 // Storage backing the C `extern uint32_t nrf_axon_interlayer_buffer[]` and
 // `nrf_axon_psum_buffer[]`. Sizes must match the -D defines in build.rs.
-const INTERLAYER_BUFFER_BYTES: usize = 147456;
-const PSUM_BUFFER_BYTES: usize = 16384;
+const INTERLAYER_BUFFER_BYTES: usize = 65536;
+const PSUM_BUFFER_BYTES: usize = 4096;
 
 #[no_mangle]
 pub static mut nrf_axon_interlayer_buffer: [u32; INTERLAYER_BUFFER_BYTES / 4] =
@@ -429,14 +430,14 @@ unsafe fn dispatch(cmd: u32, a: &[u32; 8]) -> i32 {
 }
 
 // PDM mic (same pins the KWS project validated on this DK).
-const MIC_CLK: pdm::Pin = pdm::Pin { port: 1, pin: 23 };
-const MIC_DIN: pdm::Pin = pdm::Pin { port: 1, pin: 24 };
+pub(crate) const MIC_CLK: pdm::Pin = pdm::Pin { port: 1, pin: 23 };
+pub(crate) const MIC_DIN: pdm::Pin = pdm::Pin { port: 1, pin: 24 };
 
 // One PDM hop = 20 ms; ping-pong pair for the record command.
 #[repr(C, align(4))]
-struct PdmBuf([i16; 320]);
-static mut PDM_BUF0: PdmBuf = PdmBuf([0; 320]);
-static mut PDM_BUF1: PdmBuf = PdmBuf([0; 320]);
+pub(crate) struct PdmBuf(pub [i16; 320]);
+pub(crate) static mut PDM_BUF0: PdmBuf = PdmBuf([0; 320]);
+pub(crate) static mut PDM_BUF1: PdmBuf = PdmBuf([0; 320]);
 
 /// Record `n` 16 kHz samples into `dst` (blocking). Returns overrun count.
 unsafe fn record(dst: *mut i16, n: usize) -> i32 {
@@ -525,6 +526,29 @@ fn main() -> ! {
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*mb).status), rc);
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*mb).magic), MAILBOX_FAIL);
         }
+    }
+
+    // Grace window: a connected host (tape player / decode driver) issues
+    // its PING right after the magic appears. If one does, stay a mailbox
+    // executor; otherwise go standalone (which itself falls back here when
+    // no SD image is present).
+    for _ in 0..300 {
+        cortex_m::asm::delay(1_280_000); // 10 ms
+        unsafe {
+            let seq = core::ptr::read_volatile(core::ptr::addr_of!((*mb).cmd_seq));
+            if seq != core::ptr::read_volatile(core::ptr::addr_of!((*mb).ack_seq)) {
+                rprintln!("host detected: mailbox mode");
+                mailbox_loop();
+            }
+        }
+    }
+    app::run();
+}
+
+/// The host-driven executor (also the fallback when standalone cannot start).
+pub fn mailbox_loop() -> ! {
+    let mb = core::ptr::addr_of_mut!(MAILBOX);
+    unsafe {
         loop {
             let seq = core::ptr::read_volatile(core::ptr::addr_of!((*mb).cmd_seq));
             if seq == core::ptr::read_volatile(core::ptr::addr_of!((*mb).ack_seq)) {

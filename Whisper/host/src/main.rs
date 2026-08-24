@@ -157,7 +157,10 @@ fn main() -> Result<()> {
             selftest(&args[1], &args[2], &args[3], &args[4])
         }
         Some("tape") if args.len() == 3 => tape(&args[1], &args[2]),
-        Some("decode") if args.len() == 4 => decode::decode(&args[1], &args[2], &args[3]),
+        Some("decode") if args.len() >= 4 => decode::decode(
+            &args[1], &args[2], &args[3],
+            args.get(4).map(String::as_str) == Some("--sd"),
+        ),
         Some("halt") => halt_info(),
         _ => bail!(
             "usage: whisper-host selftest <firmware.elf> <blob.bin> <input.bin> <expect.bin>\n\

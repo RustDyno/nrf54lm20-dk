@@ -21,6 +21,9 @@ use serde::Deserialize;
 
 use crate::{setup, Mailbox, CMD_PING, CMD_RUN_NPU, SLOT_BASE};
 
+const CMD_SD_INIT: u32 = 20;
+const CMD_SD_READ: u32 = 21;
+
 const CMD_LUT8: u32 = 3;
 const CMD_LN: u32 = 8;
 const CMD_ADD16: u32 = 9;
@@ -98,6 +101,8 @@ struct Dev<'a> {
     blobs_dir: PathBuf,
     loaded: String,
     streamed: usize,
+    /// blob name -> (lba, bytes) when weights come from the SD card
+    sd_index: Option<HashMap<String, (u32, u32)>>,
 }
 
 impl<'a> Dev<'a> {
@@ -105,10 +110,22 @@ impl<'a> Dev<'a> {
         if self.loaded == name {
             return Ok(());
         }
-        let data = std::fs::read(self.blobs_dir.join(format!("{name}.bin")))
-            .with_context(|| format!("blob {name}"))?;
-        self.core.write(SLOT_BASE, &data)?;
-        self.streamed += data.len();
+        if let Some(ix) = &self.sd_index {
+            let (lba, bytes) = *ix
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("{name} not on the card"))?;
+            let blocks = bytes.div_ceil(512);
+            let rc = self.mb.call(&mut self.core, CMD_SD_READ,
+                                  &[lba, SLOT_BASE as u32, blocks])?;
+            if rc != 0 {
+                bail!("SD read of {name} failed with {rc}");
+            }
+        } else {
+            let data = std::fs::read(self.blobs_dir.join(format!("{name}.bin")))
+                .with_context(|| format!("blob {name}"))?;
+            self.core.write(SLOT_BASE, &data)?;
+            self.streamed += data.len();
+        }
         self.loaded = name.to_string();
         Ok(())
     }
@@ -205,7 +222,7 @@ fn requant8(v: i8, from: Q, to: Q) -> i8 {
     ((f / to.scale).round() as i32 + to.zp).clamp(-128, 127) as i8
 }
 
-pub fn decode(elf: &str, plan_dir: &str, blobs_dir: &str) -> Result<()> {
+pub fn decode(elf: &str, plan_dir: &str, blobs_dir: &str, use_sd: bool) -> Result<()> {
     let dir = Path::new(plan_dir);
     let plan: Plan = serde_json::from_str(
         &std::fs::read_to_string(dir.join("plan.json")).context("plan.json")?)?;
@@ -235,15 +252,34 @@ pub fn decode(elf: &str, plan_dir: &str, blobs_dir: &str) -> Result<()> {
 
     let (mut session, mailbox_addr, _rtt) = setup(elf)?;
     let core = session.core(0)?;
+    let sd_index = if use_sd {
+        let raw: HashMap<String, serde_json::Value> = serde_json::from_str(
+            &std::fs::read_to_string(Path::new(plan_dir).join("../sd-index.json"))
+                .context("sd-index.json")?)?;
+        Some(raw.into_iter().map(|(k, v)| {
+            (k, (v["lba"].as_u64().unwrap() as u32,
+                 v["bytes"].as_u64().unwrap() as u32))
+        }).collect())
+    } else {
+        None
+    };
     let mut dev = Dev {
         mb: Mailbox { base: mailbox_addr, seq: 0 },
         core,
         blobs_dir: PathBuf::from(blobs_dir),
         loaded: String::new(),
         streamed: 0,
+        sd_index,
     };
     dev.mb.seq = dev.core.read_word_32(mailbox_addr + 4)?;
     dev.mb.call(&mut dev.core, CMD_PING, &[])?;
+    if dev.sd_index.is_some() {
+        let rc = dev.mb.call(&mut dev.core, CMD_SD_INIT, &[])?;
+        if rc != 0 {
+            bail!("SD init failed with {rc}");
+        }
+        eprintln!("weights from the SD card");
+    }
 
     // --- cross K/V, computed on the NPU once per chunk -------------------
     eprintln!("computing cross K/V on the device ...");

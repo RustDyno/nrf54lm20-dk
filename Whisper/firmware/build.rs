@@ -1,12 +1,13 @@
 use std::env;
 use std::path::PathBuf;
 
-// Axon buffer sizes (bytes). Measured needs for the FRAME_TILE=64 submodel
-// set (width-major layout): FC tiles 24576, conv1 29856, conv2 tile 58112,
-// psum 0 everywhere. Generous headroom for larger tiles; shrink these when
-// the tape planner fixes the final RAM budget. Keep in sync with src/main.rs.
-const INTERLAYER_BUFFER_SIZE: &str = "147456";
-const PSUM_BUFFER_SIZE: &str = "16384";
+// Axon buffer sizes (bytes). Measured needs across ALL 116 submodels:
+// FC tiles 24576, conv1 29856, conv2 tile 58112, decoder token blobs less;
+// psum 0 everywhere. Sized to the maximum plus slack -- the freed RAM holds
+// the standalone decoder's self-attention KV cache. Keep in sync with
+// src/main.rs AND tools/make-blob.sh (blobs bake the static_assert).
+const INTERLAYER_BUFFER_SIZE: &str = "65536";
+const PSUM_BUFFER_SIZE: &str = "4096";
 
 // Nordic driver blob + open C wrappers + headers, shared with the npu/ crate
 // (vendor/ there is populated from the sdk-edge-ai add-on; see npu/README.md).

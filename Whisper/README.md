@@ -116,20 +116,34 @@ activations| ORCH
       bound). Token-rate submodels run at width 4 (pointwise conv
       minimum); the LM head (final LN + vocab projection) runs on the
       host in f32 from the int16 residual.
-- [ ] M5 (in progress): STANDALONE -- SD card as the local weight store
-      (no host in the data path), then mic + on-device log-mel.
-      Stage A done in code: SPIM22 SD driver (SPI mode, 8 MHz, ~700 KB/s
-      expected), mailbox commands SD_INIT/READ/WRITE, raw image builder
-      (out/sd.img, 120 MB: all 116 blobs + decoder assets), SD smoke-test
-      tape. AWAITING HARDWARE: wire a microSD breakout to the DK
-      expansion header (3.3 V):
-          SCK -> P3.3   MOSI -> P3.0   MISO -> P3.1   CS -> P3.2
-      and write the image with a USB reader:
-          sudo dd if=model/out/sd.img of=/dev/sdX bs=4M conv=fsync
-      then: whisper-host tape <elf> model/out/tape-sdtest/tape.json
-      Stage B: decode driver reads blobs/KV from SD (~15 s/token).
-      Stage C: encoder sequencer + decode loop in firmware, PDM mic +
-      log-mel frontend -> button-free standalone transcriber.
+- [x] Mic + on-device log-mel: hardware-verified (mel bit-exact vs the
+      mirror; the mirror matches whisper's own pipeline to 3e-5).
+- [x] M5 BUILT, AWAITING SD HARDWARE TEST: the firmware is a complete
+      standalone transcriber. At boot it waits 3 s for a host (tape and
+      decode drivers still work), then: SD init -> record 12 s from the
+      PDM mic -> log-mel -> full encoder -> cross K/V -> greedy decode
+      with an on-device LM head over a 12230-token pruned vocabulary
+      (GPT-2 BPE ids < 12288 minus whisper's suppress set) -> transcript
+      printed over RTT, then it listens again. All weights/scratch on
+      the card; expected ~10 min per utterance at 8 MHz SPI.
+
+## Testing the standalone build (when the SD breakout is wired)
+
+1. Wire a microSD breakout to the expansion header (3.3 V):
+       SCK -> P3.3   MOSI -> P3.0   MISO -> P3.1   CS -> P3.2
+2. Write the image (44 MB) with a USB reader:
+       sudo dd if=model/out/sd.img of=/dev/sdX bs=4M conv=fsync
+3. SD smoke test (round-trip + image magic):
+       cd host && cargo run --release -- tape \
+         ../firmware/target/thumbv8m.main-none-eabihf/release/whisper-firmware \
+         ../model/out/tape-sdtest/tape.json
+4. Host-driven decode with card-sourced weights (stage B, ~15 s/token):
+       cargo run --release -- decode <elf> ../model/out/decoder-plan \
+         ../model/out/blobs --sd
+5. Fully standalone: flash with `cargo run --release` in firmware/, keep
+   an RTT viewer attached (probe-rs attach), do not send any host
+   command -- after 3 s the firmware goes standalone and starts
+   listening. Speak during the 12 s window.
 - [ ] M4 greedy decoder -> first on-device transcript
 - [ ] M5 PDM mic + on-device log-mel frontend
 

@@ -18,8 +18,8 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 vendor="$here/../../npu/vendor"
 
 # Must match build.rs / src/main.rs.
-interlayer=147456
-psum=16384
+interlayer=65536
+psum=4096
 slot_magic=0x4C415952
 
 if [[ $# -ne 3 ]]; then
