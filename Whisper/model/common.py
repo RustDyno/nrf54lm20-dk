@@ -77,6 +77,20 @@ def weight_qparams(w, axis=0):
     return q, np.squeeze(scales)
 
 
+def submodel_names(l):
+    """Per-block Axon submodel names. Block 0 keeps the names it was first
+    compiled under; later blocks use a uniform w{l}<kind> scheme."""
+    if l == 0:
+        n = {"q": "wq0", "k": "wk0", "v": "wv0", "out": "wout0"}
+        n.update({f"fc1{p}": f"wfc1{p}" for p in "abcd"})
+        n.update({f"fc2p{j}": f"wfc2p{j}" for j in range(4)})
+        return n
+    n = {"q": f"w{l}q", "k": f"w{l}k", "v": f"w{l}v", "out": f"w{l}out"}
+    n.update({f"fc1{p}": f"w{l}fc1{p}" for p in "abcd"})
+    n.update({f"fc2p{j}": f"w{l}fc2p{j}" for j in range(4)})
+    return n
+
+
 # --- weight loading --------------------------------------------------------
 
 def load_weights():

@@ -39,6 +39,7 @@ CMD_RUN_NPU = 2
 CMD_LUT8 = 3
 CMD_LN = 8
 CMD_ADD16 = 9
+CMD_ADDPOS = 10
 CMD_ATTN_HEAD = 12
 CMD_FC2SUM = 13
 
@@ -96,11 +97,11 @@ class Tape:
         self.steps.append({"op": "cmd", "code": code,
                            "args": [int(x) for x in args]})
 
-    def check(self, name, data, addr, label, tol=0):
+    def check(self, name, data, addr, label, tol=0, width=1):
         with open(os.path.join(self.dir, name), "wb") as f:
             f.write(data)
         self.steps.append({"op": "check", "file": name, "addr": int(addr),
-                           "label": label, "tol": tol})
+                           "label": label, "tol": tol, "width": width})
 
     def save(self):
         with open(os.path.join(self.dir, "tape.json"), "w") as f:
@@ -142,16 +143,18 @@ def ln_golden(x16, sq, gamma, beta, out_q):
     return q8(y, out_q)
 
 
-def attn_golden(qv, kv, vv, q_q, k_q, v_q, ctx_q):
-    """Fused per-head attention, planar [C, W] in/out."""
+def attn_golden(qv, kv, vv, q_q, k_q, v_q, ctx_q, tk=None):
+    """Fused per-head attention, planar [C, W] in/out. `tk` limits the keys
+    (padding frames are queries but never keys)."""
     wq = qv.shape[1]
+    tk = kv.shape[1] if tk is None else tk
     score_mult = np.float32(q_q[0] * k_q[0] / np.sqrt(HD))
     ctx = np.empty((C, wq), np.int8)
     for h in range(common.HEADS):
         r = slice(h * HD, (h + 1) * HD)
         qi = qv[r].astype(np.int64) - q_q[1]
-        ki = kv[r].astype(np.int64) - k_q[1]
-        vi = vv[r].astype(np.int64) - v_q[1]
+        ki = kv[r, :tk].astype(np.int64) - k_q[1]
+        vi = vv[r, :tk].astype(np.int64) - v_q[1]
         scores = (qi.T @ ki).astype(np.float32) * score_mult  # [wq, tk]
         m = scores.max(1, keepdims=True)
         e = np.exp(scores - m, dtype=np.float32)
@@ -180,12 +183,17 @@ def fc2sum_golden(parts, pqs, a16, qa, qd):
 
 # --- tape generators --------------------------------------------------------
 
+def capture(sd, scales, names, mode="int8"):
+    """Record simulation site values (int8 device-semantics sim or float)."""
+    ref = np.load(os.path.join(common.OUT, "ref.npz"))
+    eng = layered.Engine(sd, mode, scales, record=set(names))
+    layered.encoder(eng, ref["mel_chunk"], common.AUDIO_CTX)
+    return eng.recorded
+
+
 def capture_x16(sd, scales):
     """First-block input residual from the device-semantics simulation."""
-    ref = np.load(os.path.join(common.OUT, "ref.npz"))
-    eng = layered.Engine(sd, "int8", scales, record={"enc.x"})
-    layered.encoder(eng, ref["mel_chunk"], common.AUDIO_CTX)
-    x = eng.recorded["enc.x"][:T_TILE]
+    x = capture(sd, scales, ["enc.x"])["enc.x"][:T_TILE]
     s16 = scales["enc.x"]
     return common.quantize(x, s16[0], s16[1], bits=16).T.copy(), s16
 
@@ -278,7 +286,7 @@ def gen_block0(sd, scales):
         a_p = t.write(f"b0_res1c{ci}_p.bin", params)
         t.cmd(CMD_ADD16, [a_p])
         t.check(f"b0_res1c{ci}_exp.bin", g_res1.reshape(-1)[sl].tobytes(),
-                a_dst, f"b0_res1c{ci}", tol=1)
+                a_dst, f"b0_res1c{ci}", tol=1, width=2)
 
     # LN2 + MLP
     s16_saved = s16
@@ -321,7 +329,7 @@ def gen_block0(sd, scales):
         a_p = t.write(f"b0_fc2s{ci}_p.bin", params)
         t.cmd(CMD_FC2SUM, [a_p])
         t.check(f"b0_fc2s{ci}_exp.bin", g_res2.reshape(-1)[sl].tobytes(),
-                a_dst, f"b0_fc2sum{ci}", tol=1)
+                a_dst, f"b0_fc2sum{ci}", tol=1, width=2)
 
     t.save()
 
@@ -352,13 +360,277 @@ def gen_ln1q(sd, scales):
     t.save()
 
 
+# --- the full encoder at audio_ctx=600, frame-tiled --------------------------
+
+CTX = common.AUDIO_CTX      # real encoder frames
+PAD_W = 640                 # padded to a whole number of 64-frame tiles
+MEL_W = 2 * PAD_W
+
+
+def gen_encoder(sd, scales):
+    t = Tape(os.path.join(common.OUT, "tape-encoder"))
+    ref = np.load(os.path.join(common.OUT, "ref.npz"))
+
+    conv1 = Submodel("wconv1")
+    conv2 = [Submodel(f"wconv2{p}") for p in "abc"]
+    assert conv2[0].in_q == conv2[1].in_q == conv2[2].in_q
+
+    # Divergence tracking against the int8 simulation, per stage: the tape's
+    # checks only prove device == device-model; this is the quality signal.
+    sim_sites = ["enc.conv1", "enc.gelu1", "enc.conv2", "enc.gelu2", "enc.x",
+                 "enc.out"]
+    for l in range(common.N_LAYERS):
+        sim_sites += [f"enc.b{l}.{s}"
+                      for s in ("ln1", "q", "ctx", "res1", "res2")]
+    which_ref = os.environ.get("TAPE_REF", "int8")
+    sim = capture(sd, scales, sim_sites, mode=which_ref)
+    print(f"stage divergence vs the {which_ref} pipeline:")
+
+    def snr(name, planar, q):
+        """planar int array [C, W]; sim site is [frames, C] fake-quant."""
+        s = sim.get(name)
+        if s is None:
+            return
+        dev = dq(planar[:, :s.shape[0]].T, q)
+        err = float(np.sqrt(np.mean((dev - s) ** 2)))
+        sig = float(np.sqrt(np.mean(s ** 2))) or 1e-9
+        print(f"  {name}: snr {20 * np.log10(sig / max(err, 1e-9)):6.1f} dB")
+
+    def npu_tiled(label, model, full, t_in, t_out, halo_pad, blob_stride=1):
+        """Run `model` over frame tiles of a full planar array.
+        full [C, W_in]; returns golden [C_out, n_tiles*t_out]."""
+        cin = full.shape[0]
+        n_tiles = (full.shape[1] * t_out) // (t_in - 2 * halo_pad) // t_out
+        src = np.pad(full, ((0, 0), (halo_pad, halo_pad)),
+                     constant_values=model.in_q[1]) if halo_pad else full
+        t.reset()
+        a_in = t.alloc(cin * t_in)
+        a_out = t.alloc(0)  # placeholder; sized below on first tile
+        outs = []
+        t.blob(model.name)
+        for i in range(n_tiles):
+            lo = i * (t_in - 2 * halo_pad) * blob_stride // blob_stride
+            tile = np.ascontiguousarray(src[:, lo:lo + t_in])
+            g = model.run(tile)
+            if i == 0:
+                a_out = t.alloc(g.nbytes)
+            t.write(f"{label}_t{i}_in.bin", tile.tobytes(), a_in)
+            t.cmd(CMD_RUN_NPU, [a_in, a_out])
+            t.check(f"{label}_t{i}_exp.bin", g.tobytes(), a_out,
+                    f"{label}[{i}]", tol=1)
+            outs.append(g)
+        return np.concatenate(outs, axis=1)
+
+    def lut_stage(label, lut, full):
+        """Elementwise int8 LUT over a full planar array, flat-chunked."""
+        g = lut[full.astype(np.int32) + 128]
+        flat_g, flat_in = g.reshape(-1), full.reshape(-1)
+        chunk = 24576
+        t.reset()
+        a_lut = t.write(f"{label}_lut.bin", lut.tobytes())
+        a_in = t.alloc(chunk)
+        a_out = t.alloc(chunk)
+        for ci, lo in enumerate(range(0, flat_in.size, chunk)):
+            n = min(chunk, flat_in.size - lo)
+            t.write(f"{label}_c{ci}_in.bin", flat_in[lo:lo + n].tobytes(), a_in)
+            t.cmd(CMD_LUT8, [a_lut, a_in, a_out, n])
+            t.check(f"{label}_c{ci}_exp.bin", flat_g[lo:lo + n].tobytes(),
+                    a_out, f"{label}[{ci}]", tol=0)
+        return g
+
+    def ln_tiled(label, src16, sq, w_name, out_q):
+        gamma, beta = sd[w_name + ".weight"], sd[w_name + ".bias"]
+        g = ln_golden(src16, sq, gamma, beta, out_q)
+        t.reset()
+        a_gb = t.write(f"{label}_gb.bin",
+                       gamma.astype("<f4").tobytes()
+                       + beta.astype("<f4").tobytes())
+        a_in = t.alloc(2 * C * T_TILE)
+        a_out = t.alloc(C * T_TILE)
+        params = struct.pack("<6I", a_in, a_out, C, T_TILE, a_gb,
+                             a_gb + 4 * C) \
+            + pack_quant(*sq[:2]) + pack_quant(*out_q)
+        a_p = t.write(f"{label}_p.bin", params)
+        for i in range(PAD_W // T_TILE):
+            sl = slice(i * T_TILE, (i + 1) * T_TILE)
+            t.write(f"{label}_t{i}_in.bin",
+                    np.ascontiguousarray(src16[:, sl]).tobytes(), a_in)
+            t.cmd(CMD_LN, [a_p])
+            t.check(f"{label}_t{i}_exp.bin",
+                    np.ascontiguousarray(g[:, sl]).tobytes(), a_out,
+                    f"{label}[{i}]", tol=1)
+        return g
+
+    def add16_chunked(label, a16, qa, b8, qb, qd):
+        g = add16_golden(a16, qa, b8, qb, qd)
+        fa, fb, fg = a16.reshape(-1), b8.reshape(-1), g.reshape(-1)
+        chunk = 12288
+        for ci, lo in enumerate(range(0, fa.size, chunk)):
+            n = min(chunk, fa.size - lo)
+            t.reset()
+            a_a = t.write(f"{label}_c{ci}_a.bin", fa[lo:lo + n].tobytes())
+            a_b = t.write(f"{label}_c{ci}_b.bin", fb[lo:lo + n].tobytes())
+            a_d = t.alloc(2 * n)
+            params = struct.pack("<4I", a_a, a_b, a_d, n) \
+                + pack_quant(*qa[:2]) + pack_quant(*qb[:2]) \
+                + pack_quant(*qd[:2])
+            a_p = t.write(f"{label}_c{ci}_p.bin", params)
+            t.cmd(CMD_ADD16, [a_p])
+            t.check(f"{label}_c{ci}_exp.bin", fg[lo:lo + n].tobytes(), a_d,
+                    f"{label}[{ci}]", tol=1, width=2)
+        return g
+
+    # --- stem: mel -> conv1 -> gelu -> conv2 -> gelu -> +pos -> x16 --------
+    mel = ref["mel_chunk"]  # [80, 1200] float
+    mel_q = q8(np.pad(mel, ((0, 0), (0, MEL_W - mel.shape[1]))), conv1.in_q)
+    g_c1 = npu_tiled("conv1", conv1, mel_q, T_TILE + 2, T_TILE, 1)
+    snr("enc.conv1", g_c1, conv1.out_q)
+    lut1 = gelu_lut(conv1.out_q, conv2[0].in_q)
+    g_g1 = lut_stage("gelu1", lut1, g_c1)
+    snr("enc.gelu1", g_g1, conv2[0].in_q)
+
+    gelu2_q = scales["enc.gelu2"]
+    parts = []
+    for p, m in zip("abc", conv2):
+        g = npu_tiled(f"conv2{p}", m, g_g1, 2 * T_TILE + 2, T_TILE, 1,
+                      blob_stride=2)
+        lut = gelu_lut(m.out_q, gelu2_q[:2])
+        parts.append(lut_stage(f"gelu2{p}", lut, g))
+    g_g2 = np.concatenate(parts, axis=0)  # [384, 640] at gelu2_q
+    snr("enc.gelu2", g_g2, gelu2_q)
+
+    # positional embedding add -> int16 residual (chunked ADDPOS)
+    s16 = scales["enc.x"]
+    pos = np.zeros((C, PAD_W), np.float32)
+    pos[:, :CTX] = sd["encoder.positional_embedding"][:CTX].T
+    x16 = common.quantize(dq(g_g2, gelu2_q) + pos, s16[0], s16[1], bits=16)
+    snr("enc.x", x16, s16)
+    fa, fp, fg = g_g2.reshape(-1), pos.reshape(-1), x16.reshape(-1)
+    chunk = 12288
+    for ci, lo in enumerate(range(0, fa.size, chunk)):
+        n = min(chunk, fa.size - lo)
+        t.reset()
+        a_a = t.write(f"pos_c{ci}_a.bin", fa[lo:lo + n].tobytes())
+        a_b = t.write(f"pos_c{ci}_b.bin",
+                      fp[lo:lo + n].astype("<f4").tobytes())
+        a_d = t.alloc(2 * n)
+        params = struct.pack("<4I", a_a, a_b, a_d, n) \
+            + pack_quant(*gelu2_q[:2]) + pack_quant(*s16[:2])
+        a_p = t.write(f"pos_c{ci}_p.bin", params)
+        t.cmd(CMD_ADDPOS, [a_p])
+        t.check(f"pos_c{ci}_exp.bin", fg[lo:lo + n].tobytes(), a_d,
+                f"pos[{ci}]", tol=1, width=2)
+
+    # --- transformer blocks ------------------------------------------------
+    sq = s16
+    for l in range(common.N_LAYERS):
+        p = f"encoder.blocks.{l}."
+        names = common.submodel_names(l)
+        mq = {k: Submodel(v) for k, v in names.items()}
+        assert mq["q"].in_q == mq["k"].in_q == mq["v"].in_q
+        assert len({mq[f"fc1{c}"].in_q for c in "abcd"}) == 1
+        r1_q = scales[f"enc.b{l}.res1"]
+        r2_q = scales[f"enc.b{l}.res2"]
+
+        g_ln1 = ln_tiled(f"b{l}_ln1", x16, sq, p + "attn_ln", mq["q"].in_q)
+        snr(f"enc.b{l}.ln1", g_ln1, mq["q"].in_q)
+        g_q = npu_tiled(f"b{l}_q", mq["q"], g_ln1, T_TILE, T_TILE, 0)
+        snr(f"enc.b{l}.q", g_q, mq["q"].out_q)
+        g_k = npu_tiled(f"b{l}_k", mq["k"], g_ln1, T_TILE, T_TILE, 0)
+        g_v = npu_tiled(f"b{l}_v", mq["v"], g_ln1, T_TILE, T_TILE, 0)
+
+        # attention: K/V resident per head, q/ctx tiles cycled
+        q_q, k_q, v_q = mq["q"].out_q, mq["k"].out_q, mq["v"].out_q
+        ctx_q = mq["out"].in_q
+        g_ctx = attn_golden(g_q, g_k, g_v, q_q, k_q, v_q, ctx_q, tk=CTX)
+        score_mult = np.float32(q_q[0] * k_q[0] / np.sqrt(HD))
+        for h in range(common.HEADS):
+            r = slice(h * HD, (h + 1) * HD)
+            t.reset()
+            a_k = t.write(f"b{l}_attn_h{h}_k.bin",
+                          np.ascontiguousarray(g_k[r]).tobytes())
+            a_v = t.write(f"b{l}_attn_h{h}_v.bin",
+                          np.ascontiguousarray(g_v[r]).tobytes())
+            a_q = t.alloc(HD * T_TILE)
+            a_c = t.alloc(HD * T_TILE)
+            params = struct.pack(
+                "<9I3i", a_q, a_k, a_v, a_c, HD, T_TILE, T_TILE, CTX, PAD_W,
+                int(q_q[1]), int(k_q[1]), int(v_q[1])) \
+                + struct.pack("<ff", score_mult, v_q[0]) + pack_quant(*ctx_q)
+            a_p = t.write(f"b{l}_attn_h{h}_p.bin", params)
+            for i in range(PAD_W // T_TILE):
+                sl = slice(i * T_TILE, (i + 1) * T_TILE)
+                t.write(f"b{l}_attn_h{h}_t{i}_q.bin",
+                        np.ascontiguousarray(g_q[r, sl]).tobytes(), a_q)
+                t.cmd(CMD_ATTN_HEAD, [a_p])
+                t.check(f"b{l}_attn_h{h}_t{i}_exp.bin",
+                        np.ascontiguousarray(g_ctx[r, sl]).tobytes(), a_c,
+                        f"b{l}_attn_h{h}[{i}]", tol=1)
+
+        snr(f"enc.b{l}.ctx", g_ctx, ctx_q)
+        g_o = npu_tiled(f"b{l}_out", mq["out"], g_ctx, T_TILE, T_TILE, 0)
+        g_res1 = add16_chunked(f"b{l}_res1", x16, sq, g_o,
+                               mq["out"].out_q, r1_q)
+        snr(f"enc.b{l}.res1", g_res1, r1_q)
+
+        g_ln2 = ln_tiled(f"b{l}_ln2", g_res1, r1_q, p + "mlp_ln",
+                         mq["fc1a"].in_q)
+        g_p2, pqs = [], []
+        for j, part in enumerate("abcd"):
+            f1 = npu_tiled(f"b{l}_fc1{part}", mq[f"fc1{part}"], g_ln2,
+                           T_TILE, T_TILE, 0)
+            lut = gelu_lut(mq[f"fc1{part}"].out_q, mq[f"fc2p{j}"].in_q)
+            gg = lut_stage(f"b{l}_gelu{j}", lut, f1)
+            g_p2.append(npu_tiled(f"b{l}_fc2p{j}", mq[f"fc2p{j}"], gg,
+                                  T_TILE, T_TILE, 0))
+            pqs.append(mq[f"fc2p{j}"].out_q)
+
+        g_res2 = fc2sum_golden(g_p2, pqs, g_res1, r1_q, r2_q)
+        fr1, fr2 = g_res1.reshape(-1), g_res2.reshape(-1)
+        fp2 = [g.reshape(-1) for g in g_p2]
+        chunk = 12288
+        for ci, lo in enumerate(range(0, fr1.size, chunk)):
+            n = min(chunk, fr1.size - lo)
+            t.reset()
+            a_parts = [t.write(f"b{l}_fc2s{ci}_p{j}.bin",
+                               fp2[j][lo:lo + n].tobytes())
+                       for j in range(4)]
+            a_a = t.write(f"b{l}_fc2s{ci}_a.bin", fr1[lo:lo + n].tobytes())
+            a_d = t.alloc(2 * n)
+            params = struct.pack("<7I", *a_parts, a_a, a_d, n) \
+                + b"".join(pack_quant(*q) for q in pqs) \
+                + pack_quant(*r1_q[:2]) + pack_quant(*r2_q[:2])
+            a_p = t.write(f"b{l}_fc2s{ci}_p.bin", params)
+            t.cmd(CMD_FC2SUM, [a_p])
+            t.check(f"b{l}_fc2s{ci}_exp.bin", fr2[lo:lo + n].tobytes(), a_d,
+                    f"b{l}_fc2sum[{ci}]", tol=1, width=2)
+
+        snr(f"enc.b{l}.res2", g_res2, r2_q)
+        x16, sq = g_res2, r2_q
+
+    # --- final layernorm ---------------------------------------------------
+    out_q = scales["enc.out"]
+    assert out_q[2] == 8
+    g_out = ln_tiled("ln_post", x16, sq, "encoder.ln_post", out_q[:2])
+    t.save()
+
+    # offline: how far is the device pipeline from the int8 simulation?
+    sim = capture(sd, scales, ["enc.out"])["enc.out"]  # [600, 384] f32
+    dev = dq(g_out[:, :CTX].T, out_q)
+    err = float(np.sqrt(np.mean((dev - sim) ** 2)))
+    sig = float(np.sqrt(np.mean(sim ** 2)))
+    print(f"device-model encoder vs int8 sim: rms err {err:.4f} "
+          f"(signal {sig:.4f}, snr {20 * np.log10(sig / max(err, 1e-9)):.1f} dB)")
+
+
 def main():
     _, sd = common.load_weights()
     with open(os.path.join(common.OUT, "scales.json")) as f:
         scales = {k: (v["scale"], v["zp"], v["bits"])
                   for k, v in json.load(f).items()}
     which = sys.argv[1] if len(sys.argv) > 1 else "block0"
-    {"ln1q": gen_ln1q, "block0": gen_block0}[which](sd, scales)
+    {"ln1q": gen_ln1q, "block0": gen_block0,
+     "encoder": gen_encoder}[which](sd, scales)
 
 
 if __name__ == "__main__":

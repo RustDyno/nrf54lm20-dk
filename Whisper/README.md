@@ -100,9 +100,16 @@ activations| ORCH
 - [x] ENCODER BLOCK 0 fully verified on hardware: 25/25 stage checks
       (LN, q/k/v, 6 fused CPU attention heads, out-proj, residuals, tiled
       MLP with GELU LUTs and fc2 recombination), 12 streamed blobs, 65 s.
-- [ ] M3 rest: all 4 blocks + convs at full audio context, frame tiling,
-      host-paged activations; then the encoder end to end vs the simulation
-- [ ] M4 greedy decoder -> first on-device transcript
+- [x] M3: THE FULL ENCODER VERIFIED ON HARDWARE at audio_ctx=600: conv
+      stem (halo-tiled), positional embedding, all 4 transformer blocks
+      (frame-tiled, per-head attention over 600 keys), final layernorm.
+      1232/1232 stage checks within tolerance (worst deviation: 3 int16
+      elements off by 1 LSB); 4458 steps, 52 blobs, 43 MB, 49 min.
+      Submodels are calibrated on REAL recorded activations (random-data
+      calibration saturated block-3's fc2 and destroyed accuracy; the
+      per-stage SNR ladder in tape.py is the guard).
+- [ ] M4 greedy decoder -> first on-device transcript (single-token FC
+      needs width padding to 4; logits host-side first, on-device option)
 - [ ] M4 greedy decoder -> first on-device transcript
 - [ ] M5 PDM mic + on-device log-mel frontend
 

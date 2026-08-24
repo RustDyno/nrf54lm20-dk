@@ -175,14 +175,21 @@ enum Step {
     /// Issue a mailbox command; nonzero status aborts the tape.
     Cmd { code: u32, #[serde(default)] args: Vec<u32> },
     /// Compare device memory against a file (byte length = file length).
+    /// `width` is the element size (1 = int8, 2 = int16 little-endian);
+    /// tolerances apply per element, not per byte.
     Check {
         file: String,
         addr: u64,
         label: String,
         #[serde(default)] tol: i32,
+        #[serde(default = "default_width")] width: u32,
     },
     /// Dump device memory to a file.
     Read { file: String, addr: u64, len: u32 },
+}
+
+fn default_width() -> u32 {
+    1
 }
 
 #[derive(Deserialize)]
@@ -239,14 +246,20 @@ fn tape(elf: &str, tape_path: &str) -> Result<()> {
                     bail!("step {i}: cmd {code} failed with status {rc}");
                 }
             }
-            Step::Check { file, addr, label, tol } => {
+            Step::Check { file, addr, label, tol, width } => {
                 let expect = std::fs::read(dir.join(file))
                     .with_context(|| format!("expect {file}"))?;
                 let mut got = vec![0u8; expect.len()];
                 core.read_8(*addr, &mut got)?;
                 let (mut diffs, mut maxerr) = (0usize, 0i32);
-                for (g, e) in got.iter().zip(expect.iter()) {
-                    let d = (*g as i8 as i32 - *e as i8 as i32).abs();
+                let elem = |b: &[u8], i: usize| -> i32 {
+                    match width {
+                        2 => i16::from_le_bytes([b[2 * i], b[2 * i + 1]]) as i32,
+                        _ => b[i] as i8 as i32,
+                    }
+                };
+                for i in 0..expect.len() / *width as usize {
+                    let d = (elem(&got, i) - elem(&expect, i)).abs();
                     if d > *tol {
                         diffs += 1;
                     }

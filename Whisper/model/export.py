@@ -11,28 +11,29 @@ This currently emits one instance of each distinct submodel shape (the Axon
 compiler acceptance test). The full per-layer export + manifest lands with the
 firmware tape format.
 
-Run simulate.py first (needs out/scales.json for representative ranges).
+Run whisper_ref.py first (needs out/ref.npz for the calibration clip).
 """
 
-import json
 import os
+import sys
 
 import numpy as np
 
 import common
+from common import submodel_names
 
 FRAME_TILE = 64  # frames per NPU invocation (encoder)
 
 
-def in_range(scales, site):
-    s = scales[site]
-    lvl = 2 ** s["bits"]
-    return ((-lvl // 2 - s["zp"]) * s["scale"],
-            (lvl // 2 - 1 - s["zp"]) * s["scale"])
+def emit(name, w, b, stride, t_in, acts, out_dir):
+    """w [out, in, k] (k=1 for FC), b or None -> int8 tflite at out_dir.
 
-
-def emit(name, w, b, stride, t_in, lo, hi, out_dir):
-    """w [out, in, k] (k=1 for FC), b or None -> int8 tflite at out_dir."""
+    `acts` is the REAL input activation record [frames, C_in] (float
+    pipeline); the converter calibrates input AND output scales from
+    contiguous windows of it. Random-uniform representative data
+    underestimated real output ranges badly enough to saturate block-3's
+    fc2 partials.
+    """
     import tensorflow as tf
 
     cout, cin, k = w.shape
@@ -43,11 +44,12 @@ def emit(name, w, b, stride, t_in, lo, hi, out_dir):
     kernel = w.transpose(2, 1, 0)[None, :, :, :]  # [1, k, in, out]
     conv.set_weights([kernel, b] if b is not None else [kernel])
 
+    assert acts.shape[1] == cin and acts.shape[0] >= t_in
     rng = np.random.default_rng(7)
 
     def rep():
-        for _ in range(8):
-            yield [rng.uniform(lo, hi, (1, 1, t_in, cin)).astype(np.float32)]
+        for s in rng.integers(0, acts.shape[0] - t_in + 1, 16):
+            yield [acts[s:s + t_in][None, None].astype(np.float32)]
 
     cv = tf.lite.TFLiteConverter.from_keras_model(m)
     cv.optimizations = [tf.lite.Optimize.DEFAULT]
@@ -82,47 +84,70 @@ def emit(name, w, b, stride, t_in, lo, hi, out_dir):
     return path
 
 
+def capture_acts(sd):
+    """Float-pipeline activations at every submodel input site."""
+    import layered
+
+    ref = np.load(os.path.join(common.OUT, "ref.npz"))
+    sites = ["enc.mel", "enc.gelu1"]
+    for l in range(common.N_LAYERS):
+        sites += [f"enc.b{l}.{s}" for s in ("ln1", "ctx", "ln2", "gelu")]
+    eng = layered.Engine(sd, "float", record=set(sites))
+    layered.encoder(eng, ref["mel_chunk"], common.AUDIO_CTX)
+    return eng.recorded
+
+
 def main():
     _, sd = common.load_weights()
-    with open(os.path.join(common.OUT, "scales.json")) as f:
-        scales = json.load(f)
     out_dir = os.path.join(common.OUT, "submodels")
     os.makedirs(out_dir, exist_ok=True)
+    acts = capture_acts(sd)
 
     t = FRAME_TILE
-    print("emitting Axon submodels (convs + encoder block 0):")
+    only = sys.argv[1:] or None  # optional submodel-name filter
+    print("emitting Axon submodels (convs + all encoder blocks):")
+
+    def maybe_emit(name, *args):
+        if only is None or name in only:
+            emit(name, *args, out_dir)
+
     # conv1: k=3 s=1, 80 -> 384; halo-padded input tile in MEL frames
     # (2 per encoder frame).
-    emit("wconv1", sd["encoder.conv1.weight"], sd["encoder.conv1.bias"],
-         1, t + 2, *in_range(scales, "enc.mel"), out_dir)
-    # conv2: k=3 s=2, 384 -> 384, output-channel tile of 128 (weight slot cap)
-    emit("wconv2a", sd["encoder.conv2.weight"][:128],
-         sd["encoder.conv2.bias"][:128],
-         2, 2 * t + 2, *in_range(scales, "enc.gelu1"), out_dir)
+    maybe_emit("wconv1", sd["encoder.conv1.weight"], sd["encoder.conv1.bias"],
+               1, t + 2, acts["enc.mel"])
+    # conv2: k=3 s=2, 384 -> 384, output-channel tiles of 128 (slot cap)
+    for i, part in enumerate("abc"):
+        rows = slice(128 * i, 128 * (i + 1))
+        maybe_emit(f"wconv2{part}", sd["encoder.conv2.weight"][rows],
+                   sd["encoder.conv2.bias"][rows],
+                   2, 2 * t + 2, acts["enc.gelu1"])
 
-    p = "encoder.blocks.0."
-    # attention projections: FC 384 -> 384 over frame tiles
-    for name, w, b, site in [
-        ("wq0", "attn.query.weight", "attn.query.bias", "enc.b0.ln1"),
-        ("wk0", "attn.key.weight", None, "enc.b0.ln1"),
-        ("wv0", "attn.value.weight", "attn.value.bias", "enc.b0.ln1"),
-        ("wout0", "attn.out.weight", "attn.out.bias", "enc.b0.ctx"),
-    ]:
-        emit(name, sd[p + w][:, :, None],
-             sd[p + b] if b else None,
-             1, t, *in_range(scales, site), out_dir)
-    # mlp fc1 output-channel tiles (bias travels with its rows)
-    for i, part in enumerate("abcd"):
-        rows = slice(384 * i, 384 * (i + 1))
-        emit(f"wfc1{part}", sd[p + "mlp.0.weight"][rows][:, :, None],
-             sd[p + "mlp.0.bias"][rows],
-             1, t, *in_range(scales, "enc.b0.ln2"), out_dir)
-    # mlp fc2 input-dim partials (partial 0 carries the bias)
-    for i in range(4):
-        cols = slice(384 * i, 384 * (i + 1))
-        emit(f"wfc2p{i}", sd[p + "mlp.2.weight"][:, cols][:, :, None],
-             sd[p + "mlp.2.bias"] if i == 0 else None,
-             1, t, *in_range(scales, "enc.b0.gelu"), out_dir)
+    for l in range(common.N_LAYERS):
+        p = f"encoder.blocks.{l}."
+        n = submodel_names(l)
+        # attention projections: FC 384 -> 384 over frame tiles
+        for key, w, b, site in [
+            ("q", "attn.query.weight", "attn.query.bias", f"enc.b{l}.ln1"),
+            ("k", "attn.key.weight", None, f"enc.b{l}.ln1"),
+            ("v", "attn.value.weight", "attn.value.bias", f"enc.b{l}.ln1"),
+            ("out", "attn.out.weight", "attn.out.bias", f"enc.b{l}.ctx"),
+        ]:
+            maybe_emit(n[key], sd[p + w][:, :, None],
+                       sd[p + b] if b else None, 1, t, acts[site])
+        # mlp fc1 output-channel tiles (bias travels with its rows)
+        for i, part in enumerate("abcd"):
+            rows = slice(384 * i, 384 * (i + 1))
+            maybe_emit(n[f"fc1{part}"],
+                       sd[p + "mlp.0.weight"][rows][:, :, None],
+                       sd[p + "mlp.0.bias"][rows],
+                       1, t, acts[f"enc.b{l}.ln2"])
+        # mlp fc2 input-dim partials (partial 0 carries the bias)
+        for i in range(4):
+            cols = slice(384 * i, 384 * (i + 1))
+            maybe_emit(n[f"fc2p{i}"],
+                       sd[p + "mlp.2.weight"][:, cols][:, :, None],
+                       sd[p + "mlp.2.bias"] if i == 0 else None,
+                       1, t, acts[f"enc.b{l}.gelu"][:, cols])
     print(f"-> {out_dir}")
 
 

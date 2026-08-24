@@ -75,6 +75,8 @@ class Engine:
     def site(self, name, x, sym=False, bits=8):
         x = np.ascontiguousarray(x, dtype=np.float32)
         if self.mode == "float":
+            if self.record is not None and name in self.record:
+                self.recorded[name] = x.copy()
             return Act(x)
         if self.mode == "calib":
             lo, hi = float(x.min()), float(x.max())
