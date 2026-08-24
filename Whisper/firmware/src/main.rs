@@ -23,6 +23,7 @@ mod bindings;
 mod kernels;
 mod libm_shims;
 mod platform;
+mod sd;
 mod slot;
 
 use kernels::Quant;
@@ -166,6 +167,9 @@ const CMD_ADDPOS: u32 = 10; // args: param block addr (AddPosParams)
 const CMD_LOGITS_MAX: u32 = 11; // args: acc, mults, idx, len, state
 const CMD_ATTN_HEAD: u32 = 12; // args: param block addr (AttnParams)
 const CMD_FC2SUM: u32 = 13; // args: param block addr (Fc2SumParams)
+const CMD_SD_INIT: u32 = 20;
+const CMD_SD_READ: u32 = 21; // args: lba, dst addr, block count
+const CMD_SD_WRITE: u32 = 22; // args: lba, src addr, block count
 
 /// Host-written parameter block for CMD_LN (all addresses absolute).
 /// Layout is channel-planar: src is i16[ch][w], dst i8[ch][w].
@@ -380,6 +384,18 @@ unsafe fn dispatch(cmd: u32, a: &[u32; 8]) -> i32 {
                 p.qd,
             );
             0
+        }
+        CMD_SD_INIT => {
+            let _wd = WdogGuard::arm();
+            sd::init()
+        }
+        CMD_SD_READ => {
+            let _wd = WdogGuard::arm();
+            sd::read_blocks(a[0], a[1] as *mut u8, a[2])
+        }
+        CMD_SD_WRITE => {
+            let _wd = WdogGuard::arm();
+            sd::write_blocks(a[0], a[1] as *const u8, a[2])
         }
         CMD_LOGITS_MAX => {
             kernels::logits_max(

@@ -116,9 +116,20 @@ activations| ORCH
       bound). Token-rate submodels run at width 4 (pointwise conv
       minimum); the LM head (final LN + vocab projection) runs on the
       host in f32 from the int16 residual.
-- [ ] M5 PDM mic + on-device log-mel frontend; single-command
-      encoder+decoder pipeline; throughput work (the SWD link is the
-      only thing between 58 minutes and a few minutes per utterance)
+- [ ] M5 (in progress): STANDALONE -- SD card as the local weight store
+      (no host in the data path), then mic + on-device log-mel.
+      Stage A done in code: SPIM22 SD driver (SPI mode, 8 MHz, ~700 KB/s
+      expected), mailbox commands SD_INIT/READ/WRITE, raw image builder
+      (out/sd.img, 120 MB: all 116 blobs + decoder assets), SD smoke-test
+      tape. AWAITING HARDWARE: wire a microSD breakout to the DK
+      expansion header (3.3 V):
+          SCK -> P3.3   MOSI -> P3.0   MISO -> P3.1   CS -> P3.2
+      and write the image with a USB reader:
+          sudo dd if=model/out/sd.img of=/dev/sdX bs=4M conv=fsync
+      then: whisper-host tape <elf> model/out/tape-sdtest/tape.json
+      Stage B: decode driver reads blobs/KV from SD (~15 s/token).
+      Stage C: encoder sequencer + decode loop in firmware, PDM mic +
+      log-mel frontend -> button-free standalone transcriber.
 - [ ] M4 greedy decoder -> first on-device transcript
 - [ ] M5 PDM mic + on-device log-mel frontend
 
