@@ -1,9 +1,14 @@
-//! SD card in SPI mode on SPIM22 (the DK's "nordic expansion" SPI).
+//! SD card in SPI mode on SPIM00, the high-speed SPI instance (32 MHz).
 //!
-//! Wiring (microSD breakout to the DK expansion header, 3.3 V):
-//!   SCK  -> P3.3    MOSI -> P3.0    MISO -> P3.1    CS -> P3.2
-//! These match the board devicetree's `nordic_expansion_spi` pinout, so
-//! standard expansion shields agree with us.
+//! Wiring (microSD breakout to the DK expansion board header P17, 3.3 V --
+//! set VDD:nRF to 3.3 V and route P2.00-P2.05 to the headers with the Board
+//! Configurator app; by default the analog switches connect them to the
+//! on-board NOR flash instead):
+//!   SCK  -> P2.01 (P17 pin 22)   MOSI -> P2.02 (P17 pin 23)
+//!   MISO -> P2.04 (P17 pin 25)   CS   -> P2.05 (P17 pin 26)
+//! These are SPIM00's dedicated pins (HSSPI.SCK/MOSI/MISO/CSN in the pin
+//! assignment tables); the 16 MHz-domain SPIM instances cannot exceed 8 MHz
+//! and cannot reach port P2 at all.
 //!
 //! The card holds the model image (blobs, LUTs, params, embeddings) written
 //! raw by model/make_sd_image.py -- no filesystem, just 512-byte blocks
@@ -11,13 +16,17 @@
 //! back activation spill during standalone encoding.
 //!
 //! Register map from the nRF54LM20A SVD (nrf-pac 0.4.0); the B variant on
-//! this DK shares it. SPIM22 is a 16 MHz-domain instance: SCK = 16 MHz /
-//! PRESCALER.DIVISOR, so 8 MHz data clock, 250 kHz during card init.
+//! this DK shares it. SPIM00 is a 128 MHz-domain instance: SCK = 128 MHz /
+//! PRESCALER.DIVISOR with DIVISOR in 4..126, so 32 MHz at DIVISOR=4. The
+//! minimum divided clock (~1.02 MHz) is above the 400 kHz SD initialization
+//! cap, so card init is bit-banged on the same pins at ~250 kHz and the
+//! peripheral takes over for the data phase.
 
 use core::ptr::{read_volatile, write_volatile};
 
-const SPIM_BASE: usize = 0x500C_8000; // SPIM22, secure alias
-const P3_BASE: usize = 0x500D_8600; // GPIO port 3, secure alias
+const SPIM_BASE: usize = 0x5004_D000; // SPIM00, secure alias
+const P2_BASE: usize = 0x5005_0400; // GPIO port 2 (fast pads), secure alias
+const HSPAD_BASE: usize = 0x5005_0400; // GPIOHSPADCTRL overlays the P2 block
 
 // SPIM register offsets (SVD: GLOBAL_SPIM00, all instances share the map).
 const TASKS_START: usize = 0x000;
@@ -36,21 +45,39 @@ const TX_PTR: usize = 0x73C;
 const TX_MAXCNT: usize = 0x740;
 
 // GPIO port offsets.
+const IN: usize = 0x00C;
 const OUTSET: usize = 0x004;
 const OUTCLR: usize = 0x008;
 const DIRSET: usize = 0x014;
 const PIN_CNF: usize = 0x080;
 
-const PIN_SCK: u32 = 3;
-const PIN_MOSI: u32 = 0;
-const PIN_MISO: u32 = 1;
-const PIN_CS: u32 = 2;
-const PORT: u32 = 3;
+// GPIOHSPADCTRL.BIAS: slew control for P2 pads in E0E1 drive. HSBIAS is the
+// two low bits; the datasheet says to always use the highest slew (3).
+const HSPAD_BIAS: usize = 0x030;
+const HSBIAS_MAX: u32 = 0x3;
 
-const DIV_INIT: u32 = 64; // 16 MHz / 64 = 250 kHz (SD init needs <= 400 kHz)
-const DIV_FAST: u32 = 2; // 16 MHz / 2 = 8 MHz
+// PIN_CNF: DIR[0], INPUT[1], PULL[3:2], DRIVE0[9:8], DRIVE1[11:10].
+// Fast switching on P2 requires extra-high drive on both halves (E0=E1=3).
+const CNF_E0E1: u32 = (3 << 8) | (3 << 10);
+const CNF_OUT: u32 = 0x3; // output, input buffer disconnected
+const CNF_IN_PULLUP: u32 = 0xC; // input buffer connected, pull-up
+
+const PIN_SCK: u32 = 1;
+const PIN_MOSI: u32 = 2;
+const PIN_MISO: u32 = 4;
+const PIN_CS: u32 = 5;
+const PORT: u32 = 2;
+
+const DIV_FAST: u32 = 4; // 128 MHz / 4 = 32 MHz
+
+// Bit-bang half period for card init: 256 cycles at 128 MHz = 2 us -> 250 kHz.
+const BB_HALF_CYCLES: u32 = 256;
 
 pub const BLOCK: usize = 512;
+
+/// True from reset until init() hands the pins to the SPIM peripheral. All
+/// traffic funnels through xfer(), so the two phases share every code path.
+static mut BITBANG: bool = true;
 
 #[inline]
 fn spim(off: usize) -> *mut u32 {
@@ -59,7 +86,7 @@ fn spim(off: usize) -> *mut u32 {
 
 #[inline]
 fn gpio(off: usize) -> *mut u32 {
-    (P3_BASE + off) as *mut u32
+    (P2_BASE + off) as *mut u32
 }
 
 fn cs(low: bool) {
@@ -68,9 +95,41 @@ fn cs(low: bool) {
     }
 }
 
+fn bb_byte(tx: u8) -> u8 {
+    let mut rx = 0u8;
+    for bit in (0..8).rev() {
+        unsafe {
+            // Mode 0: MOSI changes on the falling edge, both sides sample on
+            // the rising edge.
+            write_volatile(
+                gpio(if tx & (1 << bit) != 0 { OUTSET } else { OUTCLR }),
+                1 << PIN_MOSI,
+            );
+            cortex_m::asm::delay(BB_HALF_CYCLES);
+            write_volatile(gpio(OUTSET), 1 << PIN_SCK);
+            if read_volatile(gpio(IN)) & (1 << PIN_MISO) != 0 {
+                rx |= 1 << bit;
+            }
+            cortex_m::asm::delay(BB_HALF_CYCLES);
+            write_volatile(gpio(OUTCLR), 1 << PIN_SCK);
+        }
+    }
+    rx
+}
+
 /// One full-duplex SPI transaction: send `tx` (0xFF-filled past its end),
-/// receive `rx_len` bytes into `rx`. Polled on EVENTS_END.
+/// receive `rx_len` bytes into `rx`. DMA-driven on the peripheral, or
+/// bit-banged during card init.
 fn xfer(tx: &[u8], rx: &mut [u8]) {
+    if unsafe { BITBANG } {
+        for &b in tx {
+            bb_byte(b);
+        }
+        for r in rx.iter_mut() {
+            *r = bb_byte(0xFF);
+        }
+        return;
+    }
     unsafe {
         write_volatile(spim(TX_PTR), tx.as_ptr() as u32);
         write_volatile(spim(TX_MAXCNT), tx.len() as u32);
@@ -128,25 +187,26 @@ fn card_addr(lba: u32) -> u32 {
     }
 }
 
-/// Bring up SPIM22 + the card: SPI-mode entry, v2 negotiation, fast clock.
-/// Returns 0, or a negative stage-tagged error (-2xx = stage xx).
+/// Bring up the card (bit-banged SPI-mode entry + v2 negotiation), then hand
+/// the pins to SPIM00 at 32 MHz. Returns 0, or a negative stage-tagged error
+/// (-2xx = stage xx).
 pub fn init() -> i32 {
     unsafe {
-        // CS as a plain GPIO output, idle high; MISO gets a pull-up.
-        write_volatile(gpio(PIN_CNF + 4 * PIN_CS as usize), 0x3);
-        write_volatile(gpio(OUTSET), 1 << PIN_CS);
-        write_volatile(gpio(DIRSET), 1 << PIN_CS);
-        write_volatile(gpio(PIN_CNF + 4 * PIN_MISO as usize), 0xC); // input, pull-up
-
+        BITBANG = true;
         write_volatile(spim(ENABLE), 0);
-        write_volatile(spim(PSEL_SCK), (PORT << 5) | PIN_SCK);
-        write_volatile(spim(PSEL_MOSI), (PORT << 5) | PIN_MOSI);
-        write_volatile(spim(PSEL_MISO), (PORT << 5) | PIN_MISO);
-        write_volatile(spim(PSEL_CSN), 1 << 31); // CS is ours, disconnect
-        write_volatile(spim(CONFIG), 0); // mode 0, MSB first
-        write_volatile(spim(ORC), 0xFF);
-        write_volatile(spim(PRESCALER), DIV_INIT);
-        write_volatile(spim(ENABLE), 7);
+
+        // Highest slew for the P2 pads (required for E0E1 fast switching).
+        write_volatile((HSPAD_BASE + HSPAD_BIAS) as *mut u32, HSBIAS_MAX);
+
+        // SCK/MOSI/CS as outputs (SCK idle low, MOSI/CS idle high), MISO
+        // input with pull-up. Extra-high drive on the driven pins.
+        write_volatile(gpio(OUTCLR), 1 << PIN_SCK);
+        write_volatile(gpio(OUTSET), (1 << PIN_MOSI) | (1 << PIN_CS));
+        for pin in [PIN_SCK, PIN_MOSI, PIN_CS] {
+            write_volatile(gpio(PIN_CNF + 4 * pin as usize), CNF_OUT | CNF_E0E1);
+        }
+        write_volatile(gpio(DIRSET), (1 << PIN_SCK) | (1 << PIN_MOSI) | (1 << PIN_CS));
+        write_volatile(gpio(PIN_CNF + 4 * PIN_MISO as usize), CNF_IN_PULLUP);
     }
 
     // >= 74 clocks with CS high puts the card in SPI-command mode.
@@ -206,10 +266,17 @@ pub fn init() -> i32 {
     cs(true);
     recv1(); // 8 clocks after CS release
 
+    // Data phase: hand SCK/MOSI/MISO to SPIM00 (CS stays a GPIO).
     unsafe {
-        write_volatile(spim(ENABLE), 0);
+        write_volatile(spim(PSEL_SCK), (PORT << 5) | PIN_SCK);
+        write_volatile(spim(PSEL_MOSI), (PORT << 5) | PIN_MOSI);
+        write_volatile(spim(PSEL_MISO), (PORT << 5) | PIN_MISO);
+        write_volatile(spim(PSEL_CSN), 1 << 31); // CS is ours, disconnect
+        write_volatile(spim(CONFIG), 0); // mode 0, MSB first
+        write_volatile(spim(ORC), 0xFF);
         write_volatile(spim(PRESCALER), DIV_FAST);
         write_volatile(spim(ENABLE), 7);
+        BITBANG = false;
     }
     0
 }

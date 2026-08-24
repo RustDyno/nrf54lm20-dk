@@ -125,12 +125,26 @@ activations| ORCH
       with an on-device LM head over a 12230-token pruned vocabulary
       (GPT-2 BPE ids < 12288 minus whisper's suppress set) -> transcript
       printed over RTT, then it listens again. All weights/scratch on
-      the card; expected ~10 min per utterance at 8 MHz SPI.
+      the card.
+- [x] SPEED (built blind, see speedup.md): the SD card moved to SPIM00,
+      the 32 MHz HS-SPI instance (4x the SPIM22 ceiling; card init is
+      bit-banged because SPIM00 cannot clock below ~1 MHz), and mel pass
+      1 now streams during the 12 s recording (chunk-sized PDM buffers,
+      bit-exact vs the sequential pass, which stays as an automatic
+      fallback if the M33 ever falls behind the mic). Expected effect:
+      ~10 min -> ~3 min per utterance, decode ~18 -> ~5 s/token.
 
 ## Testing the standalone build (when the SD breakout is wired)
 
-1. Wire a microSD breakout to the expansion header (3.3 V):
-       SCK -> P3.3   MOSI -> P3.0   MISO -> P3.1   CS -> P3.2
+1. Wire a microSD breakout to the expansion board header P17. The card
+   sits on SPIM00 (the 32 MHz HS-SPI instance; the SPIM2x instances top
+   out at 8 MHz and cannot reach these pins):
+       SCK  -> P2.01 (P17 pin 22)   MOSI -> P2.02 (P17 pin 23)
+       MISO -> P2.04 (P17 pin 25)   CS   -> P2.05 (P17 pin 26)
+   Board setup in nRF Connect's Board Configurator: route P2.00-P2.05 to
+   the pin headers (by default the analog switches connect them to the
+   on-board NOR flash), and set VDD:nRF to 3.3 V (SD cards need 2.7 V+;
+   the default is 1.8 V).
 2. Write the image (44 MB) with a USB reader:
        sudo dd if=model/out/sd.img of=/dev/sdX bs=4M conv=fsync
 3. SD smoke test (round-trip + image magic):
@@ -144,8 +158,6 @@ activations| ORCH
    an RTT viewer attached (probe-rs attach), do not send any host
    command -- after 3 s the firmware goes standalone and starts
    listening. Speak during the 12 s window.
-- [ ] M4 greedy decoder -> first on-device transcript
-- [ ] M5 PDM mic + on-device log-mel frontend
 
 ### M1 results (JFK clip, 11 s)
 

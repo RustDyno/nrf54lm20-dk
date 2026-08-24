@@ -422,12 +422,33 @@ pub fn run() -> ! {
     }
 }
 
+/// Streaming mode failed once (mel fell behind the mic): stay sequential.
+static mut STREAM_MEL_OK: bool = true;
+
 fn utterance(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     rprintln!("");
     rprintln!("=== speak now (12 s) ===");
-    record(c)?;
-    rprintln!("mel...");
-    mel_stage(plan, c)?;
+    if unsafe { STREAM_MEL_OK } {
+        // mel pass 1 overlaps the recording (chunk-sized PDM buffers); an
+        // overrun means the M33 could not keep up -- lost audio, so abort
+        // this utterance and fall back to the sequential path for good.
+        let ov = record_mel(c)?;
+        if ov > 0 {
+            unsafe { STREAM_MEL_OK = false };
+            rprintln!(
+                "warning: {} overruns streaming mel; falling back to \
+                 sequential mel from now on",
+                ov
+            );
+            return Err(-908);
+        }
+    } else {
+        record(c)?;
+        rprintln!("mel...");
+        mel_tables(c)?;
+        mel_pass1(c)?;
+    }
+    mel_pass2(plan, c)?;
     rprintln!("encoder...");
     encoder(plan, c)?;
     rprintln!("cross K/V...");
@@ -436,8 +457,102 @@ fn utterance(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     decode(plan, c)
 }
 
-// --- record ------------------------------------------------------------------------
+// --- record + mel pass 1 --------------------------------------------------------
+//
+// Streaming layout: the PDM ping-pong buffers are one mel chunk each
+// (10240 samples = 0.64 s), so while the DMA fills one buffer the CPU has a
+// whole chunk period to window the previous one, run mel_frames, and spill
+// the f32 chunk to S_MELF. Chunk c's DFT window needs samples
+// [c*10240 - 1280, c*10240 + 10496) (left reflect/alignment halo + right
+// STFT halo), i.e. the tail of buffer c-1, all of buffer c, and the first
+// 256 samples of buffer c+1 -- assembled in a 12032-sample sliding window.
+// The windows and sample counts are byte-identical to the sequential pass 1
+// (mel_pass1), so the mel output is bit-exact either way.
 
+const CHUNK: usize = 10240; // samples per PDM buffer / mel chunk
+const N_CHUNKS: usize = 19; // 18 x 64 frames + 1 x 48 (1200 real frames)
+const WIN: usize = 12032; // 1280 halo + CHUNK + 256 halo
+
+// Arena offsets shared by the record/mel phases. Asset loads round up to
+// whole SD blocks, so the table slots are block-sized (1600 B tables in
+// 2048 B slots) and nothing overlaps a neighbor's rounding tail.
+const R_HANN: usize = 0; // 1600 in 2048
+const R_COS: usize = 2048; // 1600 in 2048
+const R_MAX: usize = 4096; // 4
+const R_WIN: usize = 4104; // 24064 (streaming window / fallback PCM staging)
+const R_MELF: usize = 28168; // 20480 (f32 mel chunk)
+const R_PDM0: usize = 48648; // 20480
+const R_PDM1: usize = 69128; // 20480 (ends 89608 < arena top)
+const R_TILE: usize = 48648; // pass 2 int8 tile staging (PDM idle by then)
+
+fn mel_tables(c: &Ctxt) -> Result<(), i32> {
+    // filterbank borrows the interlayer buffer; small tables in the arena
+    let filt = lookup("melfilt").ok_or(-901)?;
+    try_rc!(sd::read_blocks(filt.lba, interlayer(0).as_mut_ptr(), 126), "filt");
+    c.asset("hann", R_HANN)?;
+    c.asset("melcos", R_COS)?;
+    arena(R_MAX, 4).copy_from_slice(&(-1e30f32).to_le_bytes());
+    Ok(())
+}
+
+fn mel_chunk(ci: usize, n_samples: usize, n_frames: usize) {
+    let p = mel::MelParams {
+        pcm: arena_addr(R_WIN),
+        n_samples: n_samples as u32,
+        frame0: if ci == 0 { 0 } else { 8 },
+        n_frames: n_frames as u32,
+        hann: arena_addr(R_HANN),
+        cos_tab: arena_addr(R_COS),
+        filters: interlayer(0).as_ptr() as u32,
+        out: arena_addr(R_MELF),
+        max_acc: arena_addr(R_MAX),
+    };
+    unsafe { mel::mel_frames(&p) };
+}
+
+/// Record 12 s while computing mel pass 1 in the buffer gaps. Returns the
+/// PDM overrun count (any overrun lost audio: caller must discard).
+fn record_mel(c: &Ctxt) -> Result<u32, i32> {
+    mel_tables(c)?;
+
+    let b0 = as_i16_mut(R_PDM0, CHUNK);
+    let b1 = as_i16_mut(R_PDM1, CHUNK);
+    let mut stream =
+        unsafe { pdm::Pdm::init(crate::MIC_CLK, crate::MIC_DIN).start(b0, b1) };
+    stream.next_buffer(); // warmup chunk (startup overrun + mic DC settle)
+    stream.overruns = 0;
+
+    let mut have = 0usize; // valid samples in the sliding window
+    for k in 0..N_CHUNKS {
+        let hop = stream.next_buffer(); // buffer k; DMA now fills the other
+        let win = as_i16_mut(R_WIN, WIN);
+        if k == 0 {
+            win[..CHUNK].copy_from_slice(hop);
+            have = CHUNK;
+            continue;
+        }
+        // chunk k-1: append buffer k's first 256 samples (right halo)
+        win[have..have + 256].copy_from_slice(&hop[..256]);
+        mel_chunk(k - 1, have + 256, T);
+        try_rc!(c.write(S_MELF, (k - 1) * 20480, R_MELF, 20480), "mel spill");
+        // slide: 1280-sample left halo, then all of buffer k
+        win.copy_within(have - 1280..have, 0);
+        win[1280..1280 + CHUNK].copy_from_slice(hop);
+        have = 1280 + CHUNK;
+    }
+    let ov = stream.overruns;
+    stream.stop();
+    // final chunk (48 frames) needs no further input from the mic: the
+    // window already covers [18*CHUNK - 1280, N_SAMPLES)
+    mel_chunk(N_CHUNKS - 1, N_SAMPLES - ((N_CHUNKS - 1) * CHUNK - 1280), 48);
+    try_rc!(c.write(S_MELF, (N_CHUNKS - 1) * 20480, R_MELF,
+                    (80 * 48 * 4usize).div_ceil(sd::BLOCK) * sd::BLOCK),
+            "mel spill");
+    Ok(ov)
+}
+
+/// Sequential fallback: plain recording to SD (used when streaming mel
+/// once fell behind; pass 1 then reads the PCM back from the card).
 fn record(c: &Ctxt) -> Result<(), i32> {
     const HOP: usize = 320;
     let ring = arena(0, 16 * HOP * 2);
@@ -470,75 +585,68 @@ fn record(c: &Ctxt) -> Result<(), i32> {
     Ok(())
 }
 
-// --- mel ---------------------------------------------------------------------------
+// --- mel (sequential pass 1 + shared pass 2) ---------------------------------------
 
-fn mel_stage(plan: &Plan, c: &Ctxt) -> Result<(), i32> {
-    // filterbank borrows the interlayer buffer; small tables in the arena
-    let filt = lookup("melfilt").ok_or(-901)?;
-    try_rc!(sd::read_blocks(filt.lba, interlayer(0).as_mut_ptr(), 126), "filt");
-    let a_hann = 0;
-    let a_cos = 2048;
-    c.asset("hann", a_hann).map_err(|e| e)?;
-    c.asset("melcos", a_cos)?;
-    let a_pcm = 4096; // up to 21504 B span
-    let a_out = 26112; // 20480 B f32 chunk
-    let a_max = 46592;
-    arena(a_max, 4).copy_from_slice(&(-1e30f32).to_le_bytes());
-
-    // pass 1: 18 chunks of 64 frames + 1 of 48 (1200 real frames total).
-    // The chunk's PCM window starts 8 frames (1280 samples) early so that
-    // (a) the reflect halo has real samples and (b) the SD byte offset
-    // stays block-aligned (1280 samples = 2560 B, lcm of 160 and 256).
-    for ci in 0..19usize {
+/// Fallback pass 1: 18 chunks of 64 frames + 1 of 48 (1200 real frames),
+/// PCM read back from the card. The chunk's PCM window starts 8 frames
+/// (1280 samples) early so that (a) the reflect halo has real samples and
+/// (b) the SD byte offset stays block-aligned (1280 samples = 2560 B, lcm
+/// of 160 and 256). Windows are identical to record_mel's streaming ones.
+fn mel_pass1(c: &Ctxt) -> Result<(), i32> {
+    for ci in 0..N_CHUNKS {
         let f0 = ci * T;
         let n_frames = if ci == 18 { 48 } else { T };
         let s0 = (f0 * 160).saturating_sub(1280);
         let span = ((f0 + n_frames) * 160 + 256).min(N_SAMPLES) - s0;
         let bytes = (span * 2).div_ceil(sd::BLOCK) * sd::BLOCK;
-        try_rc!(c.read(S_PCM, s0 * 2, a_pcm, bytes), "pcm rd");
+        try_rc!(c.read(S_PCM, s0 * 2, R_WIN, bytes), "pcm rd");
         let p = mel::MelParams {
-            pcm: arena_addr(a_pcm),
+            pcm: arena_addr(R_WIN),
             n_samples: (bytes / 2).min(N_SAMPLES - s0) as u32,
             frame0: ((f0 * 160 - s0) / 160) as u32,
             n_frames: n_frames as u32,
-            hann: arena_addr(a_hann),
-            cos_tab: arena_addr(a_cos),
+            hann: arena_addr(R_HANN),
+            cos_tab: arena_addr(R_COS),
             filters: interlayer(0).as_ptr() as u32,
-            out: arena_addr(a_out),
-            max_acc: arena_addr(a_max),
+            out: arena_addr(R_MELF),
+            max_acc: arena_addr(R_MAX),
         };
         unsafe { mel::mel_frames(&p) };
-        try_rc!(c.write(S_MELF, ci * 20480, a_out, (80 * n_frames * 4).div_ceil(512) * 512),
+        try_rc!(c.write(S_MELF, ci * 20480, R_MELF,
+                        (80 * n_frames * 4).div_ceil(512) * 512),
                 "mel spill");
     }
-    // pass 2: normalize into int8 mel tiles; pad frames = quantized 0.0
+    Ok(())
+}
+
+/// Pass 2: normalize into int8 mel tiles; pad frames = quantized 0.0.
+/// Needs the global max in R_MAX from either pass 1.
+fn mel_pass2(plan: &Plan, c: &Ctxt) -> Result<(), i32> {
     let pad = quant8(0.0, plan.conv1_in);
-    let a_i8 = 46596 + 60; // 5120 B tile, keep alignment
-    let a_i8 = (a_i8 + 3) & !3;
     for mt in 0..MEL_TILES {
-        let dst = as_i8_mut(a_i8, 80 * T);
+        let dst = as_i8_mut(R_TILE, 80 * T);
         if mt < 18 {
-            try_rc!(c.read(S_MELF, mt * 20480, a_out, 20480), "melf rd");
+            try_rc!(c.read(S_MELF, mt * 20480, R_MELF, 20480), "melf rd");
             let p = mel::MelNormParams {
-                mel: arena_addr(a_out),
+                mel: arena_addr(R_MELF),
                 n: (80 * T) as u32,
-                max_acc: arena_addr(a_max),
-                out: arena_addr(a_i8),
+                max_acc: arena_addr(R_MAX),
+                out: arena_addr(R_TILE),
                 q: plan.conv1_in,
             };
             unsafe { mel::mel_normalize(&p) };
         } else if mt == 18 {
             // 48 real frames stored planar [80,48]; expand to [80,64]
-            try_rc!(c.read(S_MELF, mt * 20480, a_out, 15360), "melf rd");
+            try_rc!(c.read(S_MELF, mt * 20480, R_MELF, 15360), "melf rd");
             let p = mel::MelNormParams {
-                mel: arena_addr(a_out),
+                mel: arena_addr(R_MELF),
                 n: (80 * 48) as u32,
-                max_acc: arena_addr(a_max),
-                out: arena_addr(a_i8 + 80 * T), // staging past the tile
+                max_acc: arena_addr(R_MAX),
+                out: arena_addr(R_TILE + 80 * T), // staging past the tile
                 q: plan.conv1_in,
             };
             unsafe { mel::mel_normalize(&p) };
-            let st = as_i8(a_i8 + 80 * T, 80 * 48);
+            let st = as_i8(R_TILE + 80 * T, 80 * 48);
             dst.fill(pad);
             for r in 0..80 {
                 dst[r * T..r * T + 48].copy_from_slice(&st[r * 48..(r + 1) * 48]);
@@ -546,7 +654,7 @@ fn mel_stage(plan: &Plan, c: &Ctxt) -> Result<(), i32> {
         } else {
             dst.fill(pad);
         }
-        try_rc!(c.write(S_MEL, mt * 80 * T, a_i8, 80 * T), "mel8 wr");
+        try_rc!(c.write(S_MEL, mt * 80 * T, R_TILE, 80 * T), "mel8 wr");
     }
     Ok(())
 }
@@ -1056,6 +1164,10 @@ fn assemble_head_ctx(c: &Ctxt, base: u32, matrix: usize, head: usize,
 }
 
 /// Argmax over the pruned int8 embedding, streamed in 64-row chunks.
+///
+/// (An exact bound-sorted early exit was measured and rejected: Whisper
+/// LM-head cosines are so small that even the loosest row's Cauchy-Schwarz
+/// bound sits ~3x above the best logit -- 0 of 12228 rows prunable.)
 fn lm_head(plan: &Plan, embp: Entry, ids: Entry, hid: &[f32; C],
            first: bool) -> Result<u32, i32> {
     let mut best = f32::MIN;
@@ -1068,7 +1180,7 @@ fn lm_head(plan: &Plan, embp: Entry, ids: Entry, hid: &[f32; C],
         let n = ROWS.min(plan.vocab_n - r0);
         let rc = sd::read_blocks(embp.lba + (r0 * C / sd::BLOCK) as u32,
                                  arena(D_BIGK, 0).as_mut_ptr(),
-                                 ((n * C) / sd::BLOCK) as u32);
+                                 (n * C).div_ceil(sd::BLOCK) as u32);
         if rc != 0 {
             return Err(rc);
         }
