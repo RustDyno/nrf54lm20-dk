@@ -1,0 +1,14 @@
+# Cortex-M33 with single-precision FPU (nRF54LM20B application core)
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+[target.thumbv8m.main-none-eabihf]
+# cortex-m-rt provides link.x; memory.x is emitted to OUT_DIR by build.rs
+rustflags = ["-C", "link-arg=-Tlink.x"]
+# probe-rs ships no nRF54LM20B target, so we supply one (cloned from its A
+# definition, which is what physically flashes this DK). See targets/.
+runner = "probe-rs run --chip nRF54LM20B --chip-description-path targets/nRF54LM20B.yaml"
+
+# bindgen needs libclang. The system one (llvm-18) rather than the esp toolchain's.
+[env]
+LIBCLANG_PATH = "/usr/lib/llvm-18/lib"

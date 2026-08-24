@@ -1,0 +1,17 @@
+[package]
+name = "whisper-host"
+version = "0.1.0"
+edition = "2021"
+description = "Host orchestrator for the layer-streaming Whisper firmware: flashes, streams slot blobs and activations over SWD, drives the mailbox"
+
+# Independent of the firmware workspace (different build target).
+[workspace]
+
+[[bin]]
+name = "whisper-host"
+path = "src/main.rs"
+
+[dependencies]
+probe-rs = "0.31"
+anyhow = "1"
+object = "0.36"

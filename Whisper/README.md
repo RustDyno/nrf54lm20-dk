@@ -1,0 +1,143 @@
+# Whisper — speech-to-text on the nRF54LM20-DK Axon NPU, one layer at a time
+
+An attempt to run OpenAI Whisper (tiny.en, 39M parameters) on a chip with
+2 MB flash and 510 KB usable RAM. The model is ~37 MB as int8, so it can
+never be resident: the host acts as backing store and streams the model
+through the device **layer by layer**. Each transformer sub-layer is compiled
+offline into an Axon command-buffer blob; the firmware loads blobs into a
+fixed RAM slot, runs them on the NPU, and executes the non-NPU glue on the
+Cortex-M33.
+
+This is a feasibility project, not a real-time transcriber: the debug link
+(~0.5 MB/s) has to move ~10-30 MB of weights per generated token, so an
+utterance takes minutes. The point is that it runs at all.
+
+## The layer approach
+
+The Axon NPU executes int8 TFLite models with a restricted op set (conv,
+fully-connected, add, pool, ...) compiled offline into command buffers. No
+dynamic matmuls, no layernorm, no softmax, no GELU. Whisper therefore splits
+into:
+
+| Piece | Where | Form |
+|---|---|---|
+| conv1, conv2 (mel frontend stem) | NPU | CONV_2D k=3, frame-tiled, conv2 output-channel-tiled |
+| q/k/v/out projections (self + cross) | NPU | 1x1 CONV_2D over frame tiles (FC per frame) |
+| mlp fc1 (384 -> 1536) | NPU | 4 output-channel tiles of 384 |
+| mlp fc2 (1536 -> 384) | NPU | 4 input-dim partial models, partials summed on CPU |
+| layernorm | CPU | f32, from/to quantized activations |
+| GELU | CPU | exact 256-entry int8 LUT |
+| attention QK^T, probs x V | CPU | int8 x int8 -> int32 (SMLAD), f32 softmax between |
+| residual stream | CPU | int16 (int8 was not enough, see NOTES) |
+| final logits projection | CPU | int8 x int8 -> int32, exact f32 logits, fused argmax |
+
+Every NPU submodel is small enough for a ~192 KB RAM weight slot. Blobs are
+linked offline at the slot's fixed address against the firmware ELF (the Axon
+command buffers embed absolute buffer addresses), so at runtime a blob is
+loaded into the slot and executed via the standard driver, no relocation.
+
+The encoder runs on a truncated audio context (whisper.cpp's audio_ctx
+trick): 12 s chunks -> 600 frames instead of 30 s -> 1500, sized so the
+activations the device must hold stay within RAM.
+
+```mermaid
+flowchart LR
+  subgraph host [Host PC]
+    STORE[(model blobs +
+activation store)]
+    ORCH[tape orchestrator]
+  end
+  subgraph dk [nRF54LM20-DK]
+    subgraph m33 [Cortex-M33 firmware]
+      EXEC[step executor]
+      GLUE[CPU kernels:
+LN, GELU LUT, softmax,
+attn matmuls, argmax]
+      SLOT[weight slot RAM]
+      IL[interlayer buffer]
+    end
+    subgraph axon [Axon NPU]
+      DRV[Nordic driver blob]
+      ENG[cmd-buffer engine]
+    end
+  end
+  ORCH -->|SWD: layer blobs,
+activation pages| SLOT
+  EXEC -->|tokens, spilled
+activations| ORCH
+  EXEC --> GLUE
+  EXEC -->|infer_sync| DRV --> ENG
+  SLOT --> ENG
+  ENG <--> IL
+```
+
+## Layout
+
+    model/      pixi project: reference, decomposition, quantization, export
+        whisper_ref.py   canonical openai-whisper greedy decode (ground truth)
+        layered.py       the layered engine: float / calib / int8 backends
+        simulate.py      4-stage feasibility ladder (see below)
+        export.py        int8 TFLite submodel emission for the Axon compiler
+    firmware/   bare-metal Rust step executor: mailbox protocol, CPU glue
+                kernels, runtime slot loader; reuses ../npu platform layer
+        tools/make-blob.sh   Axon header -> runtime-loadable slot blob
+    host/       probe-rs driver: flashes, streams blobs/activations over SWD,
+                runs the golden-vector selftest (seed of the tape orchestrator)
+
+## Status
+
+- [x] M0 scaffolding
+- [x] M1 numerical feasibility (host simulation)
+- [x] Axon compiler accepts the submodel shapes (frames on the WIDTH axis;
+      interlayer needs are small: FC tile 24 KB, conv tiles 30-58 KB, psum 0)
+- [x] M2 core VERIFIED ON HARDWARE: a runtime-streamed Whisper layer blob
+      (block-0 q-projection, 166 KB) loads into the RAM slot over SWD and
+      runs on the Axon BIT-EXACT vs the TFLite interpreter (40 ms inference,
+      74 KB/s streaming). Device activations are channel-planar [C][W].
+- [ ] M2 rest: tape format + orchestrator, full ~40-submodel export
+- [ ] M3 full encoder on hardware vs golden vectors
+- [ ] M4 greedy decoder -> first on-device transcript
+- [ ] M5 PDM mic + on-device log-mel frontend
+
+### M1 results (JFK clip, 11 s)
+
+    stage 1  float, full ctx:      layered == openai-whisper (3.3e-5), transcript MATCH
+    stage 2  float, audio_ctx=600: transcript correct (loses one comma)
+    stage 4  int8 device semantics: transcript == stage 2, argmax margin >= 1.1 logits
+
+The int8 pipeline transcribes the clip exactly: "And so my fellow Americans
+ask not what your country can do for you ask what you can do for your
+country." Calibration currently uses the test clip itself; a proper
+calibration set is future work (see NOTES).
+
+## Workflow
+
+    cd model
+    pixi run reference    # download tiny.en, canonical transcribe, ref.npz
+    pixi run simulate     # 4-stage ladder, writes out/scales.json
+    pixi run export       # emit int8 tflite submodels + golden vectors
+    # Axon-compile a submodel (uses the npu project's container):
+    INSTALL_DIR=$PWD/out/axon-headers \
+      ../../npu/tools/compile-model.sh out/submodels/wq0.tflite wq0 131072 32768
+
+    cd ../firmware
+    cargo build           # the step executor (no model linked at build time)
+    tools/make-blob.sh ../model/out/axon-headers/nrf_axon_model_wq0_.h \
+      target/thumbv8m.main-none-eabihf/debug/whisper-firmware \
+      ../model/out/blobs/wq0.bin
+
+    # With the DK attached: flash + stream the blob + run + compare
+    cd ../host
+    cargo run --release -- \
+      ../firmware/target/thumbv8m.main-none-eabihf/debug/whisper-firmware \
+      ../model/out/blobs/wq0.bin \
+      ../model/out/submodels/wq0.input.bin ../model/out/submodels/wq0.expect.bin
+
+Blobs embed absolute addresses resolved against the firmware ELF: regenerate
+them (make-blob.sh) after every firmware change.
+
+## Dependencies on sibling projects
+
+- `../npu/` — Axon driver blob, headers, and the containerized Axon compiler.
+- `../PDM-MIC/` — mic capture + host probe-rs plumbing (M5).
+- `../KWS/` — hardware-validated platform layer and selftest patterns.
