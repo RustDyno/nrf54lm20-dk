@@ -27,6 +27,8 @@ use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::main;
 use esp_println::{print, println};
 
+esp_bootloader_esp_idf::esp_app_desc!();
+
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     println!("panic: {}", info);
