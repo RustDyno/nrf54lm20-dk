@@ -215,15 +215,18 @@ pub fn init() -> i32 {
         BITBANG = true;
         write_volatile(spim(ENABLE), 0);
 
-        // Highest slew for the P2 pads (required for E0E1 fast switching).
-        write_volatile((HSPAD_BASE + HSPAD_BIAS) as *mut u32, HSBIAS_MAX);
-
         // SCK/MOSI/CS as outputs (SCK idle low, MOSI/CS idle high), MISO
-        // input with pull-up. Extra-high drive on the driven pins.
+        // input with pull-up. STANDARD drive for the init phase: E0E1's
+        // nanosecond edges ring hard on jumper wiring, and a ring on SCK
+        // re-crossing the card's threshold is a phantom clock -- the C3
+        // line monitor showed the card receiving a bit-perfect CMD0
+        // (3342/3392 expected SCK edges, 81/80 MOSI, 16/16 CS) and
+        // staying mute; a softer driver (ESP32-C3) talked to the same
+        // card at the same speed without issue.
         write_volatile(gpio(OUTCLR), 1 << PIN_SCK);
         write_volatile(gpio(OUTSET), (1 << PIN_MOSI) | (1 << PIN_CS));
         for pin in [PIN_SCK, PIN_MOSI, PIN_CS] {
-            write_volatile(gpio(PIN_CNF + 4 * pin as usize), CNF_OUT | CNF_E0E1);
+            write_volatile(gpio(PIN_CNF + 4 * pin as usize), CNF_OUT);
         }
         write_volatile(gpio(DIRSET), (1 << PIN_SCK) | (1 << PIN_MOSI) | (1 << PIN_CS));
         write_volatile(gpio(PIN_CNF + 4 * PIN_MISO as usize), CNF_IN_PULLUP);
@@ -296,8 +299,14 @@ pub fn init() -> i32 {
     cs(true);
     recv1(); // 8 clocks after CS release
 
-    // Data phase: hand SCK/MOSI/MISO to SPIM00 (CS stays a GPIO).
+    // Data phase: hand SCK/MOSI/MISO to SPIM00 (CS stays a GPIO). Only
+    // now raise SCK/MOSI to extra-high drive with the fast pad slew --
+    // 32 MHz needs it; CS switches once per transaction and stays soft.
     unsafe {
+        write_volatile((HSPAD_BASE + HSPAD_BIAS) as *mut u32, HSBIAS_MAX);
+        for pin in [PIN_SCK, PIN_MOSI] {
+            write_volatile(gpio(PIN_CNF + 4 * pin as usize), CNF_OUT | CNF_E0E1);
+        }
         write_volatile(spim(PSEL_SCK), (PORT << 5) | PIN_SCK);
         write_volatile(spim(PSEL_MOSI), (PORT << 5) | PIN_MOSI);
         write_volatile(spim(PSEL_MISO), (PORT << 5) | PIN_MISO);
