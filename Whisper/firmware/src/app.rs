@@ -402,6 +402,8 @@ pub fn run() -> ! {
         rprintln!("standalone: no SD ({}), staying in mailbox mode", rc);
         display::print("no SD card\n");
         sd::diag(2);
+        sd::release_pins();
+        rprintln!("sd pins released (high-Z): external testers may drive the bus");
         crate::mailbox_loop();
     }
     unsafe {

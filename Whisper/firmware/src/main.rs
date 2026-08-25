@@ -395,7 +395,12 @@ unsafe fn dispatch(cmd: u32, a: &[u32; 8]) -> i32 {
         }
         CMD_SD_INIT => {
             let _wd = WdogGuard::arm();
-            sd::init()
+            let rc = sd::init();
+            if rc != 0 {
+                // leave the bus high-Z so external testers can drive it
+                sd::release_pins();
+            }
+            rc
         }
         CMD_SD_READ => {
             let _wd = WdogGuard::arm();

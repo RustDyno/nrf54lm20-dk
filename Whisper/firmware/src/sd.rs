@@ -461,6 +461,17 @@ pub fn init() -> i32 {
     0
 }
 
+/// Release all four SD pins to high-impedance inputs (no pulls). Called
+/// after a failed init so an external master (the C3 tester) can drive
+/// the shared wires while the DK stays powered and attached.
+pub fn release_pins() {
+    unsafe {
+        for pin in [PIN_SCK, PIN_MOSI, PIN_MISO, PIN_CS] {
+            write_volatile(gpio(PIN_CNF + 4 * pin as usize), 1 << 1); // input, disconnected
+        }
+    }
+}
+
 /// Wiring diagnostic for a failed init: holds each driven line at
 /// DMM-visible static levels (measure at the CARD SOCKET pads, not the
 /// header, to test the whole path), exercises MISO's pulls, and runs a
