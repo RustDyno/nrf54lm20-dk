@@ -120,19 +120,45 @@ pub struct Entry {
 }
 
 fn lookup(name: &str) -> Option<Entry> {
+    lookup_idx(name).map(|(e, _)| e)
+}
+
+/// Like lookup, but also returns the entry's index (key into SUMS).
+fn lookup_idx(name: &str) -> Option<(Entry, usize)> {
     let idx = unsafe { &*core::ptr::addr_of!(INDEX) };
     let count = u32::from_le_bytes(idx[12..16].try_into().unwrap()) as usize;
     for i in 0..count.min(254) {
         let e = &idx[16 + 32 * i..16 + 32 * (i + 1)];
         let end = e[..24].iter().position(|&b| b == 0).unwrap_or(24);
         if &e[..end] == name.as_bytes() {
-            return Some(Entry {
-                lba: u32::from_le_bytes(e[24..28].try_into().unwrap()),
-                len: u32::from_le_bytes(e[28..32].try_into().unwrap()),
-            });
+            return Some((
+                Entry {
+                    lba: u32::from_le_bytes(e[24..28].try_into().unwrap()),
+                    len: u32::from_le_bytes(e[28..32].try_into().unwrap()),
+                },
+                i,
+            ));
         }
     }
     None
+}
+
+/// Per-entry u32 byte-sums (image "sums" asset): SPI mode has CRC off,
+/// so blob loads are verified against these and retried on mismatch.
+static mut SUMS: [u32; 256] = [0; 256];
+
+fn load_sums() {
+    if let Some(e) = lookup("sums") {
+        let n = (e.len as usize / 4).min(256);
+        let mut buf = [0u8; 1024];
+        if sd::read_blocks(e.lba, buf.as_mut_ptr(),
+                           e.len.div_ceil(sd::BLOCK as u32)) == 0 {
+            let sums = unsafe { &mut *core::ptr::addr_of_mut!(SUMS) };
+            for i in 0..n {
+                sums[i] = u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+            }
+        }
+    }
 }
 
 /// Fixed-capacity name builder for parameterized asset/blob names.
@@ -365,20 +391,41 @@ impl Ctxt {
         Ok(e)
     }
 
-    /// Blob into the slot (cached) + one NPU inference.
+    /// Blob into the slot (cached, sum-verified) + one NPU inference.
     fn npu(&mut self, blob: &str, input: usize, output: usize) -> i32 {
-        let e = match lookup(blob) {
-            Some(e) => e,
+        let (e, idx) = match lookup_idx(blob) {
+            Some(x) => x,
             None => {
                 rprintln!("no blob {}", blob);
                 return -904;
             }
         };
         if self.loaded.lba != e.lba {
-            let rc = sd::read_blocks(e.lba, slot::SLOT_BASE as *mut u8,
-                                     e.len.div_ceil(sd::BLOCK as u32));
-            if rc != 0 {
-                return rc;
+            let expect = unsafe { (*core::ptr::addr_of!(SUMS))[idx] };
+            let mut ok = false;
+            for attempt in 0..3 {
+                let rc = sd::read_blocks(e.lba, slot::SLOT_BASE as *mut u8,
+                                         e.len.div_ceil(sd::BLOCK as u32));
+                if rc != 0 {
+                    return rc;
+                }
+                let mut sum = 0u32;
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(slot::SLOT_BASE as *const u8,
+                                                e.len as usize)
+                };
+                for &b in bytes {
+                    sum = sum.wrapping_add(b as u32);
+                }
+                if expect == 0 || sum == expect {
+                    ok = true;
+                    break;
+                }
+                rprintln!("blob {} sum mismatch (got {:#x} want {:#x}, try {})",
+                          blob, sum, expect, attempt + 1);
+            }
+            if !ok {
+                return -905;
             }
             self.loaded = e;
         }
@@ -454,6 +501,7 @@ pub fn run() -> ! {
     } else {
         rprintln!("standalone: warning: image has no fwid (predates the check)");
     }
+    load_sums();
     crate::platform::hold_axon();
     rprintln!("standalone: ready ({} kept vocabulary entries)", plan.vocab_n);
     loop {

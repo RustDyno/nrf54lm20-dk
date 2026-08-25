@@ -204,6 +204,12 @@ def main():
         "<II", addrs["nrf_axon_interlayer_buffer"],
         addrs["nrf_axon_psum_buffer"])))
 
+    # per-entry integrity sums (u32 wrapping byte-sum, index order): SPI
+    # mode runs with CRC off, so the firmware verifies each blob after
+    # loading it into the slot and retries the read on mismatch.
+    entries.append(("sums", b"\0" * (4 * (len(entries) + 2))))
+    sums_idx = len(entries) - 1
+
     # place everything, then the plan (needs the final block count)
     entries.append(("plan", b""))  # reserve the entry slot
     assert len(entries) <= (HEADER_BLOCKS * BLOCK - 16) // 32, "index full"
@@ -223,6 +229,9 @@ def main():
     plan = write_plan(scales, mq_enc, mq_dec, conv1, conv2, ref,
                       scratch_lba, vocab_n)
     entries[-1] = ("plan", plan)
+    sums = [(sum(d) & 0xFFFFFFFF) if i != sums_idx else 0
+            for i, (_, d) in enumerate(entries)]
+    entries[sums_idx] = ("sums", struct.pack(f"<{len(sums)}I", *sums))
     placed, total = layout(entries)
 
     index = struct.pack("<8sII", b"WSPRIMG1", 2, len(placed))
