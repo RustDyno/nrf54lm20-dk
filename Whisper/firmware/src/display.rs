@@ -117,6 +117,10 @@ fn cmd(bytes: &[u8]) -> bool {
 
 /// Probe for the display and bring it up. Safe to call when absent.
 pub fn init() -> bool {
+    // The sd-spim22 diagnostic build owns this serial box and these pins.
+    if cfg!(feature = "sd-spim22") {
+        return false;
+    }
     unsafe {
         for pin in [PIN_SCL, PIN_SDA] {
             write_volatile(

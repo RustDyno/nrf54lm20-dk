@@ -24,9 +24,23 @@
 
 use core::ptr::{read_volatile, write_volatile};
 
+// Default bus: SPIM00 at 32 MHz on the dedicated P2 pins (through the
+// DK's analog switches). The `sd-spim22` feature instead uses SPIM22 at
+// 8 MHz on plain P3 pins (the original wiring: SCK P3.3, MOSI P3.0,
+// MISO P3.1, CS P3.2 = P17 pins 14/9/10/13) -- no analog switches in
+// the path, standard pads. Diagnostic fallback; the OLED (same serial
+// box and pins) is disabled under it.
+#[cfg(not(feature = "sd-spim22"))]
 const SPIM_BASE: usize = 0x5004_D000; // SPIM00, secure alias
-const P2_BASE: usize = 0x5005_0400; // GPIO port 2 (fast pads), secure alias
+#[cfg(not(feature = "sd-spim22"))]
+const GPIO_BASE: usize = 0x5005_0400; // GPIO port 2 (fast pads), secure alias
+#[cfg(not(feature = "sd-spim22"))]
 const HSPAD_BASE: usize = 0x5005_0400; // GPIOHSPADCTRL overlays the P2 block
+
+#[cfg(feature = "sd-spim22")]
+const SPIM_BASE: usize = 0x500C_8000; // SPIM22, secure alias
+#[cfg(feature = "sd-spim22")]
+const GPIO_BASE: usize = 0x500D_8600; // GPIO port 3, secure alias
 
 // SPIM register offsets (SVD: GLOBAL_SPIM00, all instances share the map).
 const TASKS_START: usize = 0x000;
@@ -61,22 +75,43 @@ const PIN_CNF: usize = 0x080;
 
 // GPIOHSPADCTRL.BIAS: slew control for P2 pads in E0E1 drive. HSBIAS is the
 // two low bits; the datasheet says to always use the highest slew (3).
+#[cfg(not(feature = "sd-spim22"))]
 const HSPAD_BIAS: usize = 0x030;
+#[cfg(not(feature = "sd-spim22"))]
 const HSBIAS_MAX: u32 = 0x3;
 
 // PIN_CNF: DIR[0], INPUT[1], PULL[3:2], DRIVE0[9:8], DRIVE1[11:10].
 // Fast switching on P2 requires extra-high drive on both halves (E0=E1=3).
+#[cfg(not(feature = "sd-spim22"))]
 const CNF_E0E1: u32 = (3 << 8) | (3 << 10);
 const CNF_OUT: u32 = 0x3; // output, input buffer disconnected
 const CNF_IN_PULLUP: u32 = 0xC; // input buffer connected, pull-up
 
+#[cfg(not(feature = "sd-spim22"))]
 const PIN_SCK: u32 = 1;
+#[cfg(not(feature = "sd-spim22"))]
 const PIN_MOSI: u32 = 2;
+#[cfg(not(feature = "sd-spim22"))]
 const PIN_MISO: u32 = 4;
+#[cfg(not(feature = "sd-spim22"))]
 const PIN_CS: u32 = 5;
+#[cfg(not(feature = "sd-spim22"))]
 const PORT: u32 = 2;
-
+#[cfg(not(feature = "sd-spim22"))]
 const DIV_FAST: u32 = 4; // 128 MHz / 4 = 32 MHz
+
+#[cfg(feature = "sd-spim22")]
+const PIN_SCK: u32 = 3;
+#[cfg(feature = "sd-spim22")]
+const PIN_MOSI: u32 = 0;
+#[cfg(feature = "sd-spim22")]
+const PIN_MISO: u32 = 1;
+#[cfg(feature = "sd-spim22")]
+const PIN_CS: u32 = 2;
+#[cfg(feature = "sd-spim22")]
+const PORT: u32 = 3;
+#[cfg(feature = "sd-spim22")]
+const DIV_FAST: u32 = 2; // 16 MHz / 2 = 8 MHz
 
 // Bit-bang half period for card init: 256 cycles at 128 MHz = 2 us ->
 // 250 kHz, timed with the DWT cycle counter (asm::delay pacing varies
@@ -102,7 +137,7 @@ fn spim(off: usize) -> *mut u32 {
 
 #[inline]
 fn gpio(off: usize) -> *mut u32 {
-    (P2_BASE + off) as *mut u32
+    (GPIO_BASE + off) as *mut u32
 }
 
 fn cs(low: bool) {
@@ -153,10 +188,15 @@ fn xfer(tx: &[u8], rx: &mut [u8]) {
         write_volatile(spim(RX_MAXCNT), rx.len() as u32);
         write_volatile(spim(EVENTS_STARTED), 0);
         write_volatile(spim(EVENTS_END), 0);
-        write_volatile(spim(ERRATA8_REG), 0x82);
+        if DIV_FAST > 2 {
+            // erratum [8] applies only above PRESCALER 2
+            write_volatile(spim(ERRATA8_REG), 0x82);
+        }
         write_volatile(spim(TASKS_START), 1);
         while read_volatile(spim(EVENTS_STARTED)) == 0 {}
-        write_volatile(spim(ERRATA8_REG), 0x00);
+        if DIV_FAST > 2 {
+            write_volatile(spim(ERRATA8_REG), 0x00);
+        }
         while read_volatile(spim(EVENTS_END)) == 0 {}
     }
 }
@@ -299,13 +339,17 @@ pub fn init() -> i32 {
     cs(true);
     recv1(); // 8 clocks after CS release
 
-    // Data phase: hand SCK/MOSI/MISO to SPIM00 (CS stays a GPIO). Only
+    // Data phase: hand SCK/MOSI/MISO to the SPIM (CS stays a GPIO). Only
     // now raise SCK/MOSI to extra-high drive with the fast pad slew --
     // 32 MHz needs it; CS switches once per transaction and stays soft.
+    // (P2 fast pads only; the SPIM22 fallback runs standard pads at 8 MHz.)
     unsafe {
-        write_volatile((HSPAD_BASE + HSPAD_BIAS) as *mut u32, HSBIAS_MAX);
-        for pin in [PIN_SCK, PIN_MOSI] {
-            write_volatile(gpio(PIN_CNF + 4 * pin as usize), CNF_OUT | CNF_E0E1);
+        #[cfg(not(feature = "sd-spim22"))]
+        {
+            write_volatile((HSPAD_BASE + HSPAD_BIAS) as *mut u32, HSBIAS_MAX);
+            for pin in [PIN_SCK, PIN_MOSI] {
+                write_volatile(gpio(PIN_CNF + 4 * pin as usize), CNF_OUT | CNF_E0E1);
+            }
         }
         write_volatile(spim(PSEL_SCK), (PORT << 5) | PIN_SCK);
         write_volatile(spim(PSEL_MOSI), (PORT << 5) | PIN_MOSI);

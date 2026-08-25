@@ -29,3 +29,8 @@ opt-level = "s"
 [profile.release]
 opt-level = "s"
 lto = true
+
+[features]
+# Diagnostic fallback: SD on SPIM22 at 8 MHz via plain P3 pins (original
+# wiring, no analog switches). Disables the OLED (shared serial box/pins).
+sd-spim22 = []
