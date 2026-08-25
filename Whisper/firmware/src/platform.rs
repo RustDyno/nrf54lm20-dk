@@ -52,6 +52,16 @@ fn enable_reg() -> *mut u32 {
     (AXON_BASE_ADDR + AXON_ENABLE_OFFSET) as *mut u32
 }
 
+/// Hold the Axon powered for a whole standalone session: the per-
+/// inference power cycling (Zephyr parity) opens an ENABLE=0 window
+/// between EVERY pair of inferences, and interrupt/event races in that
+/// window crashed the encoder (hardware-observed: the crash point moved
+/// 7 s -> 66 s when the NVIC line was gated, implicating the mechanism).
+/// With a session vote held, the count never reaches zero mid-pipeline.
+pub fn hold_axon() {
+    power_vote_on();
+}
+
 fn power_vote_on() {
     if POWER_VOTES.fetch_add(1, Ordering::SeqCst) == 0 {
         unsafe {

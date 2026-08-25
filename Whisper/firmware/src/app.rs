@@ -454,6 +454,7 @@ pub fn run() -> ! {
     } else {
         rprintln!("standalone: warning: image has no fwid (predates the check)");
     }
+    crate::platform::hold_axon();
     rprintln!("standalone: ready ({} kept vocabulary entries)", plan.vocab_n);
     loop {
         let mut ctx = Ctxt {
