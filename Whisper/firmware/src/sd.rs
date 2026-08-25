@@ -166,9 +166,24 @@ fn gpio(off: usize) -> *mut u32 {
     (GPIO_BASE + off) as *mut u32
 }
 
-fn cs(low: bool) {
+// ROOT CAUSE of the long -455 hunt lived here: the old helper was
+// `cs(low: bool)` but every call site passed `cs(false)` meaning
+// "assert" -- so the warmup clocks ran with the card SELECTED and every
+// command frame went out DESELECTED, which a card ignores by design.
+// The C3 sniffer showed the inverted CS phase from its first capture.
+// Explicit names so the polarity is visible at every call site:
+
+/// Assert chip select (drive CS LOW: card listens).
+fn cs_assert() {
     unsafe {
-        write_volatile(gpio(if low { OUTCLR } else { OUTSET }), 1 << PIN_CS);
+        write_volatile(gpio(OUTCLR), 1 << PIN_CS);
+    }
+}
+
+/// Release chip select (drive CS HIGH: card deselected).
+fn cs_release() {
+    unsafe {
+        write_volatile(gpio(OUTSET), 1 << PIN_CS);
     }
 }
 
@@ -284,7 +299,7 @@ fn cmd0_probe() -> u8 {
     let mut trace = [0u8; 16];
     let mut r = 0xFF;
     for attempt in 0..8 {
-        cs(false);
+        cs_assert();
         recv1(); // 8 clocks with CS low before the frame
         if attempt == 0 {
             send(&[0x40, 0, 0, 0, 0, 0x95]);
@@ -301,7 +316,7 @@ fn cmd0_probe() -> u8 {
         if r == 0x01 {
             break;
         }
-        cs(true);
+        cs_release();
         recv1(); // 8 deselected clocks between attempts
     }
     rprint!("sd: CMD0 poll bytes:");
@@ -340,7 +355,7 @@ pub fn init() -> i32 {
 
     // >= 74 clocks with CS high puts the card in SPI-command mode; send
     // 160 (some cards want extra right after power-up).
-    cs(true);
+    cs_release();
     let mut warmup = [0u8; 20];
     recv(&mut warmup);
 
@@ -354,7 +369,7 @@ pub fn init() -> i32 {
         // 0x00 forever.
         let mut post = [0u8; 4];
         recv(&mut post);
-        cs(true);
+        cs_release();
         use rtt_target::rprintln;
         if post == [0u8; 4] {
             rprintln!("sd: MISO reads permanently LOW (stuck line/short)");
@@ -377,7 +392,7 @@ pub fn init() -> i32 {
             SWAP_DATA = false;
             config_data_pins();
         }
-        cs(true);
+        cs_release();
         if r_swapped != 0xFF {
             use rtt_target::rprintln;
             rprintln!("sd: the card answers ONLY with the data pins swapped:");
@@ -388,7 +403,7 @@ pub fn init() -> i32 {
         return -200 - r as i32;
     }
     if r != 0x01 {
-        cs(true);
+        cs_release();
         return -200 - r as i32;
     }
 
@@ -399,7 +414,7 @@ pub fn init() -> i32 {
         let mut r7 = [0u8; 4];
         recv(&mut r7);
         if r7[2] & 0x0F != 0x01 || r7[3] != 0xAA {
-            cs(true);
+            cs_release();
             return -210;
         }
     }
@@ -414,25 +429,25 @@ pub fn init() -> i32 {
             break;
         }
         if r != 0x01 {
-            cs(true);
+            cs_release();
             return -220 - r as i32;
         }
     }
     if !ok {
-        cs(true);
+        cs_release();
         return -230;
     }
 
     // CMD58: OCR -> block vs byte addressing.
     let r = command(58, 0, 0xFF);
     if r != 0 {
-        cs(true);
+        cs_release();
         return -240 - r as i32;
     }
     let mut ocr = [0u8; 4];
     recv(&mut ocr);
     unsafe { HIGH_CAPACITY = ocr[0] & 0x40 != 0 };
-    cs(true);
+    cs_release();
     recv1(); // 8 clocks after CS release
 
     // Data phase: hand SCK/MOSI/MISO to the SPIM (CS stays a GPIO). Only
@@ -526,10 +541,10 @@ pub fn diag(cycles: u32) {
 
 /// Read `count` 512-byte blocks starting at `lba` into `dst` (CMD18).
 pub fn read_blocks(lba: u32, dst: *mut u8, count: u32) -> i32 {
-    cs(false);
+    cs_assert();
     let r = command(18, card_addr(lba), 0xFF);
     if r != 0 {
-        cs(true);
+        cs_release();
         return -300 - r as i32;
     }
     for i in 0..count {
@@ -542,7 +557,7 @@ pub fn read_blocks(lba: u32, dst: *mut u8, count: u32) -> i32 {
             }
         }
         if token != 0xFE {
-            cs(true);
+            cs_release();
             return -310;
         }
         let blk = unsafe {
@@ -556,20 +571,20 @@ pub fn read_blocks(lba: u32, dst: *mut u8, count: u32) -> i32 {
     // the card holds the line busy (0x00) while finishing
     for _ in 0..200_000 {
         if recv1() == 0xFF {
-            cs(true);
+            cs_release();
             return 0;
         }
     }
-    cs(true);
+    cs_release();
     -320
 }
 
 /// Write `count` 512-byte blocks starting at `lba` from `src` (CMD25).
 pub fn write_blocks(lba: u32, src: *const u8, count: u32) -> i32 {
-    cs(false);
+    cs_assert();
     let r = command(25, card_addr(lba), 0xFF);
     if r != 0 {
-        cs(true);
+        cs_release();
         return -400 - r as i32;
     }
     for i in 0..count {
@@ -581,7 +596,7 @@ pub fn write_blocks(lba: u32, src: *const u8, count: u32) -> i32 {
         send(&[0xFF, 0xFF]); // dummy CRC
         let resp = recv1();
         if resp & 0x1F != 0x05 {
-            cs(true);
+            cs_release();
             return -410 - (resp & 0x1F) as i32;
         }
         let mut busy = false;
@@ -592,7 +607,7 @@ pub fn write_blocks(lba: u32, src: *const u8, count: u32) -> i32 {
             }
         }
         if !busy {
-            cs(true);
+            cs_release();
             return -420;
         }
     }
@@ -600,10 +615,10 @@ pub fn write_blocks(lba: u32, src: *const u8, count: u32) -> i32 {
     recv1();
     for _ in 0..500_000 {
         if recv1() == 0xFF {
-            cs(true);
+            cs_release();
             return 0;
         }
     }
-    cs(true);
+    cs_release();
     -430
 }
