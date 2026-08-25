@@ -187,13 +187,21 @@ pub extern "C" fn nrf_axon_platform_wait_for_user_event() {
     // (handler in main.rs -> nrf_axon_handle_interrupt -> generate_driver_event
     // -> process_driver_event inline -> generate_user_event). Belt and braces
     // for stale peripheral state across soft resets: also poll the handler
-    // here -- it clears the event at its source, is benign when nothing is
-    // pending, and the ISR racing it is harmless now that both run the same
-    // initialized-driver path.
+    // here -- it clears the event at its source and is benign when nothing
+    // is pending.
+    //
+    // The poll MUST be serialized against the real ISR: handle_interrupt is
+    // written for a single interrupt-context caller and read-modify-writes
+    // the interrupt status registers with no critical section (the driver
+    // only guards its queue operations). Unserialized, the ISR preempting a
+    // thread-context call mid-way let both see the same status bits; the
+    // double clear/process corrupted the multi-segment inference sequencing
+    // and the engine wedged, never signalling completion (hardware-observed
+    // roughly once per 10-100 inferences, at a moving point in the encoder).
     while !USER_EVENT.swap(false, Ordering::SeqCst) {
-        unsafe {
+        cortex_m::interrupt::free(|_| unsafe {
             bindings::nrf_axon_handle_interrupt();
-        }
+        });
     }
 }
 

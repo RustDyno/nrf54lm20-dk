@@ -153,6 +153,13 @@ fn SysTick() {
     let t = WDOG_TICKS.load(Ordering::Relaxed);
     if t != WDOG_DISARMED {
         if t >= WDOG_LIMIT_TICKS {
+            // Name the reset in the log: a silent sys_reset here looked like
+            // a memory fault for days (the debugger's reset catch reported
+            // it as "Exception" at the reset handler).
+            let c = unsafe { core::ptr::read_volatile(BREADCRUMB) };
+            let c2 = unsafe { core::ptr::read_volatile(BREADCRUMB2) };
+            rprintln!("watchdog: driver call stuck >2 s (crumbs {:#x}/{:#x}), resetting", c, c2);
+            cortex_m::asm::delay(12_800_000); // ~100 ms for the host to drain RTT
             cortex_m::peripheral::SCB::sys_reset();
         }
         WDOG_TICKS.store(t + 1, Ordering::Relaxed);
