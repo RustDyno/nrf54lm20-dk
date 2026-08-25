@@ -468,18 +468,24 @@ pub fn diag(cycles: u32) {
                 unsafe { write_volatile(gpio(OUTCLR), 1 << pin) };
             }
         }
-        rprintln!("  MISO P2.04 pull-DOWN for 3 s (expect ~0 V)...");
+        rprintln!("  MISO P2.04 pull-DOWN for 3 s (a breakout pull-up may hold");
+        rprintln!("  the node mid-rail; the read below shows the SoC's view)...");
         unsafe {
             write_volatile(gpio(PIN_CNF + 4 * PIN_MISO as usize), 0x4);
         }
         dwt_delay(3 * SEC);
+        let down = unsafe { read_volatile(gpio(IN)) >> PIN_MISO } & 1;
         unsafe {
             write_volatile(gpio(PIN_CNF + 4 * PIN_MISO as usize), CNF_IN_PULLUP);
         }
-        rprintln!("  MISO pull-up restored (expect ~3.3 V)");
+        dwt_delay(SEC / 100);
+        let up = unsafe { read_volatile(gpio(IN)) >> PIN_MISO } & 1;
+        rprintln!("  MISO input reads: pulled-down={} pulled-up={}", down, up);
         let mut ok = 0;
         for &b in &[0xA5u8, 0x3C, 0x0F, 0x81] {
-            if bb_byte(b) == b {
+            let got = bb_byte(b);
+            rprintln!("  loopback sent {:02X} got {:02X}", b, got);
+            if got == b {
                 ok += 1;
             }
         }
