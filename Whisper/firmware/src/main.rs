@@ -15,7 +15,7 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use cortex_m_rt::{entry, exception};
+use cortex_m_rt::{entry, exception, ExceptionFrame};
 use panic_halt as _;
 use rtt_target::{rprintln, rtt_init, ChannelMode};
 
@@ -101,6 +101,38 @@ pub fn crumb(v: u32) {
 const WDOG_DISARMED: u32 = u32::MAX;
 const WDOG_LIMIT_TICKS: u32 = 200; // 200 x 10 ms = 2 s per driver call
 static WDOG_TICKS: AtomicU32 = AtomicU32::new(WDOG_DISARMED);
+
+#[exception]
+unsafe fn HardFault(ef: &ExceptionFrame) -> ! {
+    // Print the exception frame and fault status over RTT, then spin so
+    // the attached host can drain the message (no bkpt: keep RTT alive).
+    let crumb_val = unsafe { core::ptr::read_volatile(BREADCRUMB) };
+    rprintln!(
+        "HARDFAULT pc={:#010x} lr={:#010x} xpsr={:#010x} crumb={:#x}",
+        ef.pc(),
+        ef.lr(),
+        ef.xpsr(),
+        crumb_val
+    );
+    rprintln!(
+        "  r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r12={:#010x}",
+        ef.r0(),
+        ef.r1(),
+        ef.r2(),
+        ef.r3(),
+        ef.r12()
+    );
+    unsafe {
+        rprintln!(
+            "  CFSR={:#010x} HFSR={:#010x} MMFAR={:#010x} BFAR={:#010x}",
+            core::ptr::read_volatile(0xE000_ED28 as *const u32),
+            core::ptr::read_volatile(0xE000_ED2C as *const u32),
+            core::ptr::read_volatile(0xE000_ED34 as *const u32),
+            core::ptr::read_volatile(0xE000_ED38 as *const u32)
+        );
+    }
+    loop {}
+}
 
 #[exception]
 fn SysTick() {
