@@ -130,6 +130,32 @@ pub const BLOCK: usize = 512;
 /// traffic funnels through xfer(), so the two phases share every code path.
 static mut BITBANG: bool = true;
 
+/// Diagnostic: bit-bang with the two data pins' ROLES exchanged. If the
+/// card answers only like this, the physical MOSI/MISO wires are crossed.
+static mut SWAP_DATA: bool = false;
+
+#[inline]
+fn data_out_pin() -> u32 {
+    if unsafe { SWAP_DATA } { PIN_MISO } else { PIN_MOSI }
+}
+
+#[inline]
+fn data_in_pin() -> u32 {
+    if unsafe { SWAP_DATA } { PIN_MOSI } else { PIN_MISO }
+}
+
+/// (Re)configure the data pins for the current role assignment.
+unsafe fn config_data_pins() {
+    let o = data_out_pin();
+    let i = data_in_pin();
+    write_volatile(gpio(OUTSET), 1 << o);
+    write_volatile(gpio(PIN_CNF + 4 * o as usize), CNF_OUT);
+    write_volatile(gpio(DIRSET), 1 << o);
+    // PIN_CNF.DIR is the same physical register as DIR: this also turns
+    // the former output back into an input.
+    write_volatile(gpio(PIN_CNF + 4 * i as usize), CNF_IN_PULLUP);
+}
+
 #[inline]
 fn spim(off: usize) -> *mut u32 {
     (SPIM_BASE + off) as *mut u32
@@ -147,6 +173,8 @@ fn cs(low: bool) {
 }
 
 fn bb_byte(tx: u8) -> u8 {
+    let mosi = data_out_pin();
+    let miso = data_in_pin();
     let mut rx = 0u8;
     for bit in (0..8).rev() {
         unsafe {
@@ -154,11 +182,11 @@ fn bb_byte(tx: u8) -> u8 {
             // the rising edge.
             write_volatile(
                 gpio(if tx & (1 << bit) != 0 { OUTSET } else { OUTCLR }),
-                1 << PIN_MOSI,
+                1 << mosi,
             );
             dwt_delay(BB_HALF_CYCLES);
             write_volatile(gpio(OUTSET), 1 << PIN_SCK);
-            if read_volatile(gpio(IN)) & (1 << PIN_MISO) != 0 {
+            if read_volatile(gpio(IN)) & (1 << miso) != 0 {
                 rx |= 1 << bit;
             }
             dwt_delay(BB_HALF_CYCLES);
@@ -247,12 +275,30 @@ fn card_addr(lba: u32) -> u32 {
     }
 }
 
+/// CMD0 with retries; returns the last R1 (0xFF = total silence). Leaves
+/// CS low on success, high on failure.
+fn cmd0_probe() -> u8 {
+    let mut r = 0xFF;
+    for _ in 0..8 {
+        cs(false);
+        recv1(); // 8 clocks with CS low before the frame
+        r = command(0, 0, 0x95);
+        if r == 0x01 {
+            return r;
+        }
+        cs(true);
+        recv1(); // 8 deselected clocks between attempts
+    }
+    r
+}
+
 /// Bring up the card (bit-banged SPI-mode entry + v2 negotiation), then hand
 /// the pins to SPIM00 at 32 MHz. Returns 0, or a negative stage-tagged error
-/// (-2xx = stage xx).
+/// (-2xx = stage xx, -460 = data wires crossed).
 pub fn init() -> i32 {
     unsafe {
         BITBANG = true;
+        SWAP_DATA = false;
         write_volatile(spim(ENABLE), 0);
 
         // SCK/MOSI/CS as outputs (SCK idle low, MOSI/CS idle high), MISO
@@ -280,16 +326,29 @@ pub fn init() -> i32 {
 
     // CMD0: software reset -> idle state. Retried: real cards commonly
     // ignore the first attempt(s) after power-up.
-    let mut r = 0xFF;
-    for _ in 0..8 {
-        cs(false);
-        recv1(); // 8 clocks with CS low before the frame
-        r = command(0, 0, 0x95);
-        if r == 0x01 {
-            break;
+    let mut r = cmd0_probe();
+    if r == 0xFF {
+        // Total silence: probe with the data-pin roles exchanged. The
+        // card itself is the one witness that cannot be mis-tapped -- if
+        // it answers like this, the two data wires are crossed.
+        unsafe {
+            SWAP_DATA = true;
+            config_data_pins();
+        }
+        let r_swapped = cmd0_probe();
+        unsafe {
+            SWAP_DATA = false;
+            config_data_pins();
         }
         cs(true);
-        recv1(); // 8 deselected clocks between attempts
+        if r_swapped != 0xFF {
+            use rtt_target::rprintln;
+            rprintln!("sd: the card answers ONLY with the data pins swapped:");
+            rprintln!("sd: MOSI/MISO wires are CROSSED at the breakout.");
+            rprintln!("sd: exchange the two data wires (SPIM needs them straight).");
+            return -460;
+        }
+        return -200 - r as i32;
     }
     if r != 0x01 {
         cs(true);
