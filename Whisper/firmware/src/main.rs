@@ -90,9 +90,16 @@ pub static __INTERRUPTS: [unsafe extern "C" fn(); VECTOR_SLOTS] = vector_table()
 // reported at the next boot, so a watchdog reset names its victim.
 
 const BREADCRUMB: *mut u32 = 0x2004_AFF8 as *mut u32;
+/// Second noinit word: the NPU slot phase (0x201 entering infer,
+/// 0x202 returned), so it no longer overwrites the pipeline stage.
+const BREADCRUMB2: *mut u32 = 0x2004_AFFC as *mut u32;
 
 pub fn crumb(v: u32) {
     unsafe { core::ptr::write_volatile(BREADCRUMB, v) };
+}
+
+pub fn crumb2(v: u32) {
+    unsafe { core::ptr::write_volatile(BREADCRUMB2, v) };
 }
 
 // --- Hang watchdog (ported from the KWS firmware) ----------------------------
@@ -544,7 +551,13 @@ fn main() -> ! {
     rtt_target::set_print_channel(channels.up.0);
 
     let died_at = unsafe { core::ptr::read_volatile(BREADCRUMB) };
-    rprintln!("boot (previous life died at {:#x})", died_at);
+    let died_at2 = unsafe { core::ptr::read_volatile(BREADCRUMB2) };
+    rprintln!(
+        "boot: whisper fw build {} (previous life died at {:#x}/{:#x})",
+        env!("BUILD_ID"),
+        died_at,
+        died_at2
+    );
     crumb(0x100);
 
     let mb = core::ptr::addr_of_mut!(MAILBOX);

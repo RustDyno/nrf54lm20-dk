@@ -23,6 +23,7 @@ Write the image with a USB reader:
 import json
 import os
 import struct
+import subprocess
 
 import numpy as np
 
@@ -187,6 +188,21 @@ def main():
     assert vocab_n <= 16384, "row scales must fit the interlayer buffer"
     entries += sorted(vocab.items())
     entries += sorted(encoder_assets(sd, scales, mq_enc, conv1, conv2).items())
+
+    # firmware match id: the buffer addresses of the ELF the blobs were
+    # linked against; the firmware refuses a stale card at boot.
+    elf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                       "firmware", "target", "thumbv8m.main-none-eabihf",
+                       "release", "whisper-firmware")
+    addrs = {}
+    for line in subprocess.check_output(["arm-none-eabi-nm", elf]).decode().splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[2] in ("nrf_axon_interlayer_buffer",
+                                            "nrf_axon_psum_buffer"):
+            addrs[parts[2]] = int(parts[0], 16)
+    entries.append(("fwid", struct.pack(
+        "<II", addrs["nrf_axon_interlayer_buffer"],
+        addrs["nrf_axon_psum_buffer"])))
 
     # place everything, then the plan (needs the final block count)
     entries.append(("plan", b""))  # reserve the entry slot

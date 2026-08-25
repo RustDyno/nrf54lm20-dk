@@ -31,6 +31,14 @@ fn main() {
     .unwrap();
     println!("cargo:rustc-link-search={}", out.display());
     println!("cargo:rerun-if-changed=memory.x");
+    // Build id: printed at boot and embedded in the SD image (fwid asset)
+    // so a stale card announces itself instead of crashing mysteriously.
+    let build_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    println!("cargo:rustc-env=BUILD_ID={build_id:x}");
+    println!("cargo:rerun-if-changed=src");
 
     // Compile the open-source Axon driver wrappers (high-level inference API +
     // CPU op extensions) plus the variadic-printf glue. No model is linked at

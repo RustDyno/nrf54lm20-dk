@@ -39,7 +39,7 @@ pub unsafe fn run(input: u32, output: u32) -> i32 {
     if rc.0 != 0 {
         return rc.0;
     }
-    crate::crumb(0x201); // entering infer_sync
+    crate::crumb2(0x201); // entering infer_sync
     let input = if input == 0 {
         core::ptr::null()
     } else {
@@ -51,7 +51,7 @@ pub unsafe fn run(input: u32, output: u32) -> i32 {
         output as *mut i8
     };
     let rc = bindings::nrf_axon_nn_model_infer_sync(model, input, output).0;
-    crate::crumb(0x202); // infer_sync returned
+    crate::crumb2(0x202); // infer_sync returned
     rtt_target::rprintln!("npu: infer rc={}", rc);
     rc
 }

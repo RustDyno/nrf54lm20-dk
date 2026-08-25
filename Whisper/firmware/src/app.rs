@@ -429,6 +429,31 @@ pub fn run() -> ! {
             crate::mailbox_loop();
         }
     };
+    // Card/firmware match check: the image records the interlayer/psum
+    // addresses of the ELF its blobs were linked against. A mismatch
+    // means the card is STALE (blobs would DMA into a previous build's
+    // buffer addresses -- garbage results or a wedged engine).
+    if let Some(f) = lookup("fwid") {
+        let mut b = [0u8; 8];
+        if sd_read_bytes(f, 0, &mut b) == 0 {
+            let il = u32::from_le_bytes(b[0..4].try_into().unwrap());
+            let ps = u32::from_le_bytes(b[4..8].try_into().unwrap());
+            let my_il =
+                core::ptr::addr_of!(crate::nrf_axon_interlayer_buffer) as u32;
+            let my_ps = core::ptr::addr_of!(crate::nrf_axon_psum_buffer) as u32;
+            if il != my_il || ps != my_ps {
+                rprintln!(
+                    "standalone: CARD IMAGE IS STALE (card fwid {:#010x}/{:#010x},                      firmware {:#010x}/{:#010x}) -- re-dd model/out/sd.img",
+                    il, ps, my_il, my_ps
+                );
+                display::print("STALE CARD: re-dd
+");
+                crate::mailbox_loop();
+            }
+        }
+    } else {
+        rprintln!("standalone: warning: image has no fwid (predates the check)");
+    }
     rprintln!("standalone: ready ({} kept vocabulary entries)", plan.vocab_n);
     loop {
         let mut ctx = Ctxt {

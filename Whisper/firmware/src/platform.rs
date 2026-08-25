@@ -57,16 +57,24 @@ fn power_vote_on() {
         unsafe {
             core::ptr::write_volatile(enable_reg(), AXON_ENABLE_EN_BIT);
             bindings::nrf_axon_driver_power_on();
+            // Clear any interrupt that went pending while the block was
+            // off, then reopen the NVIC path masked in power_vote_off.
+            cortex_m::peripheral::NVIC::unpend(AxonsIrq);
+            cortex_m::peripheral::NVIC::unmask(AxonsIrq);
         }
     }
 }
 
 fn power_vote_off() {
     if POWER_VOTES.fetch_sub(1, Ordering::SeqCst) == 1 {
+        // A straggler AXONS interrupt vectoring after ENABLE=0 would
+        // fault into a clock-gated peripheral: mask before powering off.
+        cortex_m::peripheral::NVIC::mask(AxonsIrq);
         unsafe {
             bindings::nrf_axon_driver_power_off();
             core::ptr::write_volatile(enable_reg(), 0);
         }
+        cortex_m::peripheral::NVIC::unpend(AxonsIrq);
     }
 }
 
