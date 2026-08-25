@@ -763,6 +763,7 @@ fn assemble_head(c: &Ctxt, region: u32, head: usize, dst_off: usize,
 fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     let zin = quant8(0.0, plan.conv1_in);
 
+    crate::crumb(0x511);
     // conv1 + gelu1 (mel tiles [80,64] -> mel-rate tiles [384,64] in S_A)
     c.asset("g1lut", A_LUT)?;
     for i in 0..MEL_TILES {
@@ -772,6 +773,7 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         try_rc!(c.write(S_A, i * TILE8, A_OUT, TILE8), "c1 wr");
     }
 
+    crate::crumb(0x512);
     // conv2 parts + gelu2 -> int8 tiles in S_LN ([384,64], parts at row offsets)
     let z2 = quant8(0.0, plan.conv2_in);
     for pi in 0..3usize {
@@ -786,6 +788,7 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         }
     }
 
+    crate::crumb(0x513);
     // + positional embedding (tile-major f32 on the card) -> int16 S_X
     let pos = lookup("posenc").ok_or(-901)?;
     const CH: usize = 8192;
@@ -804,7 +807,9 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     let mut sq = plan.enc_x;
     for l in 0..BLOCKS {
         let bq = plan.enc[l];
+        crate::crumb(0x520 + (l as u32) * 0x10);
         ln_region(c, Name::of(&["e", DIGITS[l], "ln1_gb"]).s(), sq, bq.ln1)?;
+        crate::crumb(0x521 + (l as u32) * 0x10);
         for (kind, reg) in [("q", S_QH), ("k", S_KH), ("v", S_VH)] {
             let nm = enc_blob(l, kind, 0);
             for i in 0..N_TILES {
@@ -817,6 +822,7 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
             }
         }
         // attention
+        crate::crumb(0x524 + (l as u32) * 0x10);
         let sm = bq.q_out.scale * bq.k_out.scale / 8.0;
         for h in 0..HEADS {
             assemble_head(c, S_KH, h, A_K, PAD_W)?;
@@ -833,6 +839,7 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
             }
         }
         // out-projection
+        crate::crumb(0x525 + (l as u32) * 0x10);
         let nm = enc_blob(l, "out", 0);
         for i in 0..N_TILES {
             for h in 0..HEADS {
@@ -842,7 +849,9 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
             try_rc!(c.npu(nm.s(), A_IN, A_OUT), "out");
             try_rc!(c.write(S_O, i * TILE8, A_OUT, TILE8), "o wr");
         }
+        crate::crumb(0x526 + (l as u32) * 0x10);
         res_add(c, S_O, sq, bq.out_out, bq.res1)?;
+        crate::crumb(0x527 + (l as u32) * 0x10);
 
         // mlp
         ln_region(c, Name::of(&["e", DIGITS[l], "ln2_gb"]).s(), bq.res1, bq.ln2)?;
@@ -860,6 +869,7 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
             }
         }
         // recombination: x16 += sum of dequantized partials
+        crate::crumb(0x528 + (l as u32) * 0x10);
         const CH2: usize = 8192;
         for ci in 0..(C * PAD_W) / CH2 {
             try_rc!(c.read(S_X, ci * CH2 * 2, A_IN, CH2 * 2), "s x");
@@ -884,6 +894,7 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     }
 
     // final layernorm -> encoder output tiles (int8, enc_out quant)
+    crate::crumb(0x570);
     c.asset("lnpost_gb", A_GB)?;
     for i in 0..N_TILES {
         try_rc!(c.read(S_X, i * TILE16, A_IN, TILE16), "lp in");
@@ -900,6 +911,7 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
 // --- cross K/V ---------------------------------------------------------------------
 
 fn cross_kv(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
+    crate::crumb(0x571);
     for l in 0..BLOCKS {
         for (which, kind) in [(0u32, "xk"), (1u32, "xv")] {
             let nm = dec_blob(l, kind, 0);

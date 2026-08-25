@@ -59,6 +59,10 @@ pub static mut ARENA: [u8; ARENA_BYTES] = [0; ARENA_BYTES];
 // --- Device interrupt vector table (AXONS IRQ 86; see ../../npu/src/main.rs).
 
 const AXONS_IRQN: usize = 86;
+// Cover every possible IRQ slot (the LM20's highest IRQ numbers exceed
+// 86): a stray unmasked interrupt then lands in default_irq_handler's
+// bkpt loop instead of executing whatever .text follows the table.
+const VECTOR_SLOTS: usize = 271;
 
 unsafe extern "C" fn default_irq_handler() {
     loop {
@@ -70,15 +74,15 @@ unsafe extern "C" fn axons_irq_handler() {
     bindings::nrf_axon_handle_interrupt();
 }
 
-const fn vector_table() -> [unsafe extern "C" fn(); AXONS_IRQN + 1] {
-    let mut t = [default_irq_handler as unsafe extern "C" fn(); AXONS_IRQN + 1];
+const fn vector_table() -> [unsafe extern "C" fn(); VECTOR_SLOTS] {
+    let mut t = [default_irq_handler as unsafe extern "C" fn(); VECTOR_SLOTS];
     t[AXONS_IRQN] = axons_irq_handler;
     t
 }
 
 #[no_mangle]
 #[link_section = ".vector_table.interrupts"]
-pub static __INTERRUPTS: [unsafe extern "C" fn(); AXONS_IRQN + 1] = vector_table();
+pub static __INTERRUPTS: [unsafe extern "C" fn(); VECTOR_SLOTS] = vector_table();
 
 // --- Crash breadcrumb ---------------------------------------------------------
 // Last word of the ARENA region (NOLOAD -> survives reset; the tape
