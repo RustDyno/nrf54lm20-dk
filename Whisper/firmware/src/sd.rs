@@ -225,9 +225,24 @@ fn xfer(tx: &[u8], rx: &mut [u8]) {
         return;
     }
     unsafe {
-        write_volatile(spim(TX_PTR), tx.as_ptr() as u32);
+        if SPIM_FAULT {
+            // a previous transfer faulted: fail fast instead of piling
+            // 20 ms timeouts on every subsequent byte
+            for r in rx.iter_mut() {
+                *r = 0xFF;
+            }
+            return;
+        }
+        // Real pointers even for zero-length directions: empty-slice
+        // pointers are dangling, and the nRF54 EasyDMA validates bus
+        // addresses (TERMINATEONBUSERROR machinery) where nRF52 did not.
+        static mut DMA_DUMMY: [u8; 4] = [0; 4];
+        let dummy = core::ptr::addr_of_mut!(DMA_DUMMY) as u32;
+        let txp = if tx.is_empty() { dummy } else { tx.as_ptr() as u32 };
+        let rxp = if rx.is_empty() { dummy } else { rx.as_mut_ptr() as u32 };
+        write_volatile(spim(TX_PTR), txp);
         write_volatile(spim(TX_MAXCNT), tx.len() as u32);
-        write_volatile(spim(RX_PTR), rx.as_mut_ptr() as u32);
+        write_volatile(spim(RX_PTR), rxp);
         write_volatile(spim(RX_MAXCNT), rx.len() as u32);
         write_volatile(spim(EVENTS_STARTED), 0);
         write_volatile(spim(EVENTS_END), 0);
@@ -236,12 +251,57 @@ fn xfer(tx: &[u8], rx: &mut [u8]) {
             write_volatile(spim(ERRATA8_REG), 0x82);
         }
         write_volatile(spim(TASKS_START), 1);
-        while read_volatile(spim(EVENTS_STARTED)) == 0 {}
+        let ok_started = spim_wait(EVENTS_STARTED);
         if DIV_FAST > 2 {
             write_volatile(spim(ERRATA8_REG), 0x00);
         }
-        while read_volatile(spim(EVENTS_END)) == 0 {}
+        let ok_end = ok_started && spim_wait(EVENTS_END);
+        if !ok_end {
+            spim_fault_dump(if ok_started { "END" } else { "STARTED" });
+        }
     }
+}
+
+/// Sticky fault flag: set on the first SPIM event timeout; read_blocks /
+/// write_blocks turn it into a distinct error code.
+static mut SPIM_FAULT: bool = false;
+
+/// Wait up to 20 ms (DWT-timed) for an event register.
+unsafe fn spim_wait(event: usize) -> bool {
+    let start = cortex_m::peripheral::DWT::cycle_count();
+    while cortex_m::peripheral::DWT::cycle_count().wrapping_sub(start) < 2_560_000 {
+        if read_volatile(spim(event)) != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// One-shot diagnostic dump when a SPIM transfer times out.
+unsafe fn spim_fault_dump(which: &str) {
+    use rtt_target::{rprint, rprintln};
+    SPIM_FAULT = true;
+    rprintln!("sd: SPIM transfer timed out waiting for {}", which);
+    rprintln!(
+        "sd: STARTED={} END={} ENABLE={:#x} PRESC={} CONFIG={:#x}",
+        read_volatile(spim(EVENTS_STARTED)),
+        read_volatile(spim(EVENTS_END)),
+        read_volatile(spim(ENABLE)),
+        read_volatile(spim(PRESCALER)),
+        read_volatile(spim(CONFIG)),
+    );
+    rprint!("sd: EVENTS_DMA 0x14C..0x170:");
+    let mut off = 0x14C;
+    while off <= 0x170 {
+        rprint!(" {:x}", read_volatile(spim(off)));
+        off += 4;
+    }
+    rprintln!();
+    rprintln!(
+        "sd: RX buserr @{:#010x} TX buserr @{:#010x}",
+        read_volatile(spim(0x720)),
+        read_volatile(spim(0x758)),
+    );
 }
 
 fn send(tx: &[u8]) {
@@ -334,6 +394,7 @@ pub fn init() -> i32 {
     unsafe {
         BITBANG = true;
         SWAP_DATA = false;
+        SPIM_FAULT = false;
         write_volatile(spim(ENABLE), 0);
 
         // SCK/MOSI/CS as outputs (SCK idle low, MOSI/CS idle high), MISO
@@ -541,6 +602,9 @@ pub fn diag(cycles: u32) {
 
 /// Read `count` 512-byte blocks starting at `lba` into `dst` (CMD18).
 pub fn read_blocks(lba: u32, dst: *mut u8, count: u32) -> i32 {
+    if unsafe { SPIM_FAULT } {
+        return -470;
+    }
     cs_assert();
     let r = command(18, card_addr(lba), 0xFF);
     if r != 0 {
@@ -572,7 +636,7 @@ pub fn read_blocks(lba: u32, dst: *mut u8, count: u32) -> i32 {
     for _ in 0..200_000 {
         if recv1() == 0xFF {
             cs_release();
-            return 0;
+            return if unsafe { SPIM_FAULT } { -470 } else { 0 };
         }
     }
     cs_release();
@@ -581,6 +645,9 @@ pub fn read_blocks(lba: u32, dst: *mut u8, count: u32) -> i32 {
 
 /// Write `count` 512-byte blocks starting at `lba` from `src` (CMD25).
 pub fn write_blocks(lba: u32, src: *const u8, count: u32) -> i32 {
+    if unsafe { SPIM_FAULT } {
+        return -471;
+    }
     cs_assert();
     let r = command(25, card_addr(lba), 0xFF);
     if r != 0 {
@@ -616,7 +683,7 @@ pub fn write_blocks(lba: u32, src: *const u8, count: u32) -> i32 {
     for _ in 0..500_000 {
         if recv1() == 0xFF {
             cs_release();
-            return 0;
+            return if unsafe { SPIM_FAULT } { -471 } else { 0 };
         }
     }
     cs_release();
