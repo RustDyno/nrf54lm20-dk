@@ -44,8 +44,12 @@ const GPIO_BASE: usize = 0x500D_8600; // GPIO port 3, secure alias
 
 // SPIM register offsets (SVD: GLOBAL_SPIM00, all instances share the map).
 const TASKS_START: usize = 0x000;
+const TASKS_STOP: usize = 0x004;
 const EVENTS_STARTED: usize = 0x100;
+const EVENTS_STOPPED: usize = 0x104;
 const EVENTS_END: usize = 0x108;
+const EVENTS_DMA_RX_END: usize = 0x14C;
+const EVENTS_DMA_TX_END: usize = 0x168;
 const ENABLE: usize = 0x500;
 const PRESCALER: usize = 0x52C;
 const CONFIG: usize = 0x554;
@@ -250,15 +254,39 @@ fn xfer(tx: &[u8], rx: &mut [u8]) {
             // erratum [8] applies only above PRESCALER 2
             write_volatile(spim(ERRATA8_REG), 0x82);
         }
+        write_volatile(spim(EVENTS_DMA_RX_END), 0);
+        write_volatile(spim(EVENTS_DMA_TX_END), 0);
+        write_volatile(spim(EVENTS_STOPPED), 0);
         write_volatile(spim(TASKS_START), 1);
         let ok_started = spim_wait(EVENTS_STARTED);
         if DIV_FAST > 2 {
             write_volatile(spim(ERRATA8_REG), 0x00);
         }
-        let ok_end = ok_started && spim_wait(EVENTS_END);
+        // The nRF54 SPIM's EVENTS_END is tied to the hardware-CSN
+        // transaction framing, and our CSN is disconnected (the SD
+        // protocol holds CS across many transfers): with software CS the
+        // END event never fires (hardware-observed: both DMA END events
+        // set, EVENTS_END stuck 0). Completion = both DMA directions
+        // done; then STOP closes the engine's transaction state.
+        let ok_end = ok_started
+            && spim_wait(EVENTS_DMA_RX_END)
+            && spim_wait(EVENTS_DMA_TX_END);
         if !ok_end {
-            spim_fault_dump(if ok_started { "END" } else { "STARTED" });
+            spim_fault_dump(if ok_started { "DMA END" } else { "STARTED" });
+            return;
         }
+        write_volatile(spim(TASKS_STOP), 1);
+        // Best-effort: erratum [69] says STOPPED can fail to assert in
+        // corner cases; a bounded wait keeps that from wedging us.
+        let stop_start = cortex_m::peripheral::DWT::cycle_count();
+        while cortex_m::peripheral::DWT::cycle_count().wrapping_sub(stop_start)
+            < 128_000
+        {
+            if read_volatile(spim(EVENTS_STOPPED)) != 0 {
+                break;
+            }
+        }
+        write_volatile(spim(EVENTS_STOPPED), 0);
     }
 }
 
