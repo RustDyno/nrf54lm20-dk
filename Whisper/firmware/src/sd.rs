@@ -276,19 +276,39 @@ fn card_addr(lba: u32) -> u32 {
 }
 
 /// CMD0 with retries; returns the last R1 (0xFF = total silence). Leaves
-/// CS low on success, high on failure.
+/// CS low on success, high on failure. The first attempt's 16 poll bytes
+/// are printed afterwards -- the SoC's actual received data, the one
+/// quantity no external instrument has to be trusted for.
 fn cmd0_probe() -> u8 {
+    use rtt_target::{rprint, rprintln};
+    let mut trace = [0u8; 16];
     let mut r = 0xFF;
-    for _ in 0..8 {
+    for attempt in 0..8 {
         cs(false);
         recv1(); // 8 clocks with CS low before the frame
-        r = command(0, 0, 0x95);
+        if attempt == 0 {
+            send(&[0x40, 0, 0, 0, 0, 0x95]);
+            r = 0xFF;
+            for t in trace.iter_mut() {
+                *t = recv1();
+                if r == 0xFF && *t & 0x80 == 0 {
+                    r = *t;
+                }
+            }
+        } else {
+            r = command(0, 0, 0x95);
+        }
         if r == 0x01 {
-            return r;
+            break;
         }
         cs(true);
         recv1(); // 8 deselected clocks between attempts
     }
+    rprint!("sd: CMD0 poll bytes:");
+    for t in trace {
+        rprint!(" {:02X}", t);
+    }
+    rprintln!(" (r={:02X})", r);
     r
 }
 
