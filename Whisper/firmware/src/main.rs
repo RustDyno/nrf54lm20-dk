@@ -113,10 +113,10 @@ fn SysTick() {
     }
 }
 
-struct WdogGuard;
+pub(crate) struct WdogGuard;
 
 impl WdogGuard {
-    fn arm() -> Self {
+    pub(crate) fn arm() -> Self {
         WDOG_TICKS.store(0, Ordering::Relaxed);
         WdogGuard
     }
