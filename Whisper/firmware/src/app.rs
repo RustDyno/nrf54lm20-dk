@@ -430,7 +430,7 @@ impl Ctxt {
             self.loaded = e;
         }
         let _wd = crate::WdogGuard::arm();
-        unsafe { slot::run(arena_addr(input), arena_addr(output)) }
+        unsafe { slot::run(arena_addr(input), arena_addr(output), blob) }
     }
 }
 

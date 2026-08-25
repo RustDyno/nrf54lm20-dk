@@ -118,12 +118,15 @@ unsafe fn HardFault(ef: &ExceptionFrame) -> ! {
     // Print the exception frame and fault status over RTT, then spin so
     // the attached host can drain the message (no bkpt: keep RTT alive).
     let crumb_val = unsafe { core::ptr::read_volatile(BREADCRUMB) };
+    let crumb2_val = unsafe { core::ptr::read_volatile(BREADCRUMB2) };
     rprintln!(
-        "HARDFAULT pc={:#010x} lr={:#010x} xpsr={:#010x} crumb={:#x}",
+        "HARDFAULT pc={:#010x} lr={:#010x} xpsr={:#010x} crumbs={:#x}/{:#x} frame@{:#010x}",
         ef.pc(),
         ef.lr(),
         ef.xpsr(),
-        crumb_val
+        crumb_val,
+        crumb2_val,
+        ef as *const ExceptionFrame as usize
     );
     rprintln!(
         "  r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r12={:#010x}",
@@ -310,7 +313,7 @@ unsafe fn dispatch(cmd: u32, a: &[u32; 8]) -> i32 {
         CMD_PING => 0x50494E47, // "PING"
         CMD_RUN_NPU => {
             let _wd = WdogGuard::arm();
-            slot::run(a[0], a[1])
+            slot::run(a[0], a[1], "host")
         }
         CMD_LUT8 => {
             let lut: &[i8] = sl(a[0], 256);
@@ -537,6 +540,14 @@ fn main() -> ! {
         cortex_m::asm::delay(64);
         core::ptr::write_volatile(ICACHE_ENABLE, 1);
         cortex_m::asm::isb();
+        // An attached debugger arms DEMCR vector catch (VC_HARDERR etc.),
+        // which halts the core at exception ENTRY -- our HardFault handler
+        // never runs and no fault dump is printed. Clear the catch bits
+        // (0: VC_CORERESET, 4..10: VC_MMERR..VC_HARDERR) so faults vector
+        // into the handler; TRCENA and the rest are preserved.
+        const DEMCR: *mut u32 = 0xE000_EDFC as *mut u32;
+        let demcr = core::ptr::read_volatile(DEMCR);
+        core::ptr::write_volatile(DEMCR, demcr & !0x0000_07F1);
     }
     let channels = rtt_init! {
         up: {

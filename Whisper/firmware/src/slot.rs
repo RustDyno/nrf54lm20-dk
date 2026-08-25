@@ -25,7 +25,7 @@ struct SlotHeader {
 /// Validate and run the blob currently in the slot. `input`/`output` are
 /// absolute arena addresses (0 = the model's own interlayer locations, per
 /// the driver's NULL contract).
-pub unsafe fn run(input: u32, output: u32) -> i32 {
+pub unsafe fn run(input: u32, output: u32, name: &str) -> i32 {
     let hdr = &*(SLOT_BASE as *const SlotHeader);
     if hdr.magic != SLOT_MAGIC {
         return -101;
@@ -35,7 +35,7 @@ pub unsafe fn run(input: u32, output: u32) -> i32 {
         return -102;
     }
     let rc = bindings::nrf_axon_nn_model_validate(model);
-    rtt_target::rprintln!("npu: validate rc={} infer...", rc.0);
+    rtt_target::rprintln!("npu {}: validate rc={} infer...", name, rc.0);
     if rc.0 != 0 {
         return rc.0;
     }
