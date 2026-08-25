@@ -564,9 +564,13 @@ fn main() -> ! {
     // Grace window: a connected host (tape player / decode driver) issues
     // its PING right after the magic appears. If one does, stay a mailbox
     // executor; otherwise go standalone (which itself falls back here when
-    // no SD image is present).
-    for _ in 0..300 {
-        cortex_m::asm::delay(1_280_000); // 10 ms
+    // no SD image is present). DWT-timed to exactly 5 s wall time --
+    // asm::delay pacing shrank with the icache fix and the host once lost
+    // the race.
+    let grace_start = cortex_m::peripheral::DWT::cycle_count();
+    while cortex_m::peripheral::DWT::cycle_count().wrapping_sub(grace_start)
+        < 5 * 128_000_000
+    {
         unsafe {
             let seq = core::ptr::read_volatile(core::ptr::addr_of!((*mb).cmd_seq));
             if seq != core::ptr::read_volatile(core::ptr::addr_of!((*mb).ack_seq)) {
