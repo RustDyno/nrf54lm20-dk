@@ -90,7 +90,31 @@ exercised on hardware, [ASSUME] no primary source found -- flagged.
 | Same card + breakout + protocol from ESP32-C3 | C3 tester | PASS 3/3 incl. block-0 read |
 | Mux bypass (SoC pads direct via TPs) | tape test | still no response |
 
-## 7. The open contradiction, and what is NOT yet done
+## 7. RESOLVED: the root cause (2026-08-25, commit 046de3c)
+
+The firmware's CS polarity was inverted at every call site: the helper
+was `cs(low: bool)` (true = drive low) but the blind-built M5 call sites
+passed `cs(false)` meaning "assert". Warmup clocks ran with the card
+SELECTED; every command frame went out DESELECTED -- ignored by every
+card, by design. The C3 sniffer's decode showed the inverted CS phase
+(warmup inside CS-low, frames inside CS-high) from its first capture;
+it was misattributed to wiring three times because the code was assumed
+to match its comments. Every other instrument (DMM via diag, loopback,
+scope single-line shots) exercised paths that bypass the cs() helper.
+Fixed by replacing the helper with cs_assert()/cs_release().
+
+Post-mortem lessons, for the record:
+- A boolean parameter whose sense can be misread at call sites
+  (`cs(true)` = "low"?) is a defect class of its own; use named
+  functions for polarity.
+- "Verified" claims age: every DC/loopback verification predated some
+  later rewiring and was silently trusted past its expiry.
+- When one instrument (the protocol-context sniffer) repeatedly
+  contradicts the mental model while spot-check instruments agree with
+  it, believe the protocol-context instrument: the spot checks were
+  measuring different code paths.
+
+## 8. Superseded: the earlier open contradiction
 
 A card that answers a byte-identical, speed-identical CMD0 sequence from
 an ESP32-C3 ignores the same sequence delivered from the nRF54LM20B's own
@@ -119,7 +143,7 @@ software step is missing per sections 1-4. Remaining actions, in order:
    erratum on the P2 QSPI-capable pads is at that point a live
    possibility that only Nordic can confirm.
 
-## 8. Explicitly retired theories (for the record)
+## 9. Explicitly retired theories (for the record)
 
 Wiring swaps (disproven: card-witness swap probe), nRF cannot read MISO
 (disproven: 4/4 loopback), analog switch misrouting or damage (disproven:
