@@ -1114,7 +1114,9 @@ fn sd_read_bytes(e: Entry, byte_off: usize, dst: &mut [u8]) -> i32 {
     let lba = e.lba + (byte_off / sd::BLOCK) as u32;
     let skew = byte_off % sd::BLOCK;
     let blocks = (skew + dst.len()).div_ceil(sd::BLOCK);
-    debug_assert!(blocks <= 2);
+    if blocks > 2 {
+        return -930; // larger reads go through sd::read_blocks directly
+    }
     let rc = sd::read_blocks(lba, bounce.as_mut_ptr(), blocks as u32);
     if rc != 0 {
         return rc;
@@ -1260,7 +1262,7 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
 
         // LM head on the CPU: f32 layernorm + pruned-vocab argmax
         let mut gb = [0u8; 3072];
-        try_rc!(sd_read_bytes(fin, 0, &mut gb), "fin gb");
+        try_rc!(sd::read_blocks(fin.lba, gb.as_mut_ptr(), 6), "fin gb");
         let mut hid = [0f32; C];
         let x16 = as_i16(D_X16, C * W4);
         let mut mean = 0f32;
