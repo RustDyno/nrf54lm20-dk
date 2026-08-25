@@ -41,10 +41,19 @@ const CAP: usize = 16384;
 static mut TS: [u32; CAP] = [0; CAP];
 static mut VAL: [u32; CAP] = [0; CAP];
 
+/// ESP32-C3 has no standard mcycle; use Espressif's machine performance
+/// counter CSRs: PCER (0x7E0) event=cycles, PCMR (0x7E1) enable, PCCR
+/// (0x7E2) the running count.
+fn cycles_init() {
+    unsafe {
+        core::arch::asm!("csrwi 0x7E0, 1", "csrwi 0x7E1, 1");
+    }
+}
+
 #[inline(always)]
 fn cycles() -> u32 {
     let c: u32;
-    unsafe { core::arch::asm!("csrr {}, mcycle", out(reg) c) };
+    unsafe { core::arch::asm!("csrr {}, 0x7E2", out(reg) c) };
     c
 }
 
@@ -66,7 +75,8 @@ fn main() -> ! {
     );
     let delay = esp_hal::delay::Delay::new();
 
-    // Calibrate mcycle against the HAL delay once.
+    // Calibrate the cycle counter against the HAL delay once.
+    cycles_init();
     let c0 = cycles();
     delay.delay_millis(100);
     let cyc_per_us = cycles().wrapping_sub(c0) / 100_000;

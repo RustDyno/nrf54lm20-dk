@@ -326,7 +326,24 @@ pub fn init() -> i32 {
 
     // CMD0: software reset -> idle state. Retried: real cards commonly
     // ignore the first attempt(s) after power-up.
-    let mut r = cmd0_probe();
+    let r = cmd0_probe();
+    if r == 0x00 {
+        // 0x00 in the response slot is either a live card answering out
+        // of alignment / out of idle, or MISO stuck low. A real card
+        // returns to 0xFF idle after its response; a stuck line reads
+        // 0x00 forever.
+        let mut post = [0u8; 4];
+        recv(&mut post);
+        cs(true);
+        use rtt_target::rprintln;
+        if post == [0u8; 4] {
+            rprintln!("sd: MISO reads permanently LOW (stuck line/short)");
+            return -461;
+        }
+        rprintln!("sd: card RESPONDED but R1=00 (bit slip or already");
+        rprintln!("sd: initialized): contact is marginal -- reseat/rewire");
+        return -200;
+    }
     if r == 0xFF {
         // Total silence: probe with the data-pin roles exchanged. The
         // card itself is the one witness that cannot be mis-tapped -- if
