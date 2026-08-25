@@ -2,6 +2,7 @@
 name = "esp32c3-sd-test"
 version = "0.1.0"
 edition = "2021"
+default-run = "esp32c3-sd-test"
 
 [dependencies]
 esp-bootloader-esp-idf = { version = "0.5", features = ["esp32c3"] }
