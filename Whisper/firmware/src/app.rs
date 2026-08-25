@@ -320,6 +320,11 @@ impl Plan {
 struct Ctxt {
     scratch: u32,
     loaded: Entry,
+    /// VAD-chosen extent: active 64-frame tiles and attention context
+    /// (keys). Storage layouts stay sized for N_TILES/CTX; these only
+    /// bound the loops. Floor/cap enforced in mel_pass2.
+    tiles: usize,
+    ctx: usize,
 }
 
 macro_rules! try_rc {
@@ -426,7 +431,12 @@ pub fn run() -> ! {
     };
     rprintln!("standalone: ready ({} kept vocabulary entries)", plan.vocab_n);
     loop {
-        let mut ctx = Ctxt { scratch: plan.scratch, loaded: Entry::default() };
+        let mut ctx = Ctxt {
+            scratch: plan.scratch,
+            loaded: Entry::default(),
+            tiles: N_TILES,
+            ctx: CTX,
+        };
         if utterance(&plan, &mut ctx).is_err() {
             rprintln!("(utterance aborted; retrying in a moment)");
             display::print("(retry)\n");
@@ -463,9 +473,11 @@ fn utterance(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         mel_tables(c)?;
         mel_pass1(c)?;
     }
-    mel_pass2(plan, c)?;
-    rprintln!("encoder...");
+    let (tiles, actx) = mel_pass2(plan, c)?;
+    c.tiles = tiles;
+    c.ctx = actx;
     display::print("encoding...\n");
+    rprintln!("encoder...");
     encoder(plan, c)?;
     rprintln!("cross K/V...");
     cross_kv(plan, c)?;
@@ -636,14 +648,34 @@ fn mel_pass1(c: &Ctxt) -> Result<(), i32> {
     Ok(())
 }
 
+/// VAD floor/cap in encoder frames (mel rate is 2x): never below 192
+/// frames (3.84 s) of context, never above the full 600.
+const VAD_FLOOR_CTX: usize = 192;
+const VAD_MARGIN_CTX: usize = 32; // 0.64 s past the last speech frame
+const VAD_THRESH_LOG10: f32 = 1.0; // 10 dB over the noise floor
+
 /// Pass 2: normalize into int8 mel tiles; pad frames = quantized 0.0.
-/// Needs the global max in R_MAX from either pass 1.
-fn mel_pass2(plan: &Plan, c: &Ctxt) -> Result<(), i32> {
+/// Needs the global max in R_MAX from either pass 1. Also scans the f32
+/// mel energies for speech (mean log-mel per frame vs the quietest
+/// frame) and returns the VAD extent (tiles, ctx) for the encoder.
+fn mel_pass2(plan: &Plan, c: &Ctxt) -> Result<(usize, usize), i32> {
     let pad = quant8(0.0, plan.conv1_in);
+    // per-mel-frame mean energies staged in the (idle) R_WIN region
+    let means = unsafe {
+        core::slice::from_raw_parts_mut(arena_addr(R_WIN) as *mut f32, 1200)
+    };
     for mt in 0..MEL_TILES {
         let dst = as_i8_mut(R_TILE, 80 * T);
         if mt < 18 {
             try_rc!(c.read(S_MELF, mt * 20480, R_MELF, 20480), "melf rd");
+            let m = as_f32(R_MELF, 80 * T);
+            for f in 0..T {
+                let mut sum = 0f32;
+                for r in 0..80 {
+                    sum += m[r * T + f];
+                }
+                means[mt * T + f] = sum / 80.0;
+            }
             let p = mel::MelNormParams {
                 mel: arena_addr(R_MELF),
                 n: (80 * T) as u32,
@@ -655,6 +687,14 @@ fn mel_pass2(plan: &Plan, c: &Ctxt) -> Result<(), i32> {
         } else if mt == 18 {
             // 48 real frames stored planar [80,48]; expand to [80,64]
             try_rc!(c.read(S_MELF, mt * 20480, R_MELF, 15360), "melf rd");
+            let m = as_f32(R_MELF, 80 * 48);
+            for f in 0..48 {
+                let mut sum = 0f32;
+                for r in 0..80 {
+                    sum += m[r * 48 + f];
+                }
+                means[mt * T + f] = sum / 80.0;
+            }
             let p = mel::MelNormParams {
                 mel: arena_addr(R_MELF),
                 n: (80 * 48) as u32,
@@ -673,7 +713,27 @@ fn mel_pass2(plan: &Plan, c: &Ctxt) -> Result<(), i32> {
         }
         try_rc!(c.write(S_MEL, mt * 80 * T, R_TILE, 80 * T), "mel8 wr");
     }
-    Ok(())
+    // Endpoint: last mel frame louder than (quietest frame + 10 dB),
+    // plus margin, floored and capped, rounded up to whole tiles.
+    let mut floor = f32::MAX;
+    for &v in means[..1200].iter() {
+        if v < floor {
+            floor = v;
+        }
+    }
+    let mut last = 0usize;
+    for (f, &v) in means[..1200].iter().enumerate() {
+        if v > floor + VAD_THRESH_LOG10 {
+            last = f;
+        }
+    }
+    let ctx = (last / 2 + VAD_MARGIN_CTX).clamp(VAD_FLOOR_CTX, CTX);
+    let tiles = ctx.div_ceil(T);
+    rprintln!(
+        "vad: speech to mel frame {} -> ctx {} ({} tiles of {})",
+        last, ctx, tiles, N_TILES
+    );
+    Ok((tiles, ctx))
 }
 
 fn quant8(x: f32, q: Quant) -> i8 {
@@ -713,7 +773,7 @@ fn assemble_halo(c: &Ctxt, region: u32, rows: usize, n_tiles: usize,
 
 fn ln_region(c: &mut Ctxt, gb: &str, sq: Quant, dq: Quant) -> Result<(), i32> {
     c.asset(gb, A_GB)?;
-    for i in 0..N_TILES {
+    for i in 0..c.tiles {
         try_rc!(c.read(S_X, i * TILE16, A_IN, TILE16), "ln in");
         kernels::ln_planar_i16_to_i8(
             as_i16(A_IN, C * T), sq,
@@ -727,7 +787,7 @@ fn ln_region(c: &mut Ctxt, gb: &str, sq: Quant, dq: Quant) -> Result<(), i32> {
 
 fn res_add(c: &Ctxt, region8: u32, qa: Quant, qb: Quant, qd: Quant) -> Result<(), i32> {
     const CH: usize = 12288;
-    for ci in 0..(C * PAD_W) / CH {
+    for ci in 0..(C * c.tiles * T) / CH {
         try_rc!(c.read(S_X, ci * CH * 2, A_IN, CH * 2), "res a");
         try_rc!(c.read(region8, ci * CH, A_AUX, CH), "res b");
         // add in place: kernel reads index-aligned, safe to alias
@@ -745,7 +805,7 @@ fn res_add(c: &Ctxt, region8: u32, qa: Quant, qb: Quant, qd: Quant) -> Result<()
 /// [64, out_w] buffer at `dst_off`, dropping columns >= out_w.
 fn assemble_head(c: &Ctxt, region: u32, head: usize, dst_off: usize,
                  out_w: usize) -> Result<(), i32> {
-    for i in 0..N_TILES {
+    for i in 0..c.tiles {
         try_rc!(c.read(region, (head * N_TILES + i) * HB, A_TMP, HB), "hb rd");
         let tmp = as_i8(A_TMP, HB);
         let dst = as_i8_mut(dst_off, HD * out_w);
@@ -766,8 +826,9 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     crate::crumb(0x511);
     // conv1 + gelu1 (mel tiles [80,64] -> mel-rate tiles [384,64] in S_A)
     c.asset("g1lut", A_LUT)?;
-    for i in 0..MEL_TILES {
-        assemble_halo(c, S_MEL, 80, MEL_TILES, i as i32 * T as i32 - 1, T + 2, zin)?;
+    let mel_tiles = 2 * c.tiles;
+    for i in 0..mel_tiles {
+        assemble_halo(c, S_MEL, 80, mel_tiles, i as i32 * T as i32 - 1, T + 2, zin)?;
         try_rc!(c.npu("wconv1", A_IN, A_OUT), "wconv1");
         lut_apply(A_LUT, A_OUT, TILE8);
         try_rc!(c.write(S_A, i * TILE8, A_OUT, TILE8), "c1 wr");
@@ -779,8 +840,8 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     for pi in 0..3usize {
         let nm = Name::of(&["wconv2", PARTS[pi]]);
         c.asset(Name::of(&["g2lut", DIGITS[pi]]).s(), A_LUT)?;
-        for i in 0..N_TILES {
-            assemble_halo(c, S_A, C, MEL_TILES, i as i32 * 128 - 1, 130, z2)?;
+        for i in 0..c.tiles {
+            assemble_halo(c, S_A, C, 2 * c.tiles, i as i32 * 128 - 1, 130, z2)?;
             try_rc!(c.npu(nm.s(), A_IN, A_OUT), "wconv2");
             lut_apply(A_LUT, A_OUT, 128 * T);
             try_rc!(c.write(S_LN, i * TILE8 + pi * 128 * T, A_OUT, 128 * T),
@@ -792,7 +853,7 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     // + positional embedding (tile-major f32 on the card) -> int16 S_X
     let pos = lookup("posenc").ok_or(-901)?;
     const CH: usize = 8192;
-    for ci in 0..(C * PAD_W) / CH {
+    for ci in 0..(C * c.tiles * T) / CH {
         try_rc!(c.read(S_LN, ci * CH, A_AUX, CH), "pos a");
         try_rc!(sd::read_blocks(pos.lba + (ci * CH * 4 / sd::BLOCK) as u32,
                                 arena(A_IN, 0).as_mut_ptr(),
@@ -812,7 +873,7 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         crate::crumb(0x521 + (l as u32) * 0x10);
         for (kind, reg) in [("q", S_QH), ("k", S_KH), ("v", S_VH)] {
             let nm = enc_blob(l, kind, 0);
-            for i in 0..N_TILES {
+            for i in 0..c.tiles {
                 try_rc!(c.read(S_LN, i * TILE8, A_IN, TILE8), "proj in");
                 try_rc!(c.npu(nm.s(), A_IN, A_OUT), "proj");
                 for h in 0..HEADS {
@@ -824,14 +885,15 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         // attention
         crate::crumb(0x524 + (l as u32) * 0x10);
         let sm = bq.q_out.scale * bq.k_out.scale / 8.0;
+        let aw = c.tiles * T;
         for h in 0..HEADS {
-            assemble_head(c, S_KH, h, A_K, PAD_W)?;
-            assemble_head(c, S_VH, h, A_V, PAD_W)?;
-            for i in 0..N_TILES {
+            assemble_head(c, S_KH, h, A_K, aw)?;
+            assemble_head(c, S_VH, h, A_V, aw)?;
+            for i in 0..c.tiles {
                 try_rc!(c.read(S_QH, (h * N_TILES + i) * HB, A_Q, HB), "q rd");
                 kernels::attn_head(
-                    as_i8(A_Q, HB), as_i8(A_K, HD * PAD_W), as_i8(A_V, HD * PAD_W),
-                    as_i8_mut(A_TMP, HB), HD, T, T, CTX, PAD_W,
+                    as_i8(A_Q, HB), as_i8(A_K, HD * aw), as_i8(A_V, HD * aw),
+                    as_i8_mut(A_TMP, HB), HD, T, T, c.ctx, aw,
                     bq.q_out.zp, bq.k_out.zp, bq.v_out.zp,
                     sm, bq.v_out.scale, bq.ctx,
                 );
@@ -841,7 +903,7 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         // out-projection
         crate::crumb(0x525 + (l as u32) * 0x10);
         let nm = enc_blob(l, "out", 0);
-        for i in 0..N_TILES {
+        for i in 0..c.tiles {
             for h in 0..HEADS {
                 try_rc!(c.read(S_CH, (h * N_TILES + i) * HB, A_IN + h * HB, HB),
                         "ctx rd");
@@ -859,7 +921,7 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
             let f1 = enc_blob(l, "fc1", j);
             let p2 = enc_blob(l, "fc2p", j);
             c.asset(Name::of(&["e", DIGITS[l], "lut", DIGITS[j]]).s(), A_LUT)?;
-            for i in 0..N_TILES {
+            for i in 0..c.tiles {
                 try_rc!(c.read(S_LN, i * TILE8, A_IN, TILE8), "fc in");
                 try_rc!(c.npu(f1.s(), A_IN, A_OUT), "fc1");
                 lut_apply(A_LUT, A_OUT, TILE8);
@@ -871,7 +933,7 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         // recombination: x16 += sum of dequantized partials
         crate::crumb(0x528 + (l as u32) * 0x10);
         const CH2: usize = 8192;
-        for ci in 0..(C * PAD_W) / CH2 {
+        for ci in 0..(C * c.tiles * T) / CH2 {
             try_rc!(c.read(S_X, ci * CH2 * 2, A_IN, CH2 * 2), "s x");
             for j in 0..4usize {
                 try_rc!(c.read(S_P + j as u32 * HREG_BLOCKS, ci * CH2,
@@ -896,7 +958,7 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     // final layernorm -> encoder output tiles (int8, enc_out quant)
     crate::crumb(0x570);
     c.asset("lnpost_gb", A_GB)?;
-    for i in 0..N_TILES {
+    for i in 0..c.tiles {
         try_rc!(c.read(S_X, i * TILE16, A_IN, TILE16), "lp in");
         kernels::ln_planar_i16_to_i8(
             as_i16(A_IN, C * T), sq,
@@ -915,7 +977,7 @@ fn cross_kv(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     for l in 0..BLOCKS {
         for (which, kind) in [(0u32, "xk"), (1u32, "xv")] {
             let nm = dec_blob(l, kind, 0);
-            for i in 0..N_TILES {
+            for i in 0..c.tiles {
                 try_rc!(c.read(S_EO, i * TILE8, A_IN, TILE8), "eo rd");
                 // enc.out quant != the submodels' input quant: requantize
                 // (the lesson that once garbled the transcript)
@@ -1066,9 +1128,9 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
                 assemble_head_ctx(c, S_XKV, l * 2 + 1, h, D_BIGV)?;
                 kernels::attn_head(
                     &as_i8(D_Q, C * W4)[h * HD * W4..(h + 1) * HD * W4],
-                    as_i8(D_BIGK, HD * CTX), as_i8(D_BIGV, HD * CTX),
+                    as_i8(D_BIGK, HD * c.ctx), as_i8(D_BIGV, HD * c.ctx),
                     &mut as_i8_mut(D_CTX, C * W4)[h * HD * W4..(h + 1) * HD * W4],
-                    HD, 1, W4, CTX, CTX,
+                    HD, 1, W4, c.ctx, c.ctx,
                     bq.xq_out.zp, bq.xk_out.zp, bq.xv_out.zp,
                     smx, bq.xv_out.scale, bq.xctx,
                 );
@@ -1177,17 +1239,18 @@ fn dec_add(x16: usize, qa: Quant, b8: usize, qb: Quant, qd: Quant) {
 /// Cross K/V head reassembly into planar [64, CTX] (pad columns dropped).
 fn assemble_head_ctx(c: &Ctxt, base: u32, matrix: usize, head: usize,
                      dst_off: usize) -> Result<(), i32> {
-    for i in 0..N_TILES {
+    let w = c.ctx;
+    for i in 0..c.tiles {
         try_rc!(c.read(base + matrix as u32 * HREG_BLOCKS,
                        (head * N_TILES + i) * HB, D_P, HB),
                 "xhb");
         let tmp = as_i8(D_P, HB);
-        let dst = as_i8_mut(dst_off, HD * CTX);
+        let dst = as_i8_mut(dst_off, HD * w);
         let c0 = i * T;
-        let take = T.min(CTX.saturating_sub(c0));
+        let take = T.min(w.saturating_sub(c0));
         for r in 0..HD {
             for col in 0..take {
-                dst[r * CTX + c0 + col] = tmp[r * T + col];
+                dst[r * w + c0 + col] = tmp[r * T + col];
             }
         }
     }
