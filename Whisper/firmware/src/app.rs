@@ -95,8 +95,9 @@ fn as_f32(off: usize, len: usize) -> &'static [f32] {
     unsafe { core::slice::from_raw_parts(arena_addr(off) as *const f32, len) }
 }
 
-/// The interlayer buffer is idle outside NPU runs; phases borrow it as
-/// scratch (mel filterbank, embedding scale table).
+/// The interlayer buffer is idle outside NPU runs; phases may borrow it
+/// as scratch (mel filterbank) but nothing may park data there across an
+/// NPU inference -- every blob DMAs activations through it.
 fn interlayer(len: usize) -> &'static mut [u8] {
     unsafe {
         core::slice::from_raw_parts_mut(
@@ -523,6 +524,18 @@ pub fn run() -> ! {
 static mut STREAM_MEL_OK: bool = true;
 
 fn utterance(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
+    // Decoder iteration without paying for a full encoder pass: the cross
+    // K/V scratch persists on the card (dd stops before the scratch
+    // blocks), so a build with this feature jumps straight to decode
+    // against the previous complete run's encoder output.
+    if cfg!(feature = "decode-only") {
+        rprintln!("");
+        rprintln!("=== decode-only (cross K/V scratch of the last full run) ===");
+        let r = decode(plan, c);
+        rprintln!("");
+        rprintln!("decode-only pass finished ({:?}); mailbox mode", r);
+        crate::mailbox_loop();
+    }
     rprintln!("");
     rprintln!("=== speak now (12 s) ===");
     display::clear();
@@ -1118,9 +1131,6 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     let posd = lookup("posdec").ok_or(-901)?;
     let vtb = lookup("vocabtb").ok_or(-901)?;
     let fin = lookup("final_gb.bin").ok_or(-901)?;
-    // row scales live in the interlayer buffer for the whole decode
-    try_rc!(sd::read_blocks(scl.lba, interlayer(0).as_mut_ptr(),
-                            scl.len.div_ceil(sd::BLOCK as u32)), "scl");
 
     unsafe {
         for m in (*core::ptr::addr_of_mut!(SELF_KV)).iter_mut() {
@@ -1272,7 +1282,7 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         }
 
         let out_idx = step - (plan.n_sot - 1);
-        let best = lm_head(plan, embp, ids, &hid, out_idx == 0)?;
+        let best = lm_head(plan, embp, scl, ids, &hid, out_idx == 0)?;
         if best == plan.eot {
             rprintln!("");
             rprintln!("=== done ({} tokens) ===", printed);
@@ -1336,12 +1346,15 @@ fn assemble_head_ctx(c: &Ctxt, base: u32, matrix: usize, head: usize,
 /// (An exact bound-sorted early exit was measured and rejected: Whisper
 /// LM-head cosines are so small that even the loosest row's Cauchy-Schwarz
 /// bound sits ~3x above the best logit -- 0 of 12228 rows prunable.)
-fn lm_head(plan: &Plan, embp: Entry, ids: Entry, hid: &[f32; C],
+fn lm_head(plan: &Plan, embp: Entry, scl: Entry, ids: Entry, hid: &[f32; C],
            first: bool) -> Result<u32, i32> {
     let mut best = f32::MIN;
     let mut best_row = 0usize;
     const ROWS: usize = 64; // 64 x 384 = 24576 B per chunk
-    let scl_all = interlayer(0); // f32 row scales, loaded at decode start
+    // f32 row scales, streamed alongside each chunk (256 B, one block).
+    // They cannot be parked anywhere the NPU writes: every decoder blob
+    // runs between decode start and this read.
+    let mut scl_buf = [0u8; ROWS * 4];
     let mut row_id = [0u8; 4];
     for chunk in 0..plan.vocab_n.div_ceil(ROWS) {
         let r0 = chunk * ROWS;
@@ -1352,10 +1365,11 @@ fn lm_head(plan: &Plan, embp: Entry, ids: Entry, hid: &[f32; C],
         if rc != 0 {
             return Err(rc);
         }
+        try_rc!(sd_read_bytes(scl, r0 * 4, &mut scl_buf[..n * 4]), "scl");
         let rows = as_i8(D_BIGK, n * C);
         for r in 0..n {
             let s = f32::from_le_bytes(
-                scl_all[(r0 + r) * 4..(r0 + r) * 4 + 4].try_into().unwrap());
+                scl_buf[r * 4..r * 4 + 4].try_into().unwrap());
             if s <= 0.0 {
                 continue; // input-only row (SOT etc), marked by the image
             }

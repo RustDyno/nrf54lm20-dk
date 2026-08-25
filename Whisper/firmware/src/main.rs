@@ -16,8 +16,17 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use cortex_m_rt::{entry, exception, ExceptionFrame};
-use panic_halt as _;
 use rtt_target::{rprintln, rtt_init, ChannelMode};
+
+// A silent panic loop cost a debugging session (an out-of-bounds index in
+// the LM head presented as "decode stuck"): print the panic over RTT and
+// leave a crumb before spinning.
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    crumb2(0xDEAD);
+    rprintln!("PANIC: {}", info);
+    loop {}
+}
 
 mod app;
 mod bindings;

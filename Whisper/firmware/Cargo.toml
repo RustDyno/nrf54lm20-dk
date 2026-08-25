@@ -13,7 +13,6 @@ cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 # in main.rs) so the AXONS IRQ (86) has a real handler; without it cortex-m-rt
 # emits only 32 default vectors and IRQ 86 vectors into garbage.
 cortex-m-rt = { version = "0.7", features = ["device"] }
-panic-halt = "1.0"
 rtt-target = "0.6"
 libm = "0.2"
 
@@ -34,3 +33,6 @@ lto = true
 # Diagnostic fallback: SD on SPIM22 at 8 MHz via plain P3 pins (original
 # wiring, no analog switches). Disables the OLED (shared serial box/pins).
 sd-spim22 = []
+# Skip mic/mel/encoder/cross and decode against the scratch already on
+# the card (from the last complete run). Development iteration aid.
+decode-only = []
