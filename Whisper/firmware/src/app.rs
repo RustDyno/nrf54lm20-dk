@@ -571,16 +571,31 @@ fn utterance(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         mel_pass1(c)?;
     }
     let (tiles, actx) = mel_pass2(plan, c)?;
+    sd_stats("mel");
     c.tiles = tiles;
     c.ctx = actx;
     display::print("encoding...\n");
     rprintln!("encoder...");
     encoder(plan, c)?;
+    sd_stats("encoder");
     rprintln!("cross K/V...");
     cross_kv(plan, c)?;
+    sd_stats("cross");
     rprintln!("decoding...");
     display::print("decoding:\n");
-    decode(plan, c)
+    let r = decode(plan, c);
+    sd_stats("decode");
+    r
+}
+
+/// Per-phase SD throughput line (drains the counters). Rates well below
+/// the session's first-utterance numbers implicate the card, not code.
+fn sd_stats(phase: &str) {
+    let (rb, rc, wb, wc) = sd::stats_take();
+    rprintln!(
+        "sd[{}]: rd {} KB / {} ms, wr {} KB / {} ms",
+        phase, rb / 1024, rc / 128_000, wb / 1024, wc / 128_000
+    );
 }
 
 // --- record + mel pass 1 --------------------------------------------------------

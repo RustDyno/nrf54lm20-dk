@@ -628,8 +628,42 @@ pub fn diag(cycles: u32) {
     }
 }
 
+// Cumulative transfer accounting (bytes and DWT cycles), drained by
+// stats_take. Motivation: the second utterance of a session ran its
+// encoder ~2x slower than the first with identical work; per-phase
+// throughput numbers are the only way to tell a degrading card
+// (internal garbage collection after heavy scratch writes) from a
+// firmware regression.
+static mut RD_BYTES: u64 = 0;
+static mut RD_CYC: u64 = 0;
+static mut WR_BYTES: u64 = 0;
+static mut WR_CYC: u64 = 0;
+
+/// Read and reset the cumulative transfer counters:
+/// (read bytes, read cycles, written bytes, write cycles).
+pub fn stats_take() -> (u64, u64, u64, u64) {
+    unsafe {
+        let s = (RD_BYTES, RD_CYC, WR_BYTES, WR_CYC);
+        RD_BYTES = 0;
+        RD_CYC = 0;
+        WR_BYTES = 0;
+        WR_CYC = 0;
+        s
+    }
+}
+
 /// Read `count` 512-byte blocks starting at `lba` into `dst` (CMD18).
 pub fn read_blocks(lba: u32, dst: *mut u8, count: u32) -> i32 {
+    let t0 = cortex_m::peripheral::DWT::cycle_count();
+    let rc = read_blocks_inner(lba, dst, count);
+    unsafe {
+        RD_CYC += cortex_m::peripheral::DWT::cycle_count().wrapping_sub(t0) as u64;
+        RD_BYTES += count as u64 * BLOCK as u64;
+    }
+    rc
+}
+
+fn read_blocks_inner(lba: u32, dst: *mut u8, count: u32) -> i32 {
     if unsafe { SPIM_FAULT } {
         return -470;
     }
@@ -673,6 +707,16 @@ pub fn read_blocks(lba: u32, dst: *mut u8, count: u32) -> i32 {
 
 /// Write `count` 512-byte blocks starting at `lba` from `src` (CMD25).
 pub fn write_blocks(lba: u32, src: *const u8, count: u32) -> i32 {
+    let t0 = cortex_m::peripheral::DWT::cycle_count();
+    let rc = write_blocks_inner(lba, src, count);
+    unsafe {
+        WR_CYC += cortex_m::peripheral::DWT::cycle_count().wrapping_sub(t0) as u64;
+        WR_BYTES += count as u64 * BLOCK as u64;
+    }
+    rc
+}
+
+fn write_blocks_inner(lba: u32, src: *const u8, count: u32) -> i32 {
     if unsafe { SPIM_FAULT } {
         return -471;
     }

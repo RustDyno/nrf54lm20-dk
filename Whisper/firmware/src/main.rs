@@ -571,7 +571,16 @@ fn main() -> ! {
         core::ptr::write_volatile(DEMCR, demcr & !0x0000_07F1);
         // The AXONBUF region is NOLOAD (fixed-address interlayer/psum
         // buffers): zero it here since cortex-m-rt only zeroes .bss.
-        core::ptr::write_bytes(0x2002_1000 as *mut u8, 0, 68 * 1024);
+        core::ptr::write_bytes(
+            core::ptr::addr_of_mut!(nrf_axon_interlayer_buffer) as *mut u8,
+            0,
+            INTERLAYER_BUFFER_BYTES,
+        );
+        core::ptr::write_bytes(
+            core::ptr::addr_of_mut!(nrf_axon_psum_buffer) as *mut u8,
+            0,
+            PSUM_BUFFER_BYTES,
+        );
     }
     let channels = rtt_init! {
         up: {
