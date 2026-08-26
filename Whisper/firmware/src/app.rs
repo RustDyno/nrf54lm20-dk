@@ -540,7 +540,17 @@ fn utterance(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     rprintln!("=== speak now (12 s) ===");
     display::clear();
     display::print("== speak now (12 s)\n");
-    if unsafe { STREAM_MEL_OK } {
+    // Streaming mel has failed deterministically on hardware (17 overruns
+    // every boot), costing an aborted utterance (~25 s) before the
+    // permanent sequential fallback. Disabled via const until the overrun
+    // cause is profiled; the static stays (in .data) so the RAM layout --
+    // and with it the card image -- is unchanged.
+    const TRY_STREAM_MEL: bool = false;
+    // The volatile read keeps the (otherwise dead) static resident: its
+    // removal shifts every later .bss symbol and invalidates the card.
+    let stream_ok =
+        unsafe { core::ptr::read_volatile(core::ptr::addr_of!(STREAM_MEL_OK)) };
+    if TRY_STREAM_MEL && stream_ok {
         // mel pass 1 overlaps the recording (chunk-sized PDM buffers); an
         // overrun means the M33 could not keep up -- lost audio, so abort
         // this utterance and fall back to the sequential path for good.
@@ -740,6 +750,10 @@ fn mel_pass1(c: &Ctxt) -> Result<(), i32> {
 const VAD_FLOOR_CTX: usize = 192;
 const VAD_MARGIN_CTX: usize = 32; // 0.64 s past the last speech frame
 const VAD_THRESH_LOG10: f32 = 1.0; // 10 dB over the noise floor
+// A frame must also be within 20 dB of the loudest frame. The floor-only
+// criterion never trimmed on hardware: trailing room noise sat more than
+// 10 dB above the quietest frame, pinning the endpoint at frame 1199.
+const VAD_PEAK_DROP_LOG10: f32 = 2.0;
 
 /// Pass 2: normalize into int8 mel tiles; pad frames = quantized 0.0.
 /// Needs the global max in R_MAX from either pass 1. Also scans the f32
@@ -800,25 +814,31 @@ fn mel_pass2(plan: &Plan, c: &Ctxt) -> Result<(usize, usize), i32> {
         }
         try_rc!(c.write(S_MEL, mt * 80 * T, R_TILE, 80 * T), "mel8 wr");
     }
-    // Endpoint: last mel frame louder than (quietest frame + 10 dB),
-    // plus margin, floored and capped, rounded up to whole tiles.
+    // Endpoint: last mel frame that is both louder than (quietest frame
+    // + 10 dB) and within 20 dB of the loudest frame, plus margin,
+    // floored and capped, rounded up to whole tiles.
     let mut floor = f32::MAX;
+    let mut peak = f32::MIN;
     for &v in means[..1200].iter() {
         if v < floor {
             floor = v;
         }
+        if v > peak {
+            peak = v;
+        }
     }
+    let thresh = (floor + VAD_THRESH_LOG10).max(peak - VAD_PEAK_DROP_LOG10);
     let mut last = 0usize;
     for (f, &v) in means[..1200].iter().enumerate() {
-        if v > floor + VAD_THRESH_LOG10 {
+        if v > thresh {
             last = f;
         }
     }
     let ctx = (last / 2 + VAD_MARGIN_CTX).clamp(VAD_FLOOR_CTX, CTX);
     let tiles = ctx.div_ceil(T);
     rprintln!(
-        "vad: speech to mel frame {} -> ctx {} ({} tiles of {})",
-        last, ctx, tiles, N_TILES
+        "vad: floor {:.2} peak {:.2} thresh {:.2}, speech to mel frame {} -> ctx {} ({} tiles of {})",
+        floor, peak, thresh, last, ctx, tiles, N_TILES
     );
     Ok((tiles, ctx))
 }
