@@ -47,11 +47,16 @@ use kernels::Quant;
 const INTERLAYER_BUFFER_BYTES: usize = 65536;
 const PSUM_BUFFER_BYTES: usize = 4096;
 
+// Pinned in the fixed AXONBUF region (memory.x) so blob binaries -- which
+// embed these two addresses -- survive firmware relinks. NOLOAD: zeroed
+// explicitly at boot, not by cortex-m-rt.
 #[no_mangle]
+#[link_section = ".axonbuf.interlayer"]
 pub static mut nrf_axon_interlayer_buffer: [u32; INTERLAYER_BUFFER_BYTES / 4] =
     [0; INTERLAYER_BUFFER_BYTES / 4];
 
 #[no_mangle]
+#[link_section = ".axonbuf.psum"]
 pub static mut nrf_axon_psum_buffer: [u32; PSUM_BUFFER_BYTES / 4] = [0; PSUM_BUFFER_BYTES / 4];
 
 /// Activation / parameter arena at a FIXED address (memory.x ARENA region,
@@ -564,6 +569,9 @@ fn main() -> ! {
         const DEMCR: *mut u32 = 0xE000_EDFC as *mut u32;
         let demcr = core::ptr::read_volatile(DEMCR);
         core::ptr::write_volatile(DEMCR, demcr & !0x0000_07F1);
+        // The AXONBUF region is NOLOAD (fixed-address interlayer/psum
+        // buffers): zero it here since cortex-m-rt only zeroes .bss.
+        core::ptr::write_bytes(0x2002_1000 as *mut u8, 0, 68 * 1024);
     }
     let channels = rtt_init! {
         up: {

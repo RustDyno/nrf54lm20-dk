@@ -123,35 +123,60 @@ pub fn attn_head(
     v_scale: f32,
     ctx_q: Quant,
 ) {
+    // Bit-exact restructure of the naive triple loop (measured ~21 cy/MAC:
+    // stride-`qstride` column walks with a bounds check per access). Both
+    // matmul phases run c-outer so the inner loop walks a CONTIGUOUS k/v
+    // row through checked-once slices, and the zero-points come out of the
+    // inner loops via the exact integer identity
+    //   sum_c (q_c - zq)(k_c - zk) = sum_c (q_c - zq) k_c - zk sum_c (q_c - zq)
+    // (and its probs x V analogue). All accumulation stays i32 in the same
+    // algebraic terms, so scores, probs, and ctx match the previous
+    // implementation (and the numpy mirror) bit for bit.
+    let mut acc = [0i32; MAX_KEYS];
     let mut scores = [0.0f32; MAX_KEYS];
-    let mut probs = [0i8; MAX_KEYS];
+    let mut p16 = [0i16; MAX_KEYS];
     for qi in 0..wq {
-        let mut max = f32::MIN;
-        for t in 0..tk {
-            let mut s = 0i32;
-            for c in 0..hd {
-                s += (q[c * qstride + qi] as i32 - zq) * (k[c * kstride + t] as i32 - zk);
+        acc[..tk].fill(0);
+        let mut qsum = 0i32;
+        for c in 0..hd {
+            let qc = q[c * qstride + qi] as i32 - zq;
+            if qc == 0 {
+                continue; // zero rank-1 update: skips a full key row
             }
-            scores[t] = s as f32 * score_mult;
-            if scores[t] > max {
-                max = scores[t];
+            qsum += qc;
+            let krow = &k[c * kstride..c * kstride + tk];
+            for (a, &kv) in acc[..tk].iter_mut().zip(krow) {
+                *a += qc * kv as i32;
+            }
+        }
+        let corr = zk * qsum;
+        let mut max = f32::MIN;
+        for (s, &a) in scores[..tk].iter_mut().zip(&acc[..tk]) {
+            *s = (a - corr) as f32 * score_mult;
+            if *s > max {
+                max = *s;
             }
         }
         let mut sum = 0.0f32;
-        for t in 0..tk {
-            scores[t] = libm::expf(scores[t] - max);
-            sum += scores[t];
+        for s in scores[..tk].iter_mut() {
+            *s = libm::expf(*s - max);
+            sum += *s;
         }
         let inv = 1.0 / sum;
-        for t in 0..tk {
-            probs[t] = PROBS.q8(scores[t] * inv);
+        let mut psum = 0i32;
+        for (p, &s) in p16[..tk].iter_mut().zip(&scores[..tk]) {
+            let pv = PROBS.q8(s * inv) as i32 + 128;
+            *p = pv as i16;
+            psum += pv;
         }
+        let vcorr = zv * psum;
         for c in 0..hd {
-            let mut acc = 0i32;
-            for t in 0..tk {
-                acc += (probs[t] as i32 + 128) * (v[c * kstride + t] as i32 - zv);
+            let vrow = &v[c * kstride..c * kstride + tk];
+            let mut a = 0i32;
+            for (&p, &vv) in p16[..tk].iter().zip(vrow) {
+                a += p as i32 * vv as i32;
             }
-            ctx[c * qstride + qi] = ctx_q.q8(acc as f32 * (PROBS.scale * v_scale));
+            ctx[c * qstride + qi] = ctx_q.q8((a - vcorr) as f32 * (PROBS.scale * v_scale));
         }
     }
 }

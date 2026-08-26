@@ -12,18 +12,31 @@
  * keep all of them in sync. Blobs must be regenerated whenever the firmware
  * ELF changes.
  *
- * cortex-m-rt places the initial SP at the end of RAM, i.e. the stack grows
- * down toward the interlayer buffer in .bss.
+ * cortex-m-rt places the initial SP at the end of RAM (0x20021000); the
+ * stack grows down toward the end of .bss.
+ *
+ * AXONBUF pins the interlayer and psum buffers at FIXED addresses. Runtime
+ * blobs embed exactly these two firmware symbols (verified: a blob TU's
+ * only undefined symbols), so pinning them makes every blob binary -- and
+ * the card image -- independent of the firmware's .bss layout, which
+ * shifted with unrelated code changes three times in one day. The region
+ * is NOLOAD: main() zeroes it at boot.
  */
 MEMORY
 {
   FLASH (rx) : ORIGIN = 0x00000000, LENGTH = 2036K
-  RAM  (rwx) : ORIGIN = 0x20000000, LENGTH = 200K
+  RAM  (rwx) : ORIGIN = 0x20000000, LENGTH = 132K
+  AXONBUF (rw) : ORIGIN = 0x20021000, LENGTH = 68K
   ARENA (rw) : ORIGIN = 0x20032000, LENGTH = 100K
   SLOT (rw)  : ORIGIN = 0x2004B000, LENGTH = 208K
 }
 
 SECTIONS
 {
+  .axonbuf (NOLOAD) :
+  {
+    KEEP(*(.axonbuf.interlayer))
+    KEEP(*(.axonbuf.psum))
+  } > AXONBUF
   .arena (NOLOAD) : { KEEP(*(.arena)) } > ARENA
 }
