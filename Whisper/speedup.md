@@ -1,12 +1,16 @@
 # Whisper speed analysis: where the time goes and how to cut it
 
-Status (speedup branch): 3.1 (SPIM00 at 32 MHz) and 3.5a (mel during
-recording) are IMPLEMENTED, built blind pending SD hardware. 3.2a
-(LM-head norm-bound early exit) was implemented, MEASURED on the mirror,
-and rejected: Whisper LM-head cosines are so small that even the loosest
-row bound sits ~3x above the best logit (best 21.5 vs minimum bound 56.5,
-0 of 12228 rows prunable) -- see NOTES.md. The LM-head lever is therefore
-amortization across positions (3.3), not screening.
+Status: 3.1 (SPIM00 at 32 MHz), 3.4 (VAD endpointing), the attention
+kernel rewrite, and the mel FFT (section 7) are IMPLEMENTED; everything
+up to the attention rewrite is hardware-verified (2026-08-26 run, ~2 min
+speak-to-done from ~6.5). 3.5a (mel during recording) is re-enabled on
+the strength of the FFT and awaits a bench run. 3.2a (LM-head norm-bound
+early exit) was implemented, MEASURED on the mirror, and rejected:
+Whisper LM-head cosines are so small that even the loosest row bound
+sits ~3x above the best logit (best 21.5 vs minimum bound 56.5, 0 of
+12228 rows prunable) -- see NOTES.md. The LM-head lever is therefore
+amortization across positions (3.3), not screening. Remaining queue:
+TODO.md (A1/A2 card, 4-bit decoder weights).
 
 Baseline (commit 5f2ae02): host-driven decode runs at ~2.3 min/token over
 SWD; the standalone SD build is estimated at ~10 min per 12 s utterance.
@@ -206,6 +210,32 @@ tens of seconds. Still not real time, but a different product category
 Quality gates for anything touching quantization or schedule semantics:
 decode_model.py transcript parity, teacher-forcing accuracy, and the
 tape.py per-stage SNR ladder (TAPE_REF=float|int8).
+
+## 7. 2026-08-27: mel DFT -> mixed-radix FFT, streaming mel back on
+
+The ~22 s sequential mel pass was the O(N^2) direct DFT: 201 bins x
+400 samples x 1200 frames. Rewritten as a 400-point DIT FFT
+(400 = 5*5*4*4, real radix-4 leaves, in-place radix-4/5 combines).
+Every twiddle W_400^m comes from the existing 400-entry cos table (sin
+via the +300 index shift), so the SD image and tables are unchanged.
+Mel filter rows are also trimmed to their nonzero spans (bit-exact:
+the skipped products are exact +0.0).
+
+tools/melcheck (host comparator compiling the real mel.rs against a
+frozen copy of the old DFT, tables read from the built sd.img, device
+chunking mirrored): sequential/streaming/whole drives bitwise
+self-consistent; int8 mel (enc.mel quant) differs in at most 16/96000
+cells by +-1 LSB across six signal types -- inside the tol=1 the tape's
+own device-vs-whisper check allows. Host wall clock 13.5x
+(179 -> 13 ms per 1200-frame pass).
+
+Projection on the M33: ~22 s -> ~1.6 s sequential; a 64-frame streaming
+chunk ~85 ms against its 640 ms budget (the old DFT needed more than
+the full period -- that WAS the deterministic 17-overrun failure), so
+TRY_STREAM_MEL is true again and pass 1 hides behind the 12 s capture.
+The overrun -> sequential fallback stays. Expected critical-path win vs
+the verified run: the whole mel gap between recording end and encoder
+start (~22 s), leaving pass 2 (~1 s of SD).
 
 ## Sources
 

@@ -540,14 +540,12 @@ fn utterance(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     rprintln!("=== speak now (12 s) ===");
     display::clear();
     display::print("== speak now (12 s)\n");
-    // Streaming mel has failed deterministically on hardware (17 overruns
-    // every boot), costing an aborted utterance (~25 s) before the
-    // permanent sequential fallback. Disabled via const until the overrun
-    // cause is profiled; the static stays (in .data) so the RAM layout --
-    // and with it the card image -- is unchanged.
-    const TRY_STREAM_MEL: bool = false;
-    // The volatile read keeps the (otherwise dead) static resident: its
-    // removal shifts every later .bss symbol and invalidates the card.
+    // Mel pass 1 overlaps the recording (chunk-sized PDM buffers). The
+    // old direct DFT overran the mic deterministically (17/boot, each
+    // 64-frame chunk cost more than its 640 ms period); the mixed-radix
+    // FFT computes a chunk in a small fraction of that, leaving the
+    // 20 KB SD spill as the only variable per-chunk cost.
+    const TRY_STREAM_MEL: bool = true;
     let stream_ok =
         unsafe { core::ptr::read_volatile(core::ptr::addr_of!(STREAM_MEL_OK)) };
     if TRY_STREAM_MEL && stream_ok {
@@ -603,7 +601,7 @@ fn sd_stats(phase: &str) {
 // Streaming layout: the PDM ping-pong buffers are one mel chunk each
 // (10240 samples = 0.64 s), so while the DMA fills one buffer the CPU has a
 // whole chunk period to window the previous one, run mel_frames, and spill
-// the f32 chunk to S_MELF. Chunk c's DFT window needs samples
+// the f32 chunk to S_MELF. Chunk c's STFT window needs samples
 // [c*10240 - 1280, c*10240 + 10496) (left reflect/alignment halo + right
 // STFT halo), i.e. the tail of buffer c-1, all of buffer c, and the first
 // 256 samples of buffer c+1 -- assembled in a 12032-sample sliding window.

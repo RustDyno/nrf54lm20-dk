@@ -1,0 +1,15 @@
+[package]
+name = "melcheck"
+version = "0.1.0"
+edition = "2021"
+description = "Host comparator for firmware mel.rs: old direct DFT vs the mixed-radix FFT, against the device's actual SD tables"
+
+# Independent of the firmware workspace (different build target).
+[workspace]
+
+[dependencies]
+libm = "0.2"
+serde_json = "1"
+
+[profile.release]
+debug = true

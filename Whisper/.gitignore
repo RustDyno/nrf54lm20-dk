@@ -6,6 +6,7 @@ model/out/
 firmware/target/
 firmware/generated/
 host/target/
+tools/*/target/
 .vscode
 host/out-*.bin
 datasheets/
