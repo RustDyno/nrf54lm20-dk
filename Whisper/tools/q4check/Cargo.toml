@@ -1,0 +1,8 @@
+[package]
+name = "q4check"
+version = "0.1.0"
+edition = "2021"
+description = "Replays model/quant4.py test vectors through the real firmware 4-bit unpacker (q4.rs)"
+
+# Independent of the firmware workspace (different build target).
+[workspace]

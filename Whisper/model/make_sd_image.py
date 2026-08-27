@@ -29,6 +29,7 @@ import numpy as np
 
 import common
 import decode_model
+import quant4
 import tape
 from tape import Submodel
 
@@ -36,6 +37,7 @@ BLOCK = 512
 HEADER_BLOCKS = 16
 CMD_SD_INIT, CMD_SD_READ, CMD_SD_WRITE = 20, 21, 22
 ARENA_BASE = 0x2003_2000
+SLOT_BYTES = 208 * 1024  # must match firmware memory.x SLOT
 PLAN_MAGIC = 0x4E4C_5057  # "WPLN"
 VOCAB_KEEP = 12288
 MAX_TOKENS = 32
@@ -189,6 +191,56 @@ def main():
     entries += sorted(vocab.items())
     entries += sorted(encoder_assets(sd, scales, mq_enc, conv1, conv2).items())
 
+    # 4-bit pack the per-token decoder blobs (quality gate: quant4_check,
+    # transcript identical at G=64). The stored entry becomes "LAY4"
+    # header + verbatim head + amax/nibbles; the firmware expands it in
+    # place in the slot and verifies the expansion against sums4 once
+    # per boot. Weight offsets are found by exact byte-search of each
+    # submodel's filter tensor (verified verbatim + tail-positioned in
+    # every decoder blob).
+    per_token = {}
+    for l in range(common.N_LAYERS):
+        for k, name in common.decoder_submodel_names(l).items():
+            if k not in ("xk", "xv"):
+                per_token[name] = mq_dec[l][k]
+    recsums = {}
+    saved = 0
+    for i, (name, data) in enumerate(entries):
+        sm = per_token.get(name)
+        if sm is None:
+            continue
+        w = None
+        for d in sm.interp.get_tensor_details():
+            if d["dtype"] == np.int8 and int(np.prod(d["shape"])) == 384 * 384:
+                try:
+                    w = sm.interp.get_tensor(d["index"])
+                except ValueError:
+                    pass
+        assert w is not None, name
+        b = w.tobytes()
+        assert data.count(b) == 1, name
+        w_off = data.find(b)
+        assert w_off + len(b) == len(data), f"{name}: weights not at tail"
+        packed = quant4.pack_blob(data, w_off)
+        n = len(data) - w_off
+        # firmware expands from the slot tail: nibble stream must start
+        # at least n/2 bytes past the weight region (see app.rs)
+        tail = SLOT_BYTES - (len(packed) + BLOCK - 1) // BLOCK * BLOCK
+        assert len(data) <= tail + 16 + w_off + n // quant4.G + n // 2, name
+        assert w_off <= tail, name
+        rec = quant4.requant(np.frombuffer(data[w_off:], np.int8))
+        recsums[name] = (sum(data[:w_off])
+                         + int(rec.view(np.uint8).astype(np.uint32).sum())) \
+            & 0xFFFFFFFF
+        saved += len(data) - len(packed)
+        entries[i] = (name, packed)
+    emb_q = np.frombuffer(vocab["embp"], np.int8).reshape(-1, 384)
+    emb4 = quant4.pack_emb(emb_q)
+    entries.append(("embp4", emb4))
+    saved += len(vocab["embp"]) - len(emb4)  # embp kept for rollback
+    print(f"q4: {len(recsums)} decoder blobs + embp4 packed, "
+          f"{saved / 1e6:.1f} MB less SD traffic per token cycle")
+
     # firmware match id: the buffer addresses of the ELF the blobs were
     # linked against; the firmware refuses a stale card at boot.
     elf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
@@ -203,6 +255,11 @@ def main():
     entries.append(("fwid", struct.pack(
         "<II", addrs["nrf_axon_interlayer_buffer"],
         addrs["nrf_axon_psum_buffer"])))
+
+    # raw-content sums for the packed entries (0 = not packed): the
+    # firmware checks the in-place expansion against these once per boot.
+    entries.append(("sums4", b"\0" * (4 * (len(entries) + 3))))
+    sums4_idx = len(entries) - 1
 
     # per-entry integrity sums (u32 wrapping byte-sum, index order): SPI
     # mode runs with CRC off, so the firmware verifies each blob after
@@ -229,6 +286,8 @@ def main():
     plan = write_plan(scales, mq_enc, mq_dec, conv1, conv2, ref,
                       scratch_lba, vocab_n)
     entries[-1] = ("plan", plan)
+    sums4 = [recsums.get(n, 0) for n, _ in entries]
+    entries[sums4_idx] = ("sums4", struct.pack(f"<{len(sums4)}I", *sums4))
     sums = [(sum(d) & 0xFFFFFFFF) if i != sums_idx else 0
             for i, (_, d) in enumerate(entries)]
     entries[sums_idx] = ("sums", struct.pack(f"<{len(sums)}I", *sums))

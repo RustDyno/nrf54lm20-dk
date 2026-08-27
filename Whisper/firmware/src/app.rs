@@ -147,18 +147,31 @@ fn lookup_idx(name: &str) -> Option<(Entry, usize)> {
 /// Per-entry u32 byte-sums (image "sums" asset): SPI mode has CRC off,
 /// so blob loads are verified against these and retried on mismatch.
 static mut SUMS: [u32; 256] = [0; 256];
+/// Raw-content sums for "LAY4" packed entries (image "sums4" asset, 0 =
+/// not packed): the expanded slot is checked against these once per boot,
+/// so packer/unpacker drift is a hard error instead of a garbage model.
+static mut SUMS4: [u32; 256] = [0; 256];
+static mut Q4_VERIFIED: [u32; 8] = [0; 8];
 
 fn load_sums() {
-    if let Some(e) = lookup("sums") {
-        let n = (e.len as usize / 4).min(256);
-        let mut buf = [0u8; 1024];
-        if sd::read_blocks(e.lba, buf.as_mut_ptr(),
-                           e.len.div_ceil(sd::BLOCK as u32)) == 0 {
-            let sums = unsafe { &mut *core::ptr::addr_of_mut!(SUMS) };
-            for i in 0..n {
-                sums[i] = u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+    fn table(name: &str, dst: &mut [u32; 256]) {
+        if let Some(e) = lookup(name) {
+            let n = (e.len as usize / 4).min(256);
+            let mut buf = [0u8; 1024];
+            if e.len as usize <= buf.len()
+                && sd::read_blocks(e.lba, buf.as_mut_ptr(),
+                                   e.len.div_ceil(sd::BLOCK as u32)) == 0
+            {
+                for i in 0..n {
+                    dst[i] = u32::from_le_bytes(
+                        buf[i * 4..i * 4 + 4].try_into().unwrap());
+                }
             }
         }
+    }
+    unsafe {
+        table("sums", &mut *core::ptr::addr_of_mut!(SUMS));
+        table("sums4", &mut *core::ptr::addr_of_mut!(SUMS4));
     }
 }
 
@@ -428,11 +441,86 @@ impl Ctxt {
             if !ok {
                 return -905;
             }
+            // "LAY4" packed entry: expand in place to the raw blob.
+            let magic = unsafe { core::ptr::read(slot::SLOT_BASE as *const u32) };
+            if magic == crate::q4::MAGIC {
+                if let Err(rc) = unpack_slot(e, idx) {
+                    return rc;
+                }
+            }
             self.loaded = e;
         }
         let _wd = crate::WdogGuard::arm();
         unsafe { slot::run(arena_addr(input), arena_addr(output), blob) }
     }
+}
+
+/// Largest weight region a packable blob may carry, in 64-weight groups
+/// (bounds the stack copy of the amax table; slot-sized blobs fit).
+const AMAX_MAX: usize = 3328;
+
+/// Expand a "LAY4" packed blob, just read (and sum-verified) at
+/// SLOT_BASE, into the raw blob it encodes -- in place in the slot.
+///
+/// The packed bytes are first moved to the slot tail; the head is copied
+/// back verbatim and the weights expand forward from w_off. The writer
+/// advances 2 bytes per nibble byte consumed, so it never catches the
+/// reader as long as the nibble stream starts >= n/2 bytes past the
+/// weight region start -- checked below, guaranteed by the image builder
+/// with ~56 KB of margin for the current blobs. The amax table is copied
+/// to the stack first because the writer DOES cross it.
+fn unpack_slot(e: Entry, idx: usize) -> Result<(), i32> {
+    let blocks = e.len.div_ceil(sd::BLOCK as u32) as usize;
+    let tail = slot::SLOT_BYTES - blocks * sd::BLOCK;
+    unsafe {
+        core::ptr::copy(slot::SLOT_BASE as *const u8,
+                        (slot::SLOT_BASE + tail) as *mut u8, e.len as usize);
+        let p = (slot::SLOT_BASE + tail) as *const u8;
+        let word = |i: usize| -> usize {
+            u32::from_le_bytes(core::slice::from_raw_parts(p.add(i * 4), 4)
+                .try_into().unwrap()) as usize
+        };
+        let (raw_len, w_off, n) = (word(1), word(2), word(3));
+        let n_groups = n / crate::q4::G;
+        let nib_off = tail + 16 + w_off + n_groups;
+        if w_off + n != raw_len
+            || raw_len > slot::SLOT_BYTES
+            || n % (2 * crate::q4::G) != 0
+            || n_groups > AMAX_MAX
+            || 16 + w_off + n_groups + n / 2 != e.len as usize
+            || raw_len > nib_off + n / 2
+            || w_off > tail
+        {
+            rtt_target::rprintln!("blob unpack: bad LAY4 header");
+            return Err(-906);
+        }
+        let mut amax = [0u8; AMAX_MAX];
+        amax[..n_groups]
+            .copy_from_slice(core::slice::from_raw_parts(p.add(16 + w_off), n_groups));
+        core::ptr::copy_nonoverlapping(p.add(16), slot::SLOT_BASE as *mut u8, w_off);
+        crate::q4::unpack_raw(&amax[..n_groups],
+                              (slot::SLOT_BASE + nib_off) as *const u8,
+                              (slot::SLOT_BASE + w_off) as *mut i8, n);
+        // once per boot per entry: catch packer/unpacker drift exactly
+        let expect = (*core::ptr::addr_of!(SUMS4))[idx];
+        let seen = (*core::ptr::addr_of!(Q4_VERIFIED))[idx >> 5]
+            & (1 << (idx & 31)) != 0;
+        if expect != 0 && !seen {
+            let raw = core::slice::from_raw_parts(slot::SLOT_BASE as *const u8,
+                                                  raw_len);
+            let mut sum = 0u32;
+            for &b in raw {
+                sum = sum.wrapping_add(b as u32);
+            }
+            if sum != expect {
+                rtt_target::rprintln!(
+                    "blob unpack sum mismatch (got {:#x} want {:#x})", sum, expect);
+                return Err(-907);
+            }
+            (*core::ptr::addr_of_mut!(Q4_VERIFIED))[idx >> 5] |= 1 << (idx & 31);
+        }
+    }
+    Ok(())
 }
 
 fn lut_apply(lut_off: usize, buf_off: usize, len: usize) {
@@ -1161,6 +1249,7 @@ fn sd_read_bytes(e: Entry, byte_off: usize, dst: &mut [u8]) -> i32 {
 fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     let embf = lookup("embf").ok_or(-901)?;
     let embp = lookup("embp").ok_or(-901)?;
+    let embp4 = lookup("embp4"); // 4-bit packed rows (halves the stream)
     let scl = lookup("embpscl").ok_or(-901)?;
     let ids = lookup("embpids").ok_or(-901)?;
     let posd = lookup("posdec").ok_or(-901)?;
@@ -1317,7 +1406,7 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         }
 
         let out_idx = step - (plan.n_sot - 1);
-        let best = lm_head(plan, embp, scl, ids, &hid, out_idx == 0)?;
+        let best = lm_head(plan, embp, embp4, scl, ids, &hid, out_idx == 0)?;
         if best == plan.eot {
             rprintln!("");
             rprintln!("=== done ({} tokens) ===", printed);
@@ -1381,11 +1470,15 @@ fn assemble_head_ctx(c: &Ctxt, base: u32, matrix: usize, head: usize,
 /// (An exact bound-sorted early exit was measured and rejected: Whisper
 /// LM-head cosines are so small that even the loosest row's Cauchy-Schwarz
 /// bound sits ~3x above the best logit -- 0 of 12228 rows prunable.)
-fn lm_head(plan: &Plan, embp: Entry, scl: Entry, ids: Entry, hid: &[f32; C],
-           first: bool) -> Result<u32, i32> {
+fn lm_head(plan: &Plan, embp: Entry, embp4: Option<Entry>, scl: Entry,
+           ids: Entry, hid: &[f32; C], first: bool) -> Result<u32, i32> {
     let mut best = f32::MIN;
     let mut best_row = 0usize;
     const ROWS: usize = 64; // 64 x 384 = 24576 B per chunk
+    // 4-bit packed chunk: [amax 64*6][nibbles 64*192], block-padded.
+    const PK_AMAX: usize = ROWS * C / crate::q4::G;
+    const PK_USED: usize = PK_AMAX + ROWS * C / 2;
+    const PK_BLOCKS: u32 = PK_USED.div_ceil(sd::BLOCK) as u32;
     // f32 row scales, streamed alongside each chunk (256 B, one block).
     // They cannot be parked anywhere the NPU writes: every decoder blob
     // runs between decode start and this read.
@@ -1394,9 +1487,23 @@ fn lm_head(plan: &Plan, embp: Entry, scl: Entry, ids: Entry, hid: &[f32; C],
     for chunk in 0..plan.vocab_n.div_ceil(ROWS) {
         let r0 = chunk * ROWS;
         let n = ROWS.min(plan.vocab_n - r0);
-        let rc = sd::read_blocks(embp.lba + (r0 * C / sd::BLOCK) as u32,
-                                 arena(D_BIGK, 0).as_mut_ptr(),
-                                 (n * C).div_ceil(sd::BLOCK) as u32);
+        let rc = if let Some(p4) = embp4 {
+            // bounce the packed chunk through the interlayer buffer --
+            // transient use between NPU runs is fine (nothing persists),
+            // then expand all 64 rows into the usual D_BIGK staging
+            let il = interlayer(PK_USED);
+            let rc = sd::read_blocks(p4.lba + chunk as u32 * PK_BLOCKS,
+                                     il.as_mut_ptr(), PK_BLOCKS);
+            if rc == 0 {
+                let (amax, nibs) = il.split_at(PK_AMAX);
+                crate::q4::unpack(amax, nibs, as_i8_mut(D_BIGK, ROWS * C));
+            }
+            rc
+        } else {
+            sd::read_blocks(embp.lba + (r0 * C / sd::BLOCK) as u32,
+                            arena(D_BIGK, 0).as_mut_ptr(),
+                            (n * C).div_ceil(sd::BLOCK) as u32)
+        };
         if rc != 0 {
             return Err(rc);
         }

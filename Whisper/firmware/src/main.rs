@@ -37,6 +37,7 @@ mod mel;
 #[allow(dead_code)]
 mod pdm;
 mod platform;
+mod q4;
 mod sd;
 mod slot;
 

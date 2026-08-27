@@ -237,6 +237,41 @@ The overrun -> sequential fallback stays. Expected critical-path win vs
 the verified run: the whole mel gap between recording end and encoder
 start (~22 s), leaving pass 2 (~1 s of SD).
 
+## 8. 2026-08-27: 4-bit decoder weights + embedding (TODO item 2)
+
+Decode is SD-bound at ~4.8 s/token (all 56 per-token decoder blobs
+re-streamed every step, 4.7 MB LM-head embedding every sampled token).
+Now every per-token decoder blob and the pruned embedding are stored
+4-bit on the card: groups of 64 int8 weights share a u8 amax, nibbles
+reconstruct as w' = sign*min(127,(|nib|*amax*2+7)/14) -- pure-integer
+round-half-away, one spec in model/quant4.py mirrored by firmware
+q4.rs, cross-checked bit for bit by tools/q4check over shared vectors.
+
+Quality gate (model/quant4_check.py, device LM-head math): at G=64 the
+JFK transcript is byte-identical to int8, 24/24 teacher-forced
+agreement, 0 embedding argmax flips; weight rms error ~4 int8 LSB.
+G=32/16 gain nothing (G=16's one-token drift is a knife-edge comma).
+
+Key structural findings that made this cheap:
+- Every decoder blob embeds its tflite filter tensor VERBATIM as the
+  final 147456 bytes, and requantization changes no scales/zero-points/
+  biases, so the Axon converter never re-runs: make_sd_image locates
+  the weights by byte-search and packs "LAY4" entries; blobs on disk
+  are untouched (tape/SWD flows keep using the raw .bin files).
+- The firmware expands packed entries in place in the slot (packed
+  bytes moved to the slot tail, writer can never catch the reader,
+  ~56 KB margin) and bounces packed embedding chunks through the
+  interlayer buffer (transient use between NPU runs is safe).
+- First use of each expanded blob is verified against a raw-content
+  sum ("sums4" asset): packer/unpacker drift is error -907, not a
+  garbage transcript. The old card still works with the new firmware
+  (no LAY4/embp4 entries -> raw paths).
+
+Image: 42.5 MB (was 44.0), 6.2 MB less SD read per token cycle
+(4.0 MB blobs + 2.2 MB embedding). Unpack costs ~0.3 s/step CPU against
+~1.2-1.9 s/step of reads saved; expect ~4.8 -> ~3 s/token. Awaiting a
+bench run (new dd + reflash together).
+
 ## Sources
 
 - nRF54LM20A/B datasheet v1.0 (SPIM00 32 MHz, UARTE00 4 Mbps, USBHS
