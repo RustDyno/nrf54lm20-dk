@@ -147,31 +147,24 @@ fn lookup_idx(name: &str) -> Option<(Entry, usize)> {
 /// Per-entry u32 byte-sums (image "sums" asset): SPI mode has CRC off,
 /// so blob loads are verified against these and retried on mismatch.
 static mut SUMS: [u32; 256] = [0; 256];
-/// Raw-content sums for "LAY4" packed entries (image "sums4" asset, 0 =
-/// not packed): the expanded slot is checked against these once per boot,
-/// so packer/unpacker drift is a hard error instead of a garbage model.
-static mut SUMS4: [u32; 256] = [0; 256];
+/// Packed entries whose expansion has been checked this boot (raw-sum
+/// carried in the LAY4 header; drift is a hard error, checked once).
 static mut Q4_VERIFIED: [u32; 8] = [0; 8];
 
 fn load_sums() {
-    fn table(name: &str, dst: &mut [u32; 256]) {
-        if let Some(e) = lookup(name) {
-            let n = (e.len as usize / 4).min(256);
-            let mut buf = [0u8; 1024];
-            if e.len as usize <= buf.len()
-                && sd::read_blocks(e.lba, buf.as_mut_ptr(),
-                                   e.len.div_ceil(sd::BLOCK as u32)) == 0
-            {
-                for i in 0..n {
-                    dst[i] = u32::from_le_bytes(
-                        buf[i * 4..i * 4 + 4].try_into().unwrap());
-                }
+    if let Some(e) = lookup("sums") {
+        let n = (e.len as usize / 4).min(256);
+        let mut buf = [0u8; 1024];
+        if e.len as usize <= buf.len()
+            && sd::read_blocks(e.lba, buf.as_mut_ptr(),
+                               e.len.div_ceil(sd::BLOCK as u32)) == 0
+        {
+            let sums = unsafe { &mut *core::ptr::addr_of_mut!(SUMS) };
+            for i in 0..n {
+                sums[i] = u32::from_le_bytes(
+                    buf[i * 4..i * 4 + 4].try_into().unwrap());
             }
         }
-    }
-    unsafe {
-        table("sums", &mut *core::ptr::addr_of_mut!(SUMS));
-        table("sums4", &mut *core::ptr::addr_of_mut!(SUMS4));
     }
 }
 
@@ -456,7 +449,7 @@ impl Ctxt {
 }
 
 /// Largest weight region a packable blob may carry, in 64-weight groups
-/// (bounds the stack copy of the amax table; slot-sized blobs fit).
+/// (bounds the amax staging copy; slot-sized blobs fit).
 const AMAX_MAX: usize = 3328;
 
 /// Expand a "LAY4" packed blob, just read (and sum-verified) at
@@ -467,8 +460,9 @@ const AMAX_MAX: usize = 3328;
 /// advances 2 bytes per nibble byte consumed, so it never catches the
 /// reader as long as the nibble stream starts >= n/2 bytes past the
 /// weight region start -- checked below, guaranteed by the image builder
-/// with ~56 KB of margin for the current blobs. The amax table is copied
-/// to the stack first because the writer DOES cross it.
+/// with ~56 KB of margin for the current blobs. The amax table is staged
+/// out first (in the idle interlayer, NOT the stack -- see attn_scratch)
+/// because the writer DOES cross it.
 fn unpack_slot(e: Entry, idx: usize) -> Result<(), i32> {
     let blocks = e.len.div_ceil(sd::BLOCK as u32) as usize;
     let tail = slot::SLOT_BYTES - blocks * sd::BLOCK;
@@ -481,46 +475,58 @@ fn unpack_slot(e: Entry, idx: usize) -> Result<(), i32> {
                 .try_into().unwrap()) as usize
         };
         let (raw_len, w_off, n) = (word(1), word(2), word(3));
+        let raw_sum = word(4) as u32;
         let n_groups = n / crate::q4::G;
-        let nib_off = tail + 16 + w_off + n_groups;
+        let nib_off = tail + crate::q4::HDR + w_off + n_groups;
         if w_off + n != raw_len
             || raw_len > slot::SLOT_BYTES
             || n % (2 * crate::q4::G) != 0
             || n_groups > AMAX_MAX
-            || 16 + w_off + n_groups + n / 2 != e.len as usize
+            || crate::q4::HDR + w_off + n_groups + n / 2 != e.len as usize
             || raw_len > nib_off + n / 2
             || w_off > tail
         {
             rtt_target::rprintln!("blob unpack: bad LAY4 header");
             return Err(-906);
         }
-        let mut amax = [0u8; AMAX_MAX];
-        amax[..n_groups]
-            .copy_from_slice(core::slice::from_raw_parts(p.add(16 + w_off), n_groups));
-        core::ptr::copy_nonoverlapping(p.add(16), slot::SLOT_BASE as *mut u8, w_off);
-        crate::q4::unpack_raw(&amax[..n_groups],
+        let amax = interlayer(n_groups);
+        amax.copy_from_slice(
+            core::slice::from_raw_parts(p.add(crate::q4::HDR + w_off), n_groups));
+        core::ptr::copy_nonoverlapping(p.add(crate::q4::HDR),
+                                       slot::SLOT_BASE as *mut u8, w_off);
+        crate::q4::unpack_raw(amax,
                               (slot::SLOT_BASE + nib_off) as *const u8,
                               (slot::SLOT_BASE + w_off) as *mut i8, n);
         // once per boot per entry: catch packer/unpacker drift exactly
-        let expect = (*core::ptr::addr_of!(SUMS4))[idx];
         let seen = (*core::ptr::addr_of!(Q4_VERIFIED))[idx >> 5]
             & (1 << (idx & 31)) != 0;
-        if expect != 0 && !seen {
+        if !seen {
             let raw = core::slice::from_raw_parts(slot::SLOT_BASE as *const u8,
                                                   raw_len);
             let mut sum = 0u32;
             for &b in raw {
                 sum = sum.wrapping_add(b as u32);
             }
-            if sum != expect {
+            if sum != raw_sum {
                 rtt_target::rprintln!(
-                    "blob unpack sum mismatch (got {:#x} want {:#x})", sum, expect);
+                    "blob unpack sum mismatch (got {:#x} want {:#x})", sum, raw_sum);
                 return Err(-907);
             }
             (*core::ptr::addr_of_mut!(Q4_VERIFIED))[idx >> 5] |= 1 << (idx & 31);
         }
     }
     Ok(())
+}
+
+/// attn_head working buffers (6.4 KB), parked in the interlayer buffer:
+/// CPU attention runs between NPU inferences, when the interlayer is
+/// idle -- the same transient-use rule as the lm_head bounce. As stack
+/// locals this frame reached below _stack_end at decode depth and
+/// overwrote the driver state at the top of .bss (gl_axon_instances;
+/// hardware-observed as a wild register write mid-infer, BFAR garbage).
+fn attn_scratch() -> &'static mut kernels::AttnScratch {
+    let b = interlayer(core::mem::size_of::<kernels::AttnScratch>());
+    unsafe { &mut *(b.as_mut_ptr() as *mut kernels::AttnScratch) }
 }
 
 fn lut_apply(lut_off: usize, buf_off: usize, len: usize) {
@@ -1103,7 +1109,7 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
                     as_i8(A_Q, HB), as_i8(A_K, HD * aw), as_i8(A_V, HD * aw),
                     as_i8_mut(A_TMP, HB), HD, T, T, c.ctx, aw,
                     bq.q_out.zp, bq.k_out.zp, bq.v_out.zp,
-                    sm, bq.v_out.scale, bq.ctx,
+                    sm, bq.v_out.scale, bq.ctx, attn_scratch(),
                 );
                 try_rc!(c.write(S_CH, (h * N_TILES + i) * HB, A_TMP, HB), "ctx wr");
             }
@@ -1318,7 +1324,7 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
                         &mut as_i8_mut(D_CTX, C * W4)[h * HD * W4..(h + 1) * HD * W4],
                         HD, 1, W4, t, MAX_TOKENS,
                         bq.q_out.zp, bq.k_out.zp, bq.v_out.zp,
-                        smq, bq.v_out.scale, bq.ctx,
+                        smq, bq.v_out.scale, bq.ctx, attn_scratch(),
                     );
                 }
             }
@@ -1340,7 +1346,7 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
                     &mut as_i8_mut(D_CTX, C * W4)[h * HD * W4..(h + 1) * HD * W4],
                     HD, 1, W4, c.ctx, c.ctx,
                     bq.xq_out.zp, bq.xk_out.zp, bq.xv_out.zp,
-                    smx, bq.xv_out.scale, bq.xctx,
+                    smx, bq.xv_out.scale, bq.xctx, attn_scratch(),
                 );
             }
             try_rc!(c.npu(dec_blob(l, "xout", 0).s(), D_CTX, D_O), "dxout");

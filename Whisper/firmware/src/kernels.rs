@@ -98,6 +98,17 @@ pub fn matmul_i8_bt(a: &[i8], za: i32, b: &[i8], acc: &mut [i32], m: usize, k: u
 
 pub const MAX_KEYS: usize = 640;
 
+/// Working buffers for `attn_head`. 6.4 KB -- deliberately NOT stack
+/// locals: at decode depth that frame reached below _stack_end and
+/// overwrote the end of .bss (the Axon driver's state struct lives
+/// there; hardware-observed as a wild register write mid-infer). The
+/// caller parks this in memory that is idle during CPU attention.
+pub struct AttnScratch {
+    pub acc: [i32; MAX_KEYS],
+    pub scores: [f32; MAX_KEYS],
+    pub p16: [i16; MAX_KEYS],
+}
+
 /// One attention head, fused QK^T -> softmax -> probs x V, channel-planar
 /// buffers. q/ctx are [hd, wq] (column stride qstride), k/v are [hd, tk]
 /// (column stride kstride; tk <= kstride masks padding frames out of the
@@ -122,6 +133,7 @@ pub fn attn_head(
     score_mult: f32,
     v_scale: f32,
     ctx_q: Quant,
+    s: &mut AttnScratch,
 ) {
     // Bit-exact restructure of the naive triple loop (measured ~21 cy/MAC:
     // stride-`qstride` column walks with a bounds check per access). Both
@@ -132,9 +144,9 @@ pub fn attn_head(
     // (and its probs x V analogue). All accumulation stays i32 in the same
     // algebraic terms, so scores, probs, and ctx match the previous
     // implementation (and the numpy mirror) bit for bit.
-    let mut acc = [0i32; MAX_KEYS];
-    let mut scores = [0.0f32; MAX_KEYS];
-    let mut p16 = [0i16; MAX_KEYS];
+    let acc = &mut s.acc;
+    let scores = &mut s.scores;
+    let p16 = &mut s.p16;
     for qi in 0..wq {
         acc[..tk].fill(0);
         let mut qsum = 0i32;

@@ -272,6 +272,16 @@ Image: 42.5 MB (was 44.0), 6.2 MB less SD read per token cycle
 ~1.2-1.9 s/step of reads saved; expect ~4.8 -> ~3 s/token. Awaiting a
 bench run (new dd + reflash together).
 
+First bench attempt hardfaulted at decode token 1 -- not the 4-bit
+data: attn_head's 6.4 KB stack frame at decode depth crossed
+_stack_end into the Axon driver's .bss state (the +1 KB SUMS4 static
+had eaten the last of an always-razor-thin margin). Fix: attention and
+unpack scratch moved to the idle interlayer buffer, raw_sum folded
+into the LAY4 header (SUMS4 dropped, .bss -1 KB), MSPLIM armed at
+_stack_end so overflow is a precise STKOF fault from now on. Same
+session verified streaming mel: sd[mel] 142 ms rd / 321 ms wr, no
+overruns -- the ~22 s mel pass is fully hidden behind capture.
+
 ## Sources
 
 - nRF54LM20A/B datasheet v1.0 (SPIM00 32 MHz, UARTE00 4 Mbps, USBHS

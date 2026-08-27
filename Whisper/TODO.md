@@ -14,23 +14,27 @@ Test: dd the same sd.img to an A1/A2-rated card and rerun. The two `wr`
 numbers in the `sd[encoder]` / `sd[cross]` lines are the only ones to
 watch; expect most of the 22 s back if the card is the limit.
 
-## 2. Bench-verify the two implemented-blind passes
+## 2. Bench-verify 4-bit decode (mel FFT+streaming already verified)
 
-Both are committed, host-verified, and awaiting one hardware session:
+2026-08-27 bench: streaming mel VERIFIED (no overruns, sd[mel] 142 ms
+rd / 321 ms wr, mel fully hidden behind capture). The 4-bit run then
+hardfaulted at the first decode token -- root cause was NOT the 4-bit
+data: attn_head's 6.4 KB stack frame at decode depth dipped below
+_stack_end and corrupted the Axon driver state at the top of .bss
+(gl_axon_instances -> wild register write BFAR=0x7f0005e0). Fixed:
+attention scratch + unpack staging now live in the idle interlayer,
+SUMS4 static replaced by an in-header raw_sum (-1 KB .bss), and
+MSPLIM is armed so any future overflow is an immediate STKOF fault.
 
-- Mel FFT + streaming mel (reflash only, any card): expect no
-  "overruns streaming mel" warning and the record-end -> "encoder..."
-  gap collapsing from ~22 s to ~1 s.
-- 4-bit decoder weights + embedding (needs the NEW sd.img dd'd AND the
-  new firmware together): expect sd[decode] rd to roughly halve
-  (~104 -> ~55-60 MB) and ~4.8 -> ~3 s/token. First boot verifies every
-  expanded blob against sums4 (hard error -907 on drift, so a bad pack
-  cannot silently garble transcripts). After a re-dd the decode-only
-  feature needs one full run first to repopulate the S_XKV scratch.
+Next session: REFLASH + RE-DD TOGETHER (the LAY4 header grew to five
+words -- the previously dd'd card errors -906 against the new
+firmware). Expect sd[decode] rd to roughly halve (~104 -> ~55-60 MB)
+and ~4.8 -> ~3 s/token; first use of each blob verifies the expansion
+(-907 on drift). After the dd, decode-only needs one full run first to
+repopulate the S_XKV scratch.
 
-Rollback levers if something misbehaves: TRY_STREAM_MEL=false (mel),
-old card image or deleting the embp4/LAY4 entries (4-bit; the firmware
-falls back to raw paths automatically with the old card).
+Rollback levers: TRY_STREAM_MEL=false (mel); the pre-q4 card image +
+this firmware (raw fallbacks work) for the 4-bit path.
 
 ## 3. Later: 4-bit encoder weights
 

@@ -379,6 +379,10 @@ unsafe fn dispatch(cmd: u32, a: &[u32; 8]) -> i32 {
                 p.score_mult,
                 p.v_scale,
                 p.ctx_q,
+                // interlayer is idle between host-driven NPU runs, same
+                // as the standalone attention phases
+                &mut *(core::ptr::addr_of_mut!(nrf_axon_interlayer_buffer)
+                    as *mut kernels::AttnScratch),
             );
             0
         }
@@ -570,6 +574,17 @@ fn main() -> ! {
         const DEMCR: *mut u32 = 0xE000_EDFC as *mut u32;
         let demcr = core::ptr::read_volatile(DEMCR);
         core::ptr::write_volatile(DEMCR, demcr & !0x0000_07F1);
+        // Hardware stack-limit guard (ARMv8-M MSPLIM): the stack shares
+        // its 132 K with .bss and the margin is tight -- a deep frame
+        // once dipped past _stack_end and silently corrupted the Axon
+        // driver's state at the top of .bss (wild register write, wild
+        // BFAR). With the limit armed the same bug is an immediate
+        // STKOF fault at the exact instruction instead.
+        extern "C" {
+            static _stack_end: u32;
+        }
+        cortex_m::register::msplim::write(
+            core::ptr::addr_of!(_stack_end) as u32);
         // The AXONBUF region is NOLOAD (fixed-address interlayer/psum
         // buffers): zero it here since cortex-m-rt only zeroes .bss.
         core::ptr::write_bytes(

@@ -7,13 +7,17 @@
 //! integers:  w' = sign(nib) * min(127, (|nib| * amax * 2 + 7) / 14).
 //!
 //! Packed blob entry layout (little-endian u32 header words):
-//!   "LAY4" | raw_len | w_off | n_weights
+//!   "LAY4" | raw_len | w_off | n_weights | raw_sum
 //!   raw[0..w_off] verbatim | amax[n/64] | nibbles[n/2]
-//! The embedding entry (embp4) is chunks of 64 rows x 384 with the same
-//! amax|nibbles layout and no header (block-padded per chunk).
+//! raw_sum is the wrapping u32 byte-sum of the RAW blob the entry
+//! expands to (head + reconstructed weights); the loader checks the
+//! expansion against it once per boot. The embedding entry (embp4) is
+//! chunks of 64 rows x 384 with the same amax|nibbles layout and no
+//! header (block-padded per chunk).
 
 pub const G: usize = 64;
 pub const MAGIC: u32 = 0x3459_414C; // "LAY4"
+pub const HDR: usize = 20; // five u32 header words
 
 /// Reconstruction table for one group: lut[raw nibble 0..16].
 /// Index 0 (nibble -8) is never emitted by the packer; it decodes to the

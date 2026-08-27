@@ -12,9 +12,11 @@ i32 math on the M33 agree bit for bit. |w'| <= amax <= 127; the min(127)
 only guards the never-emitted nibble 0 (-8) slot of the device LUT.
 
 Packed blob entry (little-endian u32 header words):
-    "LAY4" | raw_len | w_off | n_weights
+    "LAY4" | raw_len | w_off | n_weights | raw_sum
     raw[0..w_off] verbatim | amax[n/64] u8 | nibbles[n/2]
-(one weight region per blob, ending at raw_len; n_weights % 128 == 0).
+(one weight region per blob, ending at raw_len; n_weights % 128 == 0;
+raw_sum = wrapping u32 byte-sum of head + reconstructed weights, which
+the firmware verifies after expanding).
 
 Packed embedding (embp4): rows of 384 in chunks of 64 rows; per chunk
     amax[64*6] u8 | nibbles[64*192]
@@ -70,7 +72,9 @@ def pack_blob(raw, w_off):
     n = len(raw) - w_off
     assert n > 0 and n % (2 * G) == 0, (len(raw), w_off)
     amax, nibs = encode(np.frombuffer(raw[w_off:], np.int8))
-    return (struct.pack("<IIII", MAGIC, len(raw), w_off, n)
+    raw_sum = (sum(raw[:w_off]) + int(decode(amax, nibs).view(np.uint8)
+                                      .astype(np.uint32).sum())) & 0xFFFFFFFF
+    return (struct.pack("<IIIII", MAGIC, len(raw), w_off, n, raw_sum)
             + raw[:w_off] + amax.tobytes() + nibs.tobytes())
 
 
