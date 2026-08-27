@@ -1,0 +1,11 @@
+[package]
+name = "attncheck"
+version = "0.1.0"
+edition = "2021"
+description = "Compares the firmware attn_head (struct-scratch form) against a direct transliteration of tape.py attn_golden"
+
+# Independent of the firmware workspace (different build target).
+[workspace]
+
+[dependencies]
+libm = "0.2"

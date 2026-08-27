@@ -664,20 +664,37 @@ fn utterance(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     }
     let (tiles, actx) = mel_pass2(plan, c)?;
     sd_stats("mel");
+    fp(c, S_MEL, "mel8");
     c.tiles = tiles;
     c.ctx = actx;
     display::print("encoding...\n");
     rprintln!("encoder...");
     encoder(plan, c)?;
     sd_stats("encoder");
+    fp(c, S_EO, "enc");
     rprintln!("cross K/V...");
     cross_kv(plan, c)?;
     sd_stats("cross");
+    fp(c, S_XKV, "xkv");
     rprintln!("decoding...");
     display::print("decoding:\n");
     let r = decode(plan, c);
     sd_stats("decode");
     r
+}
+
+/// Debug fingerprint: byte-sum of a scratch region's first block, to
+/// localize where the pipeline stops responding to the audio (two runs
+/// with different audio must differ at every live stage).
+fn fp(c: &Ctxt, region: u32, label: &str) {
+    let rc = c.read(region, 0, 0, 512);
+    if rc == 0 {
+        let mut s = 0u32;
+        for &x in as_i8(0, 512) {
+            s = s.wrapping_add(x as u8 as u32);
+        }
+        rprintln!("fp[{}]: {:#07x}", label, s);
+    }
 }
 
 /// Per-phase SD throughput line (drains the counters). Rates well below
@@ -1412,7 +1429,10 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         }
 
         let out_idx = step - (plan.n_sot - 1);
+        rprintln!("hid[0,1,2,383] {:.4} {:.4} {:.4} {:.4}",
+                  hid[0], hid[1], hid[2], hid[C - 1]);
         let best = lm_head(plan, embp, embp4, scl, ids, &hid, out_idx == 0)?;
+        rprintln!("tok id {}", best);
         if best == plan.eot {
             rprintln!("");
             rprintln!("=== done ({} tokens) ===", printed);
@@ -1479,6 +1499,7 @@ fn assemble_head_ctx(c: &Ctxt, base: u32, matrix: usize, head: usize,
 fn lm_head(plan: &Plan, embp: Entry, embp4: Option<Entry>, scl: Entry,
            ids: Entry, hid: &[f32; C], first: bool) -> Result<u32, i32> {
     let mut best = f32::MIN;
+    let mut best2 = f32::MIN;
     let mut best_row = 0usize;
     const ROWS: usize = 64; // 64 x 384 = 24576 B per chunk
     // 4-bit packed chunk: [amax 64*6][nibbles 64*192], block-padded.
@@ -1537,13 +1558,17 @@ fn lm_head(plan: &Plan, embp: Entry, embp4: Option<Entry>, scl: Entry,
                         continue;
                     }
                 }
+                best2 = best;
                 best = logit;
                 best_row = r0 + r;
+            } else if logit > best2 {
+                best2 = logit;
             }
         }
     }
     let mut b = [0u8; 4];
     try_rc!(sd_read_bytes(ids, best_row * 4, &mut b), "ids");
+    rprintln!("lm: row {} logit {:.3} (2nd {:.3})", best_row, best, best2);
     Ok(u32::from_le_bytes(b))
 }
 
