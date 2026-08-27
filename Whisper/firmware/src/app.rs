@@ -13,7 +13,7 @@
 
 use crate::kernels::{self, Quant};
 use crate::{display, mel, pdm, sd, slot};
-use rtt_target::{rprint, rprintln};
+use rtt_target::rprintln;
 
 const C: usize = 384;
 const HD: usize = 64;
@@ -505,19 +505,22 @@ pub fn run() -> ! {
     load_sums();
     crate::platform::hold_axon();
     rprintln!("standalone: ready ({} kept vocabulary entries)", plan.vocab_n);
-    loop {
-        let mut ctx = Ctxt {
-            scratch: plan.scratch,
-            loaded: Entry::default(),
-            tiles: N_TILES,
-            ctx: CTX,
-        };
-        if utterance(&plan, &mut ctx).is_err() {
-            rprintln!("(utterance aborted; retrying in a moment)");
-            display::print("(retry)\n");
-            cortex_m::asm::delay(128_000_000);
+    // Single shot: one utterance, then idle in mailbox mode -- reset the
+    // board to run again. The endless retry loop made logs unreadable.
+    let mut ctx = Ctxt {
+        scratch: plan.scratch,
+        loaded: Entry::default(),
+        tiles: N_TILES,
+        ctx: CTX,
+    };
+    match utterance(&plan, &mut ctx) {
+        Ok(()) => rprintln!("single shot done; idling (reset to run again)"),
+        Err(rc) => {
+            rprintln!("utterance failed ({}); idling (reset to retry)", rc);
+            display::print("(failed)\n");
         }
     }
+    crate::mailbox_loop();
 }
 
 /// Streaming mode failed once (mel fell behind the mic): stay sequential.
@@ -990,6 +993,7 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     let mut sq = plan.enc_x;
     for l in 0..BLOCKS {
         let bq = plan.enc[l];
+        rprintln!("enc block {}...", l);
         crate::crumb(0x520 + (l as u32) * 0x10);
         ln_region(c, Name::of(&["e", DIGITS[l], "ln1_gb"]).s(), sq, bq.ln1)?;
         crate::crumb(0x521 + (l as u32) * 0x10);
@@ -1178,6 +1182,10 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     let mut token = plan.sot[0];
     let mut next_sot = 1usize;
     let mut printed = 0usize;
+    // Assembled transcript, replayed as one line at the end (tokens also
+    // print live as ">>" lines). MAX_TOKENS pieces of at most 48 bytes.
+    let mut tbuf = [0u8; MAX_TOKENS * 48];
+    let mut tlen = 0usize;
 
     for step in 0..(plan.n_sot - 1 + MAX_TOKENS) {
         // x16 = quantize(embf[kept_pos(token)] + posdec[step])
@@ -1321,17 +1329,17 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         let out_idx = step - (plan.n_sot - 1);
         let best = lm_head(plan, embp, scl, ids, &hid, out_idx == 0)?;
         if best == plan.eot {
-            rprintln!("");
             rprintln!("=== done ({} tokens) ===", printed);
+            print_transcript(&tbuf[..tlen]);
             display::print("\n== done\n");
             return Ok(());
         }
-        print_token(vtb, kept_position(ids, best)?)?;
+        print_token(vtb, kept_position(ids, best)?, &mut tbuf, &mut tlen)?;
         printed += 1;
         token = best;
         if n_tok >= MAX_TOKENS {
-            rprintln!("");
             rprintln!("=== token budget reached ===");
+            print_transcript(&tbuf[..tlen]);
             display::print("\n== token budget\n");
             return Ok(());
         }
@@ -1462,7 +1470,8 @@ fn kept_position(ids: Entry, token: u32) -> Result<usize, i32> {
 }
 
 /// Print a kept token's text piece from the vocabulary table.
-fn print_token(vtb: Entry, kept_pos: usize) -> Result<(), i32> {
+fn print_token(vtb: Entry, kept_pos: usize, tbuf: &mut [u8],
+               tlen: &mut usize) -> Result<(), i32> {
     let mut offs = [0u8; 8];
     try_rc!(sd_read_bytes(vtb, 4 + kept_pos * 4, &mut offs), "vtb off");
     let o0 = u32::from_le_bytes(offs[0..4].try_into().unwrap()) as usize;
@@ -1478,8 +1487,19 @@ fn print_token(vtb: Entry, kept_pos: usize) -> Result<(), i32> {
     let base = 4 + (n_off + 1) * 4;
     try_rc!(sd_read_bytes(vtb, base + o0, &mut sbuf[..len]), "vtb s");
     if let Ok(s) = core::str::from_utf8(&sbuf[..len]) {
-        rprint!("{}", s);
+        rprintln!(">>{}", s);
         display::print(s);
+        let n = len.min(tbuf.len() - *tlen);
+        tbuf[*tlen..*tlen + n].copy_from_slice(&sbuf[..n]);
+        *tlen += n;
     }
     Ok(())
+}
+
+/// The assembled utterance on one line (pieces were utf8-checked as they
+/// were appended, so the concatenation is valid).
+fn print_transcript(tbuf: &[u8]) {
+    if let Ok(s) = core::str::from_utf8(tbuf) {
+        rprintln!("transcript:{}", s);
+    }
 }

@@ -35,8 +35,11 @@ pub unsafe fn run(input: u32, output: u32, name: &str) -> i32 {
         return -102;
     }
     let rc = bindings::nrf_axon_nn_model_validate(model);
-    rtt_target::rprintln!("npu {}: validate rc={} infer...", name, rc.0);
+    if VERBOSE {
+        rtt_target::rprintln!("npu {}: validate rc={} infer...", name, rc.0);
+    }
     if rc.0 != 0 {
+        rtt_target::rprintln!("npu {}: validate FAILED rc={}", name, rc.0);
         return rc.0;
     }
     crate::crumb2(0x201); // entering infer_sync
@@ -52,6 +55,15 @@ pub unsafe fn run(input: u32, output: u32, name: &str) -> i32 {
     };
     let rc = bindings::nrf_axon_nn_model_infer_sync(model, input, output).0;
     crate::crumb2(0x202); // infer_sync returned
-    rtt_target::rprintln!("npu: infer rc={}", rc);
+    if VERBOSE {
+        rtt_target::rprintln!("npu: infer rc={}", rc);
+    } else if rc != 0 {
+        rtt_target::rprintln!("npu {}: infer FAILED rc={}", name, rc);
+    }
     rc
 }
+
+/// Per-inference chatter (two RTT lines per validate/infer pair, hundreds
+/// per utterance) drowned everything else out of the log. Quiet by default
+/// now that bring-up is done; failures always print.
+pub const VERBOSE: bool = false;
