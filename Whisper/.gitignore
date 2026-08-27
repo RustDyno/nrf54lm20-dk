@@ -8,3 +8,4 @@ firmware/generated/
 host/target/
 .vscode
 host/out-*.bin
+datasheets/
