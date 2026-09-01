@@ -10,6 +10,9 @@ pub const REQ_GET_DESCRIPTOR: u8 = 6;
 pub const REQ_SET_ADDRESS: u8 = 5;
 pub const REQ_SET_CONFIGURATION: u8 = 9;
 pub const REQ_CLEAR_FEATURE: u8 = 1;
+/// Bulk-only mass storage reset (BOT 1.0, 3.1; class request to the
+/// interface): realigns a device left mid-command.
+pub const REQ_MSC_RESET: u8 = 0xFF;
 
 pub const DESC_DEVICE: u16 = 1 << 8;
 pub const DESC_CONFIG: u16 = 2 << 8;

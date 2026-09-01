@@ -384,8 +384,17 @@ fn chunk_bytes(mps: usize) -> usize {
 
 /// One BOT command: CBW, data phase (dlen bytes at dma, direction dir_in),
 /// CSW. Returns 0, the SCSI-failed marker -670 (sense data pending), or a
-/// transport error.
+/// transport error -- after which the device's BOT state machine has been
+/// realigned so the NEXT command starts clean.
 fn bot(cb: &[u8], dir_in: bool, dma: u32, dlen: usize, data_to_ms: u32) -> i32 {
+    let rc = bot_inner(cb, dir_in, dma, dlen, data_to_ms);
+    if rc != 0 && rc != -670 {
+        bot_recover();
+    }
+    rc
+}
+
+fn bot_inner(cb: &[u8], dir_in: bool, dma: u32, dlen: usize, data_to_ms: u32) -> i32 {
     let d = unsafe { &mut *core::ptr::addr_of_mut!(DEV) };
     d.tag = d.tag.wrapping_add(1);
     let tag = d.tag;
@@ -435,6 +444,18 @@ fn bot(cb: &[u8], dir_in: bool, dma: u32, dlen: usize, data_to_ms: u32) -> i32 {
         Ok(_) => -671, // phase error: device wants a reset
         Err(e) => e,
     }
+}
+
+/// Bulk-only mass storage reset + endpoint recovery (BOT 1.0, 5.3.4).
+/// A timed-out data phase kills our channel but leaves the DEVICE's BOT
+/// state machine mid-command; without this, every later transfer fails
+/// against a desynced stick (hardware-observed after the first slow
+/// write burst).
+fn bot_recover() {
+    let ifnum = unsafe { (*core::ptr::addr_of!(DEV)).msc.ifnum } as u16;
+    let _ = control_in(proto::setup(0x21, proto::REQ_MSC_RESET, 0, ifnum, 0), 0);
+    clear_halt(true);
+    clear_halt(false);
 }
 
 /// Read the sense data after a -670 so the stick can clear its UNIT
@@ -716,17 +737,27 @@ pub fn init() -> i32 {
     ms_wait(5);
 
     // SCSI bring-up: sticks report a power-on UNIT ATTENTION until a
-    // REQUEST SENSE collects it; retry TEST UNIT READY for up to a second.
+    // REQUEST SENSE collects it, and a stick that was reset mid-command
+    // (previous session interrupted) can take seconds of internal
+    // recovery before the LUN is ready -- hardware-observed after a
+    // reflash landed mid-utterance. Budget accordingly; every wait in
+    // here is DWT-bounded, so no watchdog rides along.
     let start = cortex_m::peripheral::DWT::cycle_count();
+    let mut last_sense = -1;
     loop {
         let rc = bot(&proto::cdb_test_unit_ready(), false, bounce_addr(), 0, 500);
         if rc == 0 {
             break;
         }
         if rc == -670 || rc == -671 {
-            request_sense();
+            let key = request_sense();
+            if key != last_sense {
+                rprintln!("usb: unit not ready (sense key {})", key);
+                last_sense = key;
+            }
         }
-        if cortex_m::peripheral::DWT::cycle_count().wrapping_sub(start) > 1000 * CYC_PER_MS {
+        if cortex_m::peripheral::DWT::cycle_count().wrapping_sub(start) > 5000 * CYC_PER_MS {
+            rprintln!("usb: unit never became ready (last sense key {})", last_sense);
             power_down();
             return -640;
         }
@@ -848,8 +879,15 @@ fn rw_aligned(lba: u32, buf: u32, count: u32, read: bool) -> i32 {
         } else {
             proto::cdb_write10(lba + done, n as u16)
         };
-        // Budget: slowest expected path is a full-speed stick at ~1 MB/s.
-        let to_ms = 300 + (bytes >> 10) as u32 * 2;
+        // Budgets differ by direction: reads stream at bus speed, but
+        // cheap flash controllers stall for SECONDS on a write burst
+        // (mapping-table rebuilds, GC; hardware-observed >340 ms on the
+        // very first write). All waits stay DWT-bounded.
+        let to_ms = if read {
+            500 + (bytes >> 10) as u32 * 2
+        } else {
+            3000 + (bytes >> 10) as u32 * 4
+        };
         let rc = bot(&cdb, read, buf + done * BLOCK as u32, bytes, to_ms);
         if rc == -670 {
             request_sense();

@@ -469,8 +469,10 @@ unsafe fn dispatch(cmd: u32, a: &[u32; 8]) -> i32 {
             0
         }
         CMD_SD_INIT => {
-            let _wd = WdogGuard::arm();
             // Backend-agnostic: probes the USB stick first, then the card.
+            // No watchdog here: every wait in both drivers is DWT-bounded,
+            // and a stick recovering from an interrupted session needs a
+            // multi-second ready budget that would trip the 2 s limit.
             let rc = storage::init();
             if rc != 0 {
                 // leave the SD bus high-Z so external testers can drive it
@@ -478,14 +480,11 @@ unsafe fn dispatch(cmd: u32, a: &[u32; 8]) -> i32 {
             }
             rc
         }
-        CMD_SD_READ => {
-            let _wd = WdogGuard::arm();
-            storage::read_blocks(a[0], a[1] as *mut u8, a[2])
-        }
-        CMD_SD_WRITE => {
-            let _wd = WdogGuard::arm();
-            storage::write_blocks(a[0], a[1] as *const u8, a[2])
-        }
+        // No watchdog on storage transfers either: USB write budgets run
+        // past the 2 s limit by design (slow-stick stalls), and every
+        // wait in both drivers is DWT-bounded.
+        CMD_SD_READ => storage::read_blocks(a[0], a[1] as *mut u8, a[2]),
+        CMD_SD_WRITE => storage::write_blocks(a[0], a[1] as *const u8, a[2]),
         CMD_MEL => {
             let _wd = WdogGuard::arm();
             mel::mel_frames(&*(a[0] as *const mel::MelParams));
