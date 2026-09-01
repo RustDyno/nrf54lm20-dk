@@ -203,6 +203,16 @@ static mut BOUNCE: Bounce = Bounce([0; BLOCK]);
 struct Cbw([u8; 32]);
 static mut CBW: Cbw = Cbw([0; 32]);
 
+/// CSW staging. MUST be distinct from BOUNCE: small SCSI responses
+/// (capacity, sense, inquiry) are DMA'd into BOUNCE and the CSW read
+/// follows in the same command -- sharing the buffer clobbers the first
+/// 13 bytes of the response (hardware-observed: READ CAPACITY parsed the
+/// CSW tag as a 64 MB block size). Full MPS of room because IN transfers
+/// are programmed in whole-packet multiples.
+#[repr(C, align(4))]
+struct Csw([u8; BLOCK]);
+static mut CSWBUF: Csw = Csw([0; BLOCK]);
+
 #[repr(C, align(4))]
 struct SetupBuf([u8; 8]);
 static mut SETUP: SetupBuf = SetupBuf([0; 8]);
@@ -409,15 +419,16 @@ fn bot(cb: &[u8], dir_in: bool, dma: u32, dlen: usize, data_to_ms: u32) -> i32 {
     }
     // CSW on bulk IN. One retry after a STALL (BOT 1.0, 6.7.2).
     let mps_in = d.msc.mps_in as usize;
-    let mut rc = bulk(true, bounce_addr(), mps_in, 500);
+    let csw_addr = core::ptr::addr_of_mut!(CSWBUF) as u32;
+    let mut rc = bulk(true, csw_addr, mps_in, 500);
     if rc == -651 {
         clear_halt(true);
-        rc = bulk(true, bounce_addr(), mps_in, 500);
+        rc = bulk(true, csw_addr, mps_in, 500);
     }
     if rc != 0 {
         return rc;
     }
-    let csw = unsafe { &(&(*core::ptr::addr_of!(BOUNCE)).0)[..proto::CSW_LEN] };
+    let csw = unsafe { &(&(*core::ptr::addr_of!(CSWBUF)).0)[..proto::CSW_LEN] };
     match proto::check_csw(csw, tag) {
         Ok(0) => 0,
         Ok(1) => -670,
