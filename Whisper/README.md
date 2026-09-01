@@ -146,18 +146,22 @@ activations| ORCH
       serial box and P3 pins the SD card vacated) shows status and the
       transcript token by token in standalone mode. Probed at boot;
       absent hardware degrades to RTT-only output.
-- [x] USB HOST MODE (built blind): the model image can live on a USB
-      stick instead of the SD card. The USBHS block is dual-role DWC2
-      silicon despite its device-only datasheet framing (GHWCFG2 reads
-      OTGMODE=2 with 16 host channels); usb.rs forces host mode and
-      speaks bulk-only mass storage, polled, single-channel, buffer
-      DMA. storage.rs probes USB first (fails in ~100 ms when no VBUS
-      is wired), then SD; the same dd image works on either medium and
-      app.rs/mailbox/host tooling are backend-agnostic. Needs 5 V fed
-      into the nRF USB connector (wiring below). Expected payoff: HS
-      bulk reads far above the SD's 3.3 MB/s ceiling on the 104 MB/
-      utterance decode stream. Protocol code is host-verified
-      (tools/usbcheck, 19 descriptor/framing vectors).
+- [x] USB HOST MODE, bring-up VERIFIED ON HARDWARE: the model image can
+      live on a USB stick instead of the SD card. The USBHS block is
+      dual-role DWC2 v5.00b silicon despite its device-only datasheet
+      framing (GHWCFG2 reads OTGMODE=2 with 16 host channels); usb.rs
+      forces host mode and speaks bulk-only mass storage, polled,
+      single-channel, buffer DMA. Bench session with VBUS from a PC on
+      J3: forced host mode takes (CurMod=1), the port FSM detects/
+      resets/enables, and SETUP packets go out on the wire -- see the
+      v5 soft-reset handshake and dead STATUS.CORE findings in NOTES.
+      storage.rs probes USB first (fails in ~100 ms when no VBUS is
+      wired), then SD; the same dd image works on either medium and
+      app.rs/mailbox/host tooling are backend-agnostic. Enumeration +
+      MSC against a real stick still needs the 5 V OTG wiring (below).
+      Expected payoff: HS bulk reads far above the SD's 3.3 MB/s
+      ceiling on the 104 MB/utterance decode stream. Protocol code is
+      host-verified (tools/usbcheck, 19 descriptor/framing vectors).
 
 ## Testing the standalone build (when the SD breakout is wired)
 

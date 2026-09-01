@@ -36,20 +36,21 @@ repopulate the S_XKV scratch.
 Rollback levers: TRY_STREAM_MEL=false (mel); the pre-q4 card image +
 this firmware (raw fallbacks work) for the 4-bit path.
 
-## 3. Bench: USB host mode (built blind; wiring in README)
+## 3. Bench: USB host mode with a real stick (wiring in README)
 
-usb.rs/storage.rs let the model image live on a USB stick behind the
-USBHS port in forced host mode -- the decode stream is SD-read-bound
-(3.3 MB/s ceiling), and HS bulk should clear that by an order of
-magnitude, on top of dodging the SD write crawl in item 1.
+2026-09-01 session (J3 to the dev PC = VBUS, no device): bring-up
+VERIFIED through forced host mode, port FSM, and SETUP transmission
+(-652 XactErr against the answerless PC is the correct outcome).
+Fixed on the bench: v5.00b soft-reset handshake, dead STATUS.CORE
+readiness bit, VREGUSB edge-event re-init. Details in NOTES.md.
 
-Bench order: (1) DMM the 5V0:CONN tap and the J3 VBUS injection point
-before connecting anything; (2) flash the new firmware WITHOUT any USB
-wiring -- expect `usb rc=-600` then normal SD behavior (regression
-check); (3) wire 5 V + stick, expect the `usb: ... stick` boot line and
-`model source: USB stick`; (4) run the sdtest tape against the stick,
-then a full utterance and compare the sd[phase] lines. Fallback at any
-point: unplug the stick, the card path is untouched.
+Remaining: enumeration + MSC + throughput against a real stick.
+(1) DMM the 5V0:CONN tap and the J3 VBUS injection point before
+connecting anything; (2) wire 5 V + stick, expect `usb: port enabled,
+speed 0`, the `usb: ... stick` line and `model source: USB stick`;
+(3) run the sdtest tape against the stick, then a full utterance and
+compare the sd[phase] lines against the 3.3 MB/s SD baseline.
+Fallback at any point: unplug the stick, the card path is untouched.
 
 ## 4. Later: 4-bit encoder weights
 

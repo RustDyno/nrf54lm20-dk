@@ -45,7 +45,9 @@ const WRAP_BASE: usize = 0x5005_A000; // USBHS wrapper
 const WRAP_TASKS_START: usize = 0x000;
 const WRAP_TASKS_STOP: usize = 0x004;
 const WRAP_ENABLE: usize = 0x400; // bit0 CORE, bit1 PHY
-const WRAP_STATUS: usize = 0x408; // bit0: core register access ready
+// The wrapper's STATUS register (0x408) is deliberately unused: its CORE
+// ready bit never asserts on this part (hardware-observed) even with the
+// core alive; GSNPSID readback is the working readiness check.
 
 const CORE_BASE: usize = 0x5002_0000; // USBHSCORE (DWC2)
 const GOTGCTL: usize = 0x000;
@@ -55,6 +57,7 @@ const GRSTCTL: usize = 0x010;
 const GINTSTS: usize = 0x014;
 const GRXFSIZ: usize = 0x024;
 const GNPTXFSIZ: usize = 0x028;
+const GSNPSID: usize = 0x040;
 const GHWCFG2: usize = 0x048;
 const HPTXFSIZ: usize = 0x100;
 const HCFG: usize = 0x400;
@@ -74,6 +77,12 @@ const OTG_AVALID_OV: u32 = (1 << 4) | (1 << 5);
 const GRSTCTL_CSFTRST: u32 = 1 << 0;
 const GRSTCTL_RXFFLSH: u32 = 1 << 4;
 const GRSTCTL_TXFFLSH: u32 = 1 << 5;
+// HARDWARE-CONFIRMED: this core is DWC2 v5.00b (GSNPSID 0x4F54500B), and
+// since v4.20a soft reset is a handshake -- CSftRst does NOT self-clear.
+// The core sets CSftRstDone (bit 29, absent from the SVD/datasheet) and
+// software must then write both bits back to 0. Polling for self-clear
+// hangs forever with the reset long since finished.
+const GRSTCTL_CSFTRSTDONE: u32 = 1 << 29;
 const GRSTCTL_AHBIDLE: u32 = 1 << 31;
 const GUSBCFG_FRCHSTMODE: u32 = 1 << 29;
 const GAHBCFG_DMAEN: u32 = 1 << 5;
@@ -468,7 +477,16 @@ pub fn init() -> i32 {
     }
 
     // VBUS check first: without 5 V on the VBUS pin the PHY has no
-    // signaling rail and there is nothing to talk to.
+    // signaling rail and there is nothing to talk to. VBUSDETECTED is an
+    // EDGE event: if VREGUSB is already running (a previous init this
+    // power cycle; soft reset does not fully reset peripherals, erratum
+    // [63]) a bare re-START never re-fires it -- hardware-observed as a
+    // silent -600 with VBUS present. Stop first to force a fresh
+    // detection cycle.
+    unsafe {
+        write_volatile(vreg(VREG_TASKS_STOP), 1);
+    }
+    ms_wait(2);
     unsafe {
         write_volatile(vreg(VREG_EVENTS_VBUSDETECTED), 0);
         write_volatile(vreg(VREG_TASKS_START), 1);
@@ -480,9 +498,16 @@ pub fn init() -> i32 {
 
     unsafe {
         write_volatile(wrap(WRAP_ENABLE), 3); // CORE + PHY
+    }
+    ms_wait(1); // PHY clock start (the H20 quirk waits 45 us here)
+    unsafe {
         write_volatile(wrap(WRAP_TASKS_START), 1);
     }
-    if !poll(wrap(WRAP_STATUS), 1, 1, 50) {
+    // HARDWARE-CONFIRMED: the wrapper's STATUS.CORE bit never asserts on
+    // this part even with the core fully alive and register access
+    // working, so it cannot be the readiness gate. GSNPSID answering
+    // with the Synopsys signature ("OT" in the top bytes) is.
+    if !poll(core_reg(GSNPSID), 0xFFFF_0000, 0x4F54_0000, 50) {
         power_down();
         return -602;
     }
@@ -496,9 +521,15 @@ pub fn init() -> i32 {
     unsafe {
         write_volatile(core_reg(GRSTCTL), GRSTCTL_CSFTRST);
     }
-    if !poll(core_reg(GRSTCTL), GRSTCTL_CSFTRST, 0, 50)
-        || !poll(core_reg(GRSTCTL), GRSTCTL_AHBIDLE, GRSTCTL_AHBIDLE, 50)
-    {
+    // v4.20a+ handshake: wait for CSftRstDone, then clear both bits.
+    if !poll(core_reg(GRSTCTL), GRSTCTL_CSFTRSTDONE, GRSTCTL_CSFTRSTDONE, 50) {
+        power_down();
+        return -604;
+    }
+    unsafe {
+        write_volatile(core_reg(GRSTCTL), 0);
+    }
+    if !poll(core_reg(GRSTCTL), GRSTCTL_AHBIDLE, GRSTCTL_AHBIDLE, 50) {
         power_down();
         return -604;
     }
@@ -565,6 +596,7 @@ pub fn init() -> i32 {
         write_volatile(core_reg(HPRT), (hprt & !HPRT_W1C) | HPRT_ENCHNG | HPRT_CONNDET);
     }
     let speed = hprt >> 17 & 3;
+    rprintln!("usb: port enabled, speed {} (0=HS 1=FS)", speed);
     if speed == 2 {
         rprintln!("usb: low-speed device is not a stick");
         power_down();
@@ -588,6 +620,7 @@ pub fn init() -> i32 {
         );
     }
     if rc != 0 {
+        rprintln!("usb: first descriptor read failed rc={}", rc);
         power_down();
         return -620;
     }
