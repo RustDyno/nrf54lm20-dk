@@ -58,7 +58,13 @@ attn matmuls, argmax]
     end
     OLED[SSD1306 OLED
 TWIM22, optional]
+    STOR[(model image, standalone:
+microSD on SPIM00 32 MHz
+or USB stick on USBHS
+DWC2 forced-host, ch0)]
     EXEC -->|transcript| OLED
+    EXEC <-->|512 B blocks
+storage.rs dispatch| STOR
     subgraph axon [Axon NPU]
       DRV[Nordic driver blob]
       ENG[cmd-buffer engine]
@@ -140,6 +146,18 @@ activations| ORCH
       serial box and P3 pins the SD card vacated) shows status and the
       transcript token by token in standalone mode. Probed at boot;
       absent hardware degrades to RTT-only output.
+- [x] USB HOST MODE (built blind): the model image can live on a USB
+      stick instead of the SD card. The USBHS block is dual-role DWC2
+      silicon despite its device-only datasheet framing (GHWCFG2 reads
+      OTGMODE=2 with 16 host channels); usb.rs forces host mode and
+      speaks bulk-only mass storage, polled, single-channel, buffer
+      DMA. storage.rs probes USB first (fails in ~100 ms when no VBUS
+      is wired), then SD; the same dd image works on either medium and
+      app.rs/mailbox/host tooling are backend-agnostic. Needs 5 V fed
+      into the nRF USB connector (wiring below). Expected payoff: HS
+      bulk reads far above the SD's 3.3 MB/s ceiling on the 104 MB/
+      utterance decode stream. Protocol code is host-verified
+      (tools/usbcheck, 19 descriptor/framing vectors).
 
 ## Testing the standalone build (when the SD breakout is wired)
 
@@ -168,6 +186,39 @@ activations| ORCH
    an RTT viewer attached (probe-rs attach), do not send any host
    command -- after 3 s the firmware goes standalone and starts
    listening. Speak during the 12 s window.
+
+## Testing the USB-stick build (USB host mode, built blind)
+
+The firmware probes for a USB stick on the USBHS port before trying the
+SD card; the stick carries the exact same image:
+
+    sudo dd if=model/out/sd.img of=/dev/sdX bs=4M conv=fsync
+
+The chip cannot source VBUS (its VBUS pin is an input that powers the
+USB pads via VREGUSB), so host mode needs 5 V fed into the nRF USB
+connector J3 from the DK's own 5 V rail. VERIFY EVERY TAP WITH A DMM
+BEFORE CONNECTING THE STICK.
+
+1. 5 V source: any `5V0:CONN` pin (the 2x2 power headers P6-P10 and
+   P18). It carries the debugger-USB 5 V whenever the DK is powered
+   through J4 (SB31 is closed by default). Confirm ~5 V against GND.
+2. Data path to the stick, either:
+   a. Breakout cable: a sacrificial USB-C cable plugged into J3; its
+      VBUS wire to the 5V0:CONN tap, GND to GND, D+/D- to a USB-A
+      female breakout that takes the stick. Electrically identical to
+      plugging J3 into a PC, which is a supported DK configuration.
+   b. Solder option: one wire from TP21 (the VBUS:nRF test point next
+      to J3; confirm continuity to J3's VBUS pins first) to the
+      5V0:CONN tap, then a plain USB-C OTG adapter in J3 takes the
+      stick. Powers J3's VBUS permanently; remove before using J3 as a
+      device port against a PC.
+3. Boot with the stick attached. The log prints
+   `usb: high-speed stick <vid>:<pid>, <n> MB` and
+   `standalone: model source: USB stick` on success; any USB failure
+   falls back to the SD card (and then to mailbox mode) with the rc in
+   the log. The mailbox SD commands and all host tape tools run against
+   whichever backend probed first, so the sdtest tape doubles as the
+   USB smoke test.
 
 ### M1 results (JFK clip, 11 s)
 

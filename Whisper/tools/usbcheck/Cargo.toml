@@ -1,0 +1,8 @@
+[package]
+name = "usbcheck"
+version = "0.1.0"
+edition = "2021"
+description = "Replays descriptor and BOT framing vectors through the real firmware USB protocol code (usbproto.rs)"
+
+# Independent of the firmware workspace (different build target).
+[workspace]

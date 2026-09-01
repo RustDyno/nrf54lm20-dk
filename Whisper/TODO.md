@@ -36,7 +36,22 @@ repopulate the S_XKV scratch.
 Rollback levers: TRY_STREAM_MEL=false (mel); the pre-q4 card image +
 this firmware (raw fallbacks work) for the 4-bit path.
 
-## 3. Later: 4-bit encoder weights
+## 3. Bench: USB host mode (built blind; wiring in README)
+
+usb.rs/storage.rs let the model image live on a USB stick behind the
+USBHS port in forced host mode -- the decode stream is SD-read-bound
+(3.3 MB/s ceiling), and HS bulk should clear that by an order of
+magnitude, on top of dodging the SD write crawl in item 1.
+
+Bench order: (1) DMM the 5V0:CONN tap and the J3 VBUS injection point
+before connecting anything; (2) flash the new firmware WITHOUT any USB
+wiring -- expect `usb rc=-600` then normal SD behavior (regression
+check); (3) wire 5 V + stick, expect the `usb: ... stick` boot line and
+`model source: USB stick`; (4) run the sdtest tape against the stick,
+then a full utterance and compare the sd[phase] lines. Fallback at any
+point: unplug the stick, the card path is untouched.
+
+## 4. Later: 4-bit encoder weights
 
 The loader is generic (any "LAY4" entry expands in the slot), so this
 is make_sd_image-side only -- but it needs its own quality gate first

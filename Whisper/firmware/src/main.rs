@@ -40,6 +40,9 @@ mod platform;
 mod q4;
 mod sd;
 mod slot;
+mod storage;
+mod usb;
+mod usbproto;
 
 use kernels::Quant;
 
@@ -467,20 +470,21 @@ unsafe fn dispatch(cmd: u32, a: &[u32; 8]) -> i32 {
         }
         CMD_SD_INIT => {
             let _wd = WdogGuard::arm();
-            let rc = sd::init();
+            // Backend-agnostic: probes the USB stick first, then the card.
+            let rc = storage::init();
             if rc != 0 {
-                // leave the bus high-Z so external testers can drive it
+                // leave the SD bus high-Z so external testers can drive it
                 sd::release_pins();
             }
             rc
         }
         CMD_SD_READ => {
             let _wd = WdogGuard::arm();
-            sd::read_blocks(a[0], a[1] as *mut u8, a[2])
+            storage::read_blocks(a[0], a[1] as *mut u8, a[2])
         }
         CMD_SD_WRITE => {
             let _wd = WdogGuard::arm();
-            sd::write_blocks(a[0], a[1] as *const u8, a[2])
+            storage::write_blocks(a[0], a[1] as *const u8, a[2])
         }
         CMD_MEL => {
             let _wd = WdogGuard::arm();

@@ -1,5 +1,7 @@
 //! Standalone Whisper: record from the PDM mic, transcribe, print over RTT.
-//! No host in the data path -- weights and scratch live on the SD card.
+//! No host in the data path -- weights and scratch live on the storage
+//! device (USB stick via usb.rs host mode, or SD card via sd.rs; the
+//! storage module picks at init and everything here is backend-agnostic).
 //!
 //! The pipeline mirrors the hardware-verified host drivers step for step
 //! (tape-encoder and whisper-host decode); only the paging backend changed
@@ -12,7 +14,7 @@
 //! image builder and `Plan::load` are ONE contract: same field order.
 
 use crate::kernels::{self, Quant};
-use crate::{display, mel, pdm, sd, slot};
+use crate::{display, mel, pdm, sd, slot, storage};
 use rtt_target::{rprint, rprintln};
 
 const C: usize = 384;
@@ -31,7 +33,7 @@ const BLOCKS: usize = 4;
 const TILE8: usize = C * T; // 24576 B
 const TILE16: usize = 2 * TILE8;
 const HB: usize = HD * T; // head block, 4096 B
-const HREG_BLOCKS: u32 = (HEADS * N_TILES * HB / sd::BLOCK) as u32; // 480
+const HREG_BLOCKS: u32 = (HEADS * N_TILES * HB / storage::BLOCK) as u32; // 480
 
 // --- SD scratch regions (block offsets from plan.scratch_lba) ----------------
 const S_PCM: u32 = 0; // 750 blocks
@@ -156,8 +158,8 @@ fn load_sums() {
         let n = (e.len as usize / 4).min(256);
         let mut buf = [0u8; 1024];
         if e.len as usize <= buf.len()
-            && sd::read_blocks(e.lba, buf.as_mut_ptr(),
-                               e.len.div_ceil(sd::BLOCK as u32)) == 0
+            && storage::read_blocks(e.lba, buf.as_mut_ptr(),
+                               e.len.div_ceil(storage::BLOCK as u32)) == 0
         {
             let sums = unsafe { &mut *core::ptr::addr_of_mut!(SUMS) };
             for i in 0..n {
@@ -300,8 +302,8 @@ impl Plan {
         if e.len as usize > buf.len() {
             return Err(-902);
         }
-        let rc = sd::read_blocks(e.lba, buf.as_mut_ptr(),
-                                 e.len.div_ceil(sd::BLOCK as u32));
+        let rc = storage::read_blocks(e.lba, buf.as_mut_ptr(),
+                                 e.len.div_ceil(storage::BLOCK as u32));
         if rc != 0 {
             return Err(rc);
         }
@@ -372,26 +374,26 @@ macro_rules! try_rc {
 
 impl Ctxt {
     fn read(&self, region: u32, byte_off: usize, off: usize, len: usize) -> i32 {
-        sd::read_blocks(
-            self.scratch + region + (byte_off / sd::BLOCK) as u32,
+        storage::read_blocks(
+            self.scratch + region + (byte_off / storage::BLOCK) as u32,
             arena(off, 0).as_mut_ptr(),
-            (len / sd::BLOCK) as u32,
+            (len / storage::BLOCK) as u32,
         )
     }
 
     fn write(&self, region: u32, byte_off: usize, off: usize, len: usize) -> i32 {
-        sd::write_blocks(
-            self.scratch + region + (byte_off / sd::BLOCK) as u32,
+        storage::write_blocks(
+            self.scratch + region + (byte_off / storage::BLOCK) as u32,
             arena(off, 0).as_ptr(),
-            (len / sd::BLOCK) as u32,
+            (len / storage::BLOCK) as u32,
         )
     }
 
     /// Load a whole named asset to an arena offset.
     fn asset(&self, name: &str, off: usize) -> Result<Entry, i32> {
         let e = lookup(name).ok_or(-901)?;
-        let rc = sd::read_blocks(e.lba, arena(off, 0).as_mut_ptr(),
-                                 e.len.div_ceil(sd::BLOCK as u32));
+        let rc = storage::read_blocks(e.lba, arena(off, 0).as_mut_ptr(),
+                                 e.len.div_ceil(storage::BLOCK as u32));
         if rc != 0 {
             return Err(rc);
         }
@@ -411,8 +413,8 @@ impl Ctxt {
             let expect = unsafe { (*core::ptr::addr_of!(SUMS))[idx] };
             let mut ok = false;
             for attempt in 0..3 {
-                let rc = sd::read_blocks(e.lba, slot::SLOT_BASE as *mut u8,
-                                         e.len.div_ceil(sd::BLOCK as u32));
+                let rc = storage::read_blocks(e.lba, slot::SLOT_BASE as *mut u8,
+                                         e.len.div_ceil(storage::BLOCK as u32));
                 if rc != 0 {
                     return rc;
                 }
@@ -464,8 +466,8 @@ const AMAX_MAX: usize = 3328;
 /// out first (in the idle interlayer, NOT the stack -- see attn_scratch)
 /// because the writer DOES cross it.
 fn unpack_slot(e: Entry, idx: usize) -> Result<(), i32> {
-    let blocks = e.len.div_ceil(sd::BLOCK as u32) as usize;
-    let tail = slot::SLOT_BYTES - blocks * sd::BLOCK;
+    let blocks = e.len.div_ceil(storage::BLOCK as u32) as usize;
+    let tail = slot::SLOT_BYTES - blocks * storage::BLOCK;
     unsafe {
         core::ptr::copy(slot::SLOT_BASE as *const u8,
                         (slot::SLOT_BASE + tail) as *mut u8, e.len as usize);
@@ -544,18 +546,19 @@ pub fn run() -> ! {
         rprintln!("standalone: OLED found");
         display::print("Whisper standalone\n");
     }
-    rprintln!("standalone: SD init");
-    let rc = sd::init();
+    rprintln!("standalone: storage init (USB stick, then SD)");
+    let rc = storage::init();
     if rc != 0 {
-        rprintln!("standalone: no SD ({}), staying in mailbox mode", rc);
-        display::print("no SD card\n");
+        rprintln!("standalone: no storage ({}), staying in mailbox mode", rc);
+        display::print("no storage\n");
         sd::diag(2);
         sd::release_pins();
         rprintln!("sd pins released (high-Z): external testers may drive the bus");
         crate::mailbox_loop();
     }
+    rprintln!("standalone: model source: {}", storage::name());
     unsafe {
-        let rc = sd::read_blocks(0, core::ptr::addr_of_mut!(INDEX) as *mut u8, 16);
+        let rc = storage::read_blocks(0, core::ptr::addr_of_mut!(INDEX) as *mut u8, 16);
         let idx = &*core::ptr::addr_of!(INDEX);
         if rc != 0 || &idx[..8] != IMG_MAGIC {
             rprintln!("standalone: no image (rc={}), staying in mailbox mode", rc);
@@ -700,7 +703,7 @@ fn fp(c: &Ctxt, region: u32, label: &str) {
 /// Per-phase SD throughput line (drains the counters). Rates well below
 /// the session's first-utterance numbers implicate the card, not code.
 fn sd_stats(phase: &str) {
-    let (rb, rc, wb, wc) = sd::stats_take();
+    let (rb, rc, wb, wc) = storage::stats_take();
     rprintln!(
         "sd[{}]: rd {} KB / {} ms, wr {} KB / {} ms",
         phase, rb / 1024, rc / 128_000, wb / 1024, wc / 128_000
@@ -738,7 +741,7 @@ const R_TILE: usize = 48648; // pass 2 int8 tile staging (PDM idle by then)
 fn mel_tables(c: &Ctxt) -> Result<(), i32> {
     // filterbank borrows the interlayer buffer; small tables in the arena
     let filt = lookup("melfilt").ok_or(-901)?;
-    try_rc!(sd::read_blocks(filt.lba, interlayer(0).as_mut_ptr(), 126), "filt");
+    try_rc!(storage::read_blocks(filt.lba, interlayer(0).as_mut_ptr(), 126), "filt");
     c.asset("hann", R_HANN)?;
     c.asset("melcos", R_COS)?;
     arena(R_MAX, 4).copy_from_slice(&(-1e30f32).to_le_bytes());
@@ -796,7 +799,7 @@ fn record_mel(c: &Ctxt) -> Result<u32, i32> {
     // window already covers [18*CHUNK - 1280, N_SAMPLES)
     mel_chunk(N_CHUNKS - 1, N_SAMPLES - ((N_CHUNKS - 1) * CHUNK - 1280), 48);
     try_rc!(c.write(S_MELF, (N_CHUNKS - 1) * 20480, R_MELF,
-                    (80 * 48 * 4usize).div_ceil(sd::BLOCK) * sd::BLOCK),
+                    (80 * 48 * 4usize).div_ceil(storage::BLOCK) * storage::BLOCK),
             "mel spill");
     Ok(ov)
 }
@@ -848,7 +851,7 @@ fn mel_pass1(c: &Ctxt) -> Result<(), i32> {
         let n_frames = if ci == 18 { 48 } else { T };
         let s0 = (f0 * 160).saturating_sub(1280);
         let span = ((f0 + n_frames) * 160 + 256).min(N_SAMPLES) - s0;
-        let bytes = (span * 2).div_ceil(sd::BLOCK) * sd::BLOCK;
+        let bytes = (span * 2).div_ceil(storage::BLOCK) * storage::BLOCK;
         try_rc!(c.read(S_PCM, s0 * 2, R_WIN, bytes), "pcm rd");
         let p = mel::MelParams {
             pcm: arena_addr(R_WIN),
@@ -1086,9 +1089,9 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     const CH: usize = 8192;
     for ci in 0..(C * c.tiles * T) / CH {
         try_rc!(c.read(S_LN, ci * CH, A_AUX, CH), "pos a");
-        try_rc!(sd::read_blocks(pos.lba + (ci * CH * 4 / sd::BLOCK) as u32,
+        try_rc!(storage::read_blocks(pos.lba + (ci * CH * 4 / storage::BLOCK) as u32,
                                 arena(A_IN, 0).as_mut_ptr(),
-                                (CH * 4 / sd::BLOCK) as u32), "pos b");
+                                (CH * 4 / storage::BLOCK) as u32), "pos b");
         kernels::add_i8_f32_to_i16(
             as_i8(A_AUX, CH), plan.gelu2, as_f32(A_IN, CH),
             as_i16_mut(A_IN + CH * 4, CH), plan.enc_x,
@@ -1255,13 +1258,13 @@ const D_BIGV: usize = 25088 + HD * CTX;
 fn sd_read_bytes(e: Entry, byte_off: usize, dst: &mut [u8]) -> i32 {
     // unaligned helper via a bounce block (small reads only)
     let mut bounce = [0u8; 1024];
-    let lba = e.lba + (byte_off / sd::BLOCK) as u32;
-    let skew = byte_off % sd::BLOCK;
-    let blocks = (skew + dst.len()).div_ceil(sd::BLOCK);
+    let lba = e.lba + (byte_off / storage::BLOCK) as u32;
+    let skew = byte_off % storage::BLOCK;
+    let blocks = (skew + dst.len()).div_ceil(storage::BLOCK);
     if blocks > 2 {
-        return -930; // larger reads go through sd::read_blocks directly
+        return -930; // larger reads go through storage::read_blocks directly
     }
-    let rc = sd::read_blocks(lba, bounce.as_mut_ptr(), blocks as u32);
+    let rc = storage::read_blocks(lba, bounce.as_mut_ptr(), blocks as u32);
     if rc != 0 {
         return rc;
     }
@@ -1295,12 +1298,12 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         let mut row = [0f32; C];
         let mut buf = [0u8; C * 4];
         // embf rows are 1536 B = 3 blocks, block-aligned by construction
-        try_rc!(sd::read_blocks(embf.lba + (pos_kept * 3) as u32,
+        try_rc!(storage::read_blocks(embf.lba + (pos_kept * 3) as u32,
                                 buf.as_mut_ptr(), 3), "embf");
         for (i, r) in row.iter_mut().enumerate() {
             *r = f32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
         }
-        try_rc!(sd::read_blocks(posd.lba + (step * 3) as u32,
+        try_rc!(storage::read_blocks(posd.lba + (step * 3) as u32,
                                 buf.as_mut_ptr(), 3), "posd");
         let x16 = as_i16_mut(D_X16, C * W4);
         x16.fill(0);
@@ -1407,7 +1410,7 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
 
         // LM head on the CPU: f32 layernorm + pruned-vocab argmax
         let mut gb = [0u8; 3072];
-        try_rc!(sd::read_blocks(fin.lba, gb.as_mut_ptr(), 6), "fin gb");
+        try_rc!(storage::read_blocks(fin.lba, gb.as_mut_ptr(), 6), "fin gb");
         let mut hid = [0f32; C];
         let x16 = as_i16(D_X16, C * W4);
         let mut mean = 0f32;
@@ -1505,7 +1508,7 @@ fn lm_head(plan: &Plan, embp: Entry, embp4: Option<Entry>, scl: Entry,
     // 4-bit packed chunk: [amax 64*6][nibbles 64*192], block-padded.
     const PK_AMAX: usize = ROWS * C / crate::q4::G;
     const PK_USED: usize = PK_AMAX + ROWS * C / 2;
-    const PK_BLOCKS: u32 = PK_USED.div_ceil(sd::BLOCK) as u32;
+    const PK_BLOCKS: u32 = PK_USED.div_ceil(storage::BLOCK) as u32;
     // f32 row scales, streamed alongside each chunk (256 B, one block).
     // They cannot be parked anywhere the NPU writes: every decoder blob
     // runs between decode start and this read.
@@ -1519,7 +1522,7 @@ fn lm_head(plan: &Plan, embp: Entry, embp4: Option<Entry>, scl: Entry,
             // transient use between NPU runs is fine (nothing persists),
             // then expand all 64 rows into the usual D_BIGK staging
             let il = interlayer(PK_USED);
-            let rc = sd::read_blocks(p4.lba + chunk as u32 * PK_BLOCKS,
+            let rc = storage::read_blocks(p4.lba + chunk as u32 * PK_BLOCKS,
                                      il.as_mut_ptr(), PK_BLOCKS);
             if rc == 0 {
                 let (amax, nibs) = il.split_at(PK_AMAX);
@@ -1527,9 +1530,9 @@ fn lm_head(plan: &Plan, embp: Entry, embp4: Option<Entry>, scl: Entry,
             }
             rc
         } else {
-            sd::read_blocks(embp.lba + (r0 * C / sd::BLOCK) as u32,
+            storage::read_blocks(embp.lba + (r0 * C / storage::BLOCK) as u32,
                             arena(D_BIGK, 0).as_mut_ptr(),
-                            (n * C).div_ceil(sd::BLOCK) as u32)
+                            (n * C).div_ceil(storage::BLOCK) as u32)
         };
         if rc != 0 {
             return Err(rc);
