@@ -36,21 +36,11 @@ repopulate the S_XKV scratch.
 Rollback levers: TRY_STREAM_MEL=false (mel); the pre-q4 card image +
 this firmware (raw fallbacks work) for the 4-bit path.
 
-## 3. Bench: USB host mode with a real stick (wiring in README)
-
-2026-09-01 session (J3 to the dev PC = VBUS, no device): bring-up
-VERIFIED through forced host mode, port FSM, and SETUP transmission
-(-652 XactErr against the answerless PC is the correct outcome).
-Fixed on the bench: v5.00b soft-reset handshake, dead STATUS.CORE
-readiness bit, VREGUSB edge-event re-init. Details in NOTES.md.
-
-Remaining: enumeration + MSC + throughput against a real stick.
-(1) DMM the 5V0:CONN tap and the J3 VBUS injection point before
-connecting anything; (2) wire 5 V + stick, expect `usb: port enabled,
-speed 0`, the `usb: ... stick` line and `model source: USB stick`;
-(3) run the sdtest tape against the stick, then a full utterance and
-compare the sd[phase] lines against the 3.3 MB/s SD baseline.
-Fallback at any point: unplug the stick, the card path is untouched.
+## 3. DONE 2026-09-01: USB host mode verified end to end (see
+TODO_complete.md; findings in NOTES.md). Storage is no longer the
+bottleneck -- the M33 CPU share (attention, 4-bit unpack, LM-head
+dots) now dominates encoder and decode wall time, which reorders
+this queue: CPU kernels beat further storage work.
 
 ## 4. Later: 4-bit encoder weights
 
