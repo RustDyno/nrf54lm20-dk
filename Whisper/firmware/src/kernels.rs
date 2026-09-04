@@ -332,6 +332,7 @@ pub fn keys_padded(tk: usize) -> usize {
 }
 
 /// Fill `kt` from any int8 key layout through `get(channel, key)`.
+#[allow(dead_code)] // reference form, exercised by tools/attncheck
 pub fn attn_prepare_kt<F: Fn(usize, usize) -> i8>(get: F, tk: usize, kt: &mut [i16]) {
     let tkp = keys_padded(tk);
     assert!(tk >= 1 && tkp <= MAX_KEYS && kt.len() >= tkp * HD64);
@@ -345,6 +346,7 @@ pub fn attn_prepare_kt<F: Fn(usize, usize) -> i8>(get: F, tk: usize, kt: &mut [i
 }
 
 /// Fill `v16` from any int8 value layout through `get(channel, key)`.
+#[allow(dead_code)] // reference form, exercised by tools/attncheck
 pub fn attn_prepare_v16<F: Fn(usize, usize) -> i8>(get: F, tk: usize, v16: &mut [i16]) {
     let tkp = keys_padded(tk);
     assert!(tk >= 1 && tkp <= MAX_KEYS && v16.len() >= KV16_LEN);

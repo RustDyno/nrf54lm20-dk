@@ -14,7 +14,9 @@
 //! image builder and `Plan::load` are ONE contract: same field order.
 
 use crate::kernels::{self, Quant};
-use crate::{display, mel, pdm, sd, slot, storage};
+#[cfg(feature = "sd-card")]
+use crate::sd;
+use crate::{display, mel, pdm, slot, storage};
 use rtt_target::rprintln;
 
 use crate::dsp;
@@ -682,14 +684,21 @@ pub fn run() -> ! {
         rprintln!("standalone: OLED found");
         display::print("Whisper standalone\n");
     }
-    rprintln!("standalone: storage init (USB stick, then SD)");
+    if cfg!(feature = "mock-usb") {
+        rprintln!("standalone: storage init (host image over USB device mode)");
+    } else {
+        rprintln!("standalone: storage init (USB stick, {} tries)", storage::USB_TRIES);
+    }
     let rc = storage::init();
     if rc != 0 {
         rprintln!("standalone: no storage ({}), staying in mailbox mode", rc);
         display::print("no storage\n");
-        sd::diag(2);
-        sd::release_pins();
-        rprintln!("sd pins released (high-Z): external testers may drive the bus");
+        #[cfg(feature = "sd-card")]
+        {
+            sd::diag(2);
+            sd::release_pins();
+            rprintln!("sd pins released (high-Z): external testers may drive the bus");
+        }
         crate::mailbox_loop();
     }
     rprintln!("standalone: model source: {}", storage::name());
@@ -836,6 +845,7 @@ fn utterance(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         display::print("== injected clip\n");
         mel_tables(c)?;
         mel_pass1(c)?;
+        capture_done(false);
     } else {
     rprintln!("=== speak now (up to 12 s) ===");
     display::clear();
@@ -957,6 +967,20 @@ const SIL_CHUNKS: usize = 3;
 const MIN_CHUNKS: usize = 7;
 /// Chunks the last capture produced (N_CHUNKS = the full 12 s).
 static mut REC_CHUNKS: usize = N_CHUNKS;
+
+/// Latency bookkeeping for the line printed after the transcript: when
+/// the audio was complete (uptime ms), whether it came from the mic, and
+/// how much of the recording followed the last speech frame.
+static mut CAPTURE_END_MS: u32 = 0;
+static mut CAPTURE_LIVE: bool = false;
+static mut SPEECH_TAIL_MS: u32 = 0;
+
+fn capture_done(live: bool) {
+    unsafe {
+        CAPTURE_END_MS = crate::uptime_ms();
+        CAPTURE_LIVE = live;
+    }
+}
 
 // Each pipeline phase keeps its scratch on the stack, and the stack has
 // ~16.5 KB between the top of RAM and .bss. Inlined into one another the
@@ -1087,6 +1111,7 @@ fn record_mel(c: &Ctxt) -> Result<u32, i32> {
     }
     let ov = stream.overruns;
     stream.stop();
+    capture_done(true);
     if n_chunks == N_CHUNKS {
         // final chunk (48 frames) needs no further input from the mic: the
         // window already covers [18*CHUNK - 1280, N_SAMPLES)
@@ -1186,6 +1211,7 @@ fn record(c: &Ctxt) -> Result<(), i32> {
     }
     let ov = stream.overruns;
     stream.stop();
+    capture_done(true);
     if ov > 0 {
         rprintln!("warning: {} recording overruns", ov);
     }
@@ -1354,6 +1380,8 @@ fn mel_pass2(plan: &Plan, c: &Ctxt) -> Result<(usize, usize), i32> {
     // floored and capped, rounded up to whole tiles.
     let (floor, peak, thresh, last) = vad_scan(&means[..n_frames]);
     let last = last.unwrap_or(0);
+    // mel frames are 10 ms apart: recording that followed the speech
+    unsafe { SPEECH_TAIL_MS = ((n_frames - 1 - last) * 10) as u32 };
     let ctx = (last / 2 + VAD_MARGIN_CTX).clamp(VAD_FLOOR_CTX, CTX);
     let tiles = ctx.div_ceil(T);
     rprintln!(
@@ -2026,7 +2054,8 @@ fn append_token(vtb: Entry, kept_pos: usize, buf: &mut [u8; 256],
 }
 
 /// Emit the decoded transcript on its own line, prefixed "Detected: ",
-/// to both the RTT log and the OLED (leading BPE space trimmed).
+/// to both the RTT log and the OLED (leading BPE space trimmed), then the
+/// time from the end of speech to this line.
 fn print_detected(buf: &[u8; 256], len: usize) {
     if let Ok(s) = core::str::from_utf8(&buf[..len]) {
         let s = s.trim_start();
@@ -2035,5 +2064,39 @@ fn print_detected(buf: &[u8; 256], len: usize) {
         display::print("\nDetected: ");
         display::print(s);
         display::print("\n");
+    }
+    let (end, live, tail) = unsafe { (CAPTURE_END_MS, CAPTURE_LIVE, SPEECH_TAIL_MS) };
+    let processing = crate::uptime_ms().wrapping_sub(end);
+    if live {
+        // the mic kept recording for `tail` after the last speech frame
+        rprintln!(
+            "latency: {} ms from end of speech (recording tail {} ms + processing {} ms)",
+            tail + processing, tail, processing
+        );
+    } else {
+        rprintln!("latency: {} ms of processing from end of clip (injected audio)",
+                  processing);
+    }
+    oled_line(format_args!("({} ms)\n", if live { tail + processing } else { processing }));
+}
+
+/// Formatted text to the OLED without an allocator (48-byte line).
+fn oled_line(args: core::fmt::Arguments) {
+    struct Buf {
+        b: [u8; 48],
+        n: usize,
+    }
+    impl core::fmt::Write for Buf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let take = s.len().min(self.b.len() - self.n);
+            self.b[self.n..self.n + take].copy_from_slice(&s.as_bytes()[..take]);
+            self.n += take;
+            Ok(())
+        }
+    }
+    let mut buf = Buf { b: [0; 48], n: 0 };
+    let _ = core::fmt::write(&mut buf, args);
+    if let Ok(s) = core::str::from_utf8(&buf.b[..buf.n]) {
+        display::print(s);
     }
 }

@@ -1,8 +1,9 @@
 //! Block-device dispatch: the model image is the same raw 512-byte-block
 //! image whether it sits on a USB stick (usb.rs, USB host mode) or on the
-//! SD card (sd.rs). Probe order is USB first -- with no 5 V wired to VBUS
-//! it fails in ~100 ms (-600) -- then SD. Everything above this layer
-//! (app.rs, the mailbox SD commands, the host tape tools) is
+//! SD card (sd.rs). The stick is probed up to three times (with no 5 V
+//! wired to VBUS a probe fails in ~100 ms with -600); the SD card is only
+//! tried after that with the `sd-card` feature. Everything above this
+//! layer (app.rs, the mailbox SD commands, the host tape tools) is
 //! backend-agnostic.
 
 #[cfg(feature = "mock-usb")]
@@ -37,9 +38,13 @@ pub fn name() -> &'static str {
     }
 }
 
-/// Probe USB then SD. Returns 0 with a backend selected, or the SD error
-/// (the USB code is logged; SD is the last resort and its code is the one
-/// existing tooling knows). Pins/power of a failed probe are left clean.
+/// Stick probes before giving up: one that is still enumerating after
+/// power-up answers on a later try.
+pub const USB_TRIES: u32 = 3;
+
+/// Probe the USB stick USB_TRIES times, then (with `sd-card`) the SD
+/// card. Returns 0 with a backend selected, else the last probe's error.
+/// Pins/power of a failed probe are left clean.
 pub fn init() -> i32 {
     unsafe { BACKEND = Backend::None };
 
@@ -62,22 +67,32 @@ pub fn init() -> i32 {
 
     #[cfg(not(feature = "mock-usb"))]
     {
-    let urc = usb::init();
-    if urc == 0 {
-        unsafe { BACKEND = Backend::Usb };
-        return 0;
-    }
-    if urc != -600 {
+    let mut urc = -600;
+    for attempt in 1..=USB_TRIES {
+        urc = usb::init();
+        if urc == 0 {
+            unsafe { BACKEND = Backend::Usb };
+            return 0;
+        }
         // -600 is plain "nothing wired"; anything else means a stick was
-        // in reach and failed partway -- worth a loud line.
-        rprintln!("storage: usb host failed rc={}, trying SD", urc);
+        // in reach and failed partway.
+        rprintln!("storage: usb stick probe {}/{} failed rc={}", attempt, USB_TRIES, urc);
+        if attempt < USB_TRIES {
+            cortex_m::asm::delay(64_000_000); // 0.5 s at 128 MHz
+        }
     }
-    let src = sd::init();
-    if src == 0 {
-        unsafe { BACKEND = Backend::Sd };
-        return 0;
+    #[cfg(feature = "sd-card")]
+    {
+        rprintln!("storage: trying the SD card");
+        let src = sd::init();
+        if src == 0 {
+            unsafe { BACKEND = Backend::Sd };
+            return 0;
+        }
+        return src;
     }
-    src
+    #[cfg(not(feature = "sd-card"))]
+    urc
     }
 }
 

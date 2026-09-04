@@ -30,9 +30,13 @@ opt-level = "s"
 lto = true
 
 [features]
+# Probe the SD card (SPIM00 wiring) when no USB stick answers: the
+# storage path from before the stick. Off by default -- the standalone
+# build tries the stick three times and then stays in mailbox mode.
+sd-card = []
 # Diagnostic fallback: SD on SPIM22 at 8 MHz via plain P3 pins (original
 # wiring, no analog switches). Disables the OLED (shared serial box/pins).
-sd-spim22 = []
+sd-spim22 = ["sd-card"]
 # Skip mic/mel/encoder/cross and decode against the scratch already on
 # the card (from the last complete run). Development iteration aid.
 decode-only = []

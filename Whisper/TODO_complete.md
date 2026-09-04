@@ -161,3 +161,12 @@ residual / encoder output / cross K/V scratch bit-identical to the
 previous firmware (mock_diff.py, 0 of 5480 blocks), encoder 100 -> 38 s,
 decode 2.4 -> 1.08 s per step, speak-to-done ~168 -> ~71 s. Image
 rebuilt (embc4 replaces embp4; old cards need a re-dd).
+
+## 2026-09-04: USB-only probe, latency after the transcript
+
+- storage::init tries the USB stick three times and then stops; the SD
+  card probe (and its pin diagnostics) is behind `--features sd-card`.
+- After "Detected: ..." the firmware prints the time from the end of
+  speech to the printed words, split into the recording tail after the
+  last speech frame and the processing time (injected clips: processing
+  from the end of the clip). SysTick now keeps a 10 ms uptime clock.

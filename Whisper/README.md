@@ -165,9 +165,11 @@ activations| ORCH
       the M33 is the bottleneck. Bring-up findings that cost bench
       time (v5 soft-reset handshake, dead STATUS.CORE, VREGUSB edge
       event, BOT desync recovery, slow-stick budgets) are in NOTES.
-      storage.rs probes USB first (fails in ~100 ms when no VBUS is
-      wired), then SD; the same dd image works on either medium and
-      app.rs/mailbox/host tooling are backend-agnostic. Protocol code
+      storage.rs probes the stick three times (each fails in ~100 ms
+      when no VBUS is wired) and then stays in mailbox mode; the SD
+      card is probed after that only with `--features sd-card`. The
+      same dd image works on either medium and app.rs/mailbox/host
+      tooling are backend-agnostic. Protocol code
       is host-verified (tools/usbcheck, 19 descriptor/framing vectors).
 
 - [x] MOCK USB RIG: the model image can be served from a PC over the same
@@ -196,6 +198,10 @@ activations| ORCH
 
 ## Testing the standalone build (when the SD breakout is wired)
 
+The SD card path is behind the `sd-card` feature (the default build is
+USB-stick only), so every `cargo run`/`cargo build` below needs
+`--features sd-card`.
+
 1. Wire a microSD breakout to the expansion board header P17. The card
    sits on SPIM00 (the 32 MHz HS-SPI instance; the SPIM2x instances top
    out at 8 MHz and cannot reach these pins):
@@ -217,11 +223,12 @@ activations| ORCH
 4. Host-driven decode with card-sourced weights (stage B, ~15 s/token):
        cargo run --release -- decode <elf> ../model/out/decoder-plan \
          ../model/out/blobs --sd
-5. Fully standalone: flash with `cargo run --release` in firmware/, keep
-   an RTT viewer attached (probe-rs attach), do not send any host
-   command -- after 3 s the firmware goes standalone and starts
-   listening. Speak during the 12 s window; the capture ends early
-   after about 2 s of silence.
+5. Fully standalone: flash with `cargo run --release --features sd-card`
+   in firmware/, keep an RTT viewer attached (probe-rs attach), do not
+   send any host command -- after 3 s the firmware goes standalone and
+   starts listening. Speak during the 12 s window; the capture ends
+   early after about 2 s of silence. After the transcript the log
+   prints the latency from the end of speech to the printed words.
 
 ## Testing the USB-stick build (USB host mode, built blind)
 
@@ -250,11 +257,10 @@ BEFORE CONNECTING THE STICK.
       device port against a PC.
 3. Boot with the stick attached. The log prints
    `usb: high-speed stick <vid>:<pid>, <n> MB` and
-   `standalone: model source: USB stick` on success; any USB failure
-   falls back to the SD card (and then to mailbox mode) with the rc in
-   the log. The mailbox SD commands and all host tape tools run against
-   whichever backend probed first, so the sdtest tape doubles as the
-   USB smoke test.
+   `standalone: model source: USB stick` on success; three failed
+   probes (rc in the log) leave the firmware in mailbox mode. The
+   mailbox SD commands and all host tape tools run against whichever
+   backend probed, so the sdtest tape doubles as the USB smoke test.
 
 ## Testing without a USB stick: the mock rig
 

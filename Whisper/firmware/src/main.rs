@@ -41,6 +41,7 @@ mod mockblk;
 mod pdm;
 mod platform;
 mod q4;
+#[cfg_attr(not(feature = "sd-card"), allow(dead_code))]
 mod sd;
 mod slot;
 mod storage;
@@ -136,6 +137,14 @@ const WDOG_DISARMED: u32 = u32::MAX;
 const WDOG_LIMIT_TICKS: u32 = 200; // 200 x 10 ms = 2 s per driver call
 static WDOG_TICKS: AtomicU32 = AtomicU32::new(WDOG_DISARMED);
 
+/// SysTick periods since boot (10 ms each): a wall clock for spans the
+/// 33 s DWT cycle counter cannot cover.
+static UPTIME_TICKS: AtomicU32 = AtomicU32::new(0);
+
+pub fn uptime_ms() -> u32 {
+    UPTIME_TICKS.load(Ordering::Relaxed).wrapping_mul(10)
+}
+
 #[exception]
 unsafe fn HardFault(ef: &ExceptionFrame) -> ! {
     // Print the exception frame and fault status over RTT, then spin so
@@ -173,6 +182,7 @@ unsafe fn HardFault(ef: &ExceptionFrame) -> ! {
 
 #[exception]
 fn SysTick() {
+    UPTIME_TICKS.fetch_add(1, Ordering::Relaxed);
     let t = WDOG_TICKS.load(Ordering::Relaxed);
     if t != WDOG_DISARMED {
         if t >= WDOG_LIMIT_TICKS {
@@ -474,11 +484,13 @@ unsafe fn dispatch(cmd: u32, a: &[u32; 8]) -> i32 {
             0
         }
         CMD_SD_INIT => {
-            // Backend-agnostic: probes the USB stick first, then the card.
-            // No watchdog here: every wait in both drivers is DWT-bounded,
-            // and a stick recovering from an interrupted session needs a
-            // multi-second ready budget that would trip the 2 s limit.
+            // Backend-agnostic: probes the USB stick (then the card with
+            // the sd-card feature). No watchdog here: every wait in both
+            // drivers is DWT-bounded, and a stick recovering from an
+            // interrupted session needs a multi-second ready budget that
+            // would trip the 2 s limit.
             let rc = storage::init();
+            #[cfg(feature = "sd-card")]
             if rc != 0 {
                 // leave the SD bus high-Z so external testers can drive it
                 sd::release_pins();
