@@ -27,9 +27,9 @@ into:
 | mlp fc2 (1536 -> 384) | NPU | 4 input-dim partial models, partials summed on CPU |
 | layernorm | CPU | f32, from/to quantized activations |
 | GELU | CPU | exact 256-entry int8 LUT |
-| attention QK^T, probs x V | CPU | int8 x int8 -> int32 (SMLAD), f32 softmax between |
+| attention QK^T, probs x V | CPU | keys/values as int16 in the idle weight slot, 2x2 SMLAD dot blocks, f32 softmax between |
 | residual stream | CPU | int16 (int8 was not enough, see NOTES) |
-| final logits projection | CPU | int8 x int8 -> int32, exact f32 logits, fused argmax |
+| final logits projection | CPU | int16 hidden x 4-bit rows (expanded to int16) on SMLAD, fused argmax |
 
 Every NPU submodel is small enough for a ~192 KB RAM weight slot. Blobs are
 linked offline at the slot's fixed address against the firmware ELF (the Axon
@@ -172,7 +172,8 @@ activations| ORCH
 
 - [x] MOCK USB RIG: the model image can be served from a PC over the same
       USBHS block in DEVICE mode (CDC-ACM), with the recording replaced by
-      a fixed clip. A full deterministic utterance runs in under 3 minutes
+      a fixed clip. A full deterministic utterance runs in ~70 s (it was
+      under 3 minutes before the DSP kernels below)
       and reproduces the reference transcript exactly (23/23 word tokens;
       only the known audio_ctx=600 comma is missing). This localized the
       standing accuracy problem to the MICROPHONE, not the model: the same
@@ -182,6 +183,16 @@ activations| ORCH
       the int8 floor. Proven by a round trip: that same mic recording,
       multiplied by 36 on the host and injected back through the SAME
       firmware, transcribes correctly. See "Testing without a USB stick" below.
+
+- [x] DSP KERNELS (2026-09-04, verified on the rig): the encoder attention,
+      softmax tail, LM head and blob checksum moved onto the Cortex-M33
+      DSP extension (SMLAD, VCVTA, USADA8; firmware/src/dsp.rs with
+      portable fallbacks), keys/values live transposed in the idle weight
+      slot, and cross K/V pages in one read per head. Encoder 100 -> 38 s,
+      decode 2.4 -> 1.08 s per token, transcript and every scratch region
+      bit-identical to the previous firmware (model/mock_diff.py). The
+      recording also stops on its own after ~2 s of silence. Details in
+      speedup.md section 10.
 
 ## Testing the standalone build (when the SD breakout is wired)
 
@@ -209,7 +220,8 @@ activations| ORCH
 5. Fully standalone: flash with `cargo run --release` in firmware/, keep
    an RTT viewer attached (probe-rs attach), do not send any host
    command -- after 3 s the firmware goes standalone and starts
-   listening. Speak during the 12 s window.
+   listening. Speak during the 12 s window; the capture ends early
+   after about 2 s of silence.
 
 ## Testing the USB-stick build (USB host mode, built blind)
 

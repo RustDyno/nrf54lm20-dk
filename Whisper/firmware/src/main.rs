@@ -31,6 +31,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 mod app;
 mod bindings;
 mod display;
+mod dsp;
 mod kernels;
 mod libm_shims;
 mod mel;
@@ -52,7 +53,7 @@ use kernels::Quant;
 
 // Storage backing the C `extern uint32_t nrf_axon_interlayer_buffer[]` and
 // `nrf_axon_psum_buffer[]`. Sizes must match the -D defines in build.rs.
-const INTERLAYER_BUFFER_BYTES: usize = 65536;
+pub const INTERLAYER_BUFFER_BYTES: usize = 65536;
 const PSUM_BUFFER_BYTES: usize = 4096;
 
 // Pinned in the fixed AXONBUF region (memory.x) so blob binaries -- which

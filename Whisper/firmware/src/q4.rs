@@ -18,6 +18,9 @@
 pub const G: usize = 64;
 pub const MAGIC: u32 = 0x3459_414C; // "LAY4"
 pub const HDR: usize = 20; // five u32 header words
+/// Blocks per LM-head embedding chunk ("embc4": 64 f32 scales, 64 u32
+/// ids, 384 amax bytes, 12288 nibble bytes = 13184 B, block-padded).
+pub const EMB_CHUNK_BLOCKS: usize = 26;
 
 /// Reconstruction table for one group: lut[raw nibble 0..16].
 /// Index 0 (nibble -8) is never emitted by the packer; it decodes to the
@@ -59,9 +62,64 @@ pub unsafe fn unpack_raw(amax: &[u8], nibs: *const u8, dst: *mut i8, n: usize) {
     }
 }
 
-/// Safe wrapper for disjoint buffers (the embedding chunk path).
+/// Safe wrapper for disjoint buffers (tools/q4check; the firmware's
+/// embedding path now expands to int16 below).
+#[allow(dead_code)]
 pub fn unpack(amax: &[u8], nibs: &[u8], dst: &mut [i8]) {
     let n = dst.len();
     assert!(nibs.len() >= n / 2);
     unsafe { unpack_raw(amax, nibs.as_ptr(), dst.as_mut_ptr(), n) }
+}
+
+/// `lut` widened to int16, for unpacking straight into the SMLAD
+/// operand layout of the LM head.
+#[inline]
+pub fn lut16(amax: u8) -> [i16; 16] {
+    let t = lut(amax);
+    core::array::from_fn(|k| t[k] as i16)
+}
+
+/// Reconstruction tables for every possible amax, as the u16 bit patterns
+/// of the int16 weights (16 KB). Building one table costs ~300 cycles
+/// (a division per entry); the LM head meets ~73 k groups per token, so
+/// they are built once per decode and indexed by amax.
+pub const TABLES16: usize = 256 * 16;
+
+pub fn tables16(out: &mut [u32; TABLES16]) {
+    for a in 0..256 {
+        let t = lut(a as u8);
+        for k in 0..16 {
+            out[a * 16 + k] = t[k] as i16 as u16 as u32;
+        }
+    }
+}
+
+/// Expand `dst.len()` weights (a multiple of G) into int16.
+///
+/// Hot path of the LM head (4.7 M nibbles per token): each source word
+/// (8 nibbles) becomes four u32 stores of two int16 weights each through
+/// the group's 16-entry table.
+pub fn unpack16(tables: &[u32; TABLES16], amax: &[u8], nibs: &[u8], dst: &mut [i16]) {
+    let n = dst.len();
+    assert!(n % G == 0 && nibs.len() >= n / 2 && amax.len() >= n / G);
+    assert!(dst.as_ptr() as usize % 4 == 0);
+    let mut sp = nibs.as_ptr();
+    let mut dp = dst.as_mut_ptr() as *mut u32;
+    for &a in &amax[..n / G] {
+        let t = &tables[a as usize * 16..a as usize * 16 + 16];
+        // SAFETY: bounds asserted above; G/2 source bytes and G/2 u32
+        // (= G i16) destination words per group. Source words may be
+        // unaligned (read_unaligned).
+        unsafe {
+            for _ in 0..G / 8 {
+                let b = (sp as *const u32).read_unaligned();
+                *dp = t[(b & 15) as usize] | (t[((b >> 4) & 15) as usize] << 16);
+                *dp.add(1) = t[((b >> 8) & 15) as usize] | (t[((b >> 12) & 15) as usize] << 16);
+                *dp.add(2) = t[((b >> 16) & 15) as usize] | (t[((b >> 20) & 15) as usize] << 16);
+                *dp.add(3) = t[((b >> 24) & 15) as usize] | (t[(b >> 28) as usize] << 16);
+                sp = sp.add(4);
+                dp = dp.add(4);
+            }
+        }
+    }
 }

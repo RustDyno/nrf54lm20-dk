@@ -30,6 +30,66 @@ comparison.
 Speed queue (2026-08-27). Baseline: the 2026-08-26 verified run, ~2 min
 speak-to-done, sd[...] stats in NOTES.md.
 
+## 5. DONE 2026-09-04: speed pass 4, CPU kernels on the DSP extension
+
+Profile source: firmware/output9.log on the USB stick, written up in
+speedup.md section 9. A ctx-600 utterance spends 85 s of its 123 s
+encoder in the scalar attention kernel (~8 cycles/MAC) and 1.5 s of
+every 2.9 s decode step in the LM head. Storage is ~20-30 percent.
+
+Accuracy contract for each item (asked and answered before starting):
+bit-exact = same integer/float operations in a different order or
+instruction; gated = a numeric change with a host gate that must show
+zero argmax flips / transcript parity; risk = a real behavioral change.
+
+- [x] 5.1 Attention on SMLAD (bit-exact). K transposed to key-major
+      int16 [key][64], V expanded to int16 [64][640], both in the weight
+      SLOT (idle during CPU attention; the next blob reloads in 18 ms),
+      2 queries x 2 keys register blocking, one 40 KB read per head for
+      Q/K/V and one write for the context tiles. Same i32 sums as
+      today. Target 21 s -> ~5 s per block.
+- [x] 5.2 Softmax tail. VCVTA for round-half-away (bit-exact), the
+      /(1/256) as an exact *256 (bit-exact), expf via exp2 polynomial
+      (gated: attncheck reports every ctx byte that moves; transcript
+      parity on the rig). Switchable per call site.
+- [x] 5.3 LM head. int16 hidden vector (per-utterance scale) x int8
+      rows on SMLAD (gated: lm16_check.py must show 0 argmax flips on
+      the golden decode), row scales and ids stored inside each packed
+      chunk so a chunk is ONE read (layout only), unpack straight to
+      int16 (bit-exact). New image entry "embc4"; embp4 dropped.
+- [x] 5.4 Blob byte-sum with USADA8 (bit-exact; the check stays).
+- [x] 5.5 Decode cross-attention: read a head's 10 tile blocks in one
+      command into the slot, SMLAD kernel (bit-exact). Replaces 480
+      4 KB reads per token with 48.
+- [x] 5.6 Stop recording at silence (risk: a pause longer than the
+      timeout ends the utterance). Online VAD on the streaming mel
+      chunks; stop after 3 silent 0.64 s chunks past the last speech
+      chunk and never before 7 chunks, which keeps every frame the
+      encoder touches (ctx floor, margin, tile round-up, conv halo)
+      real recorded audio -- the encoder input is then identical to
+      the 12 s capture's for the same VAD endpoint.
+- [x] 5.7 Host gates: attncheck (new kernel vs golden, both exp paths),
+      exp ulp sweep, unpack16 vs unpack8, USADA8 sum vs byte loop,
+      lm16_check.py.
+- [x] 5.8 Rig run (mock USB, JFK clip): transcript must match the
+      reference; encoder output compared block-for-block with the
+      previous work image; new cpu[phase] lines for the timings.
+
+Result (mock rig, JFK clip): encoder 100 -> 38 s, decode 2.4 -> 1.08 s
+per step, transcript identical, 0 of 5480 scratch blocks differ from
+the previous firmware (mock_diff.py). Summary in TODO_complete.md,
+design notes in NOTES.md, numbers in speedup.md section 10. The silence
+stop (5.6) is built and reasoned about but not yet exercised with a
+live microphone.
+
+Left in the queue, not part of this pass:
+- Fast USB stick (zero code, needs hardware): reads sit at a flat
+  9-10 MB/s at every transfer size, so the limit is bandwidth.
+- Overlap DMA with compute (medium; only pays once 5.1-5.5 are in).
+- 4-bit decoder blobs (item 1 follow-ups B/D; accuracy regate first).
+- Speculative / batched decode positions (large; exact by construction
+  but the draft's acceptance rate is unmeasured).
+
 ## 1. Application-class SD card (zero code)
 
 Reads run at 3.3 MB/s everywhere, but writes crawl at 103-278 KB/s
@@ -120,3 +180,7 @@ is make_sd_image-side only -- but it needs its own quality gate first
 (full-pipeline simulate.py transcript with patched encoder tflites),
 since quant4_check.py only gated the decoder. Encoder reads ~27 MB per
 utterance; packing would cut ~8 MB of that.
+
+# Model
+
+Swap to Moonshine Tiny, Vosk Small Models, Next-Gen Kaldi / Sherpa-ONNX Zipformer, NVIDIA NeMo FastConformer-CTC Tiny?

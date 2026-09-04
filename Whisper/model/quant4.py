@@ -18,10 +18,11 @@ Packed blob entry (little-endian u32 header words):
 raw_sum = wrapping u32 byte-sum of head + reconstructed weights, which
 the firmware verifies after expanding).
 
-Packed embedding (embp4): rows of 384 in chunks of 64 rows; per chunk
-    amax[64*6] u8 | nibbles[64*192]
-padded to whole 512-byte blocks (25 per chunk) so the firmware's
-chunked reads stay block-aligned. Pad rows are zero.
+Packed embedding ("embc4"): rows of 384 in chunks of 64 rows; per chunk
+the rows' f32 scales (64), their u32 token ids (64), then amax[64*6] and
+nibbles[64*192], padded to whole 512-byte blocks (26 per chunk) so one
+block-aligned read brings everything the LM head needs for the chunk.
+Pad rows are zero with scale 0 (skipped, like the -1 input-only marker).
 """
 
 import struct
@@ -33,8 +34,10 @@ BLOCK = 512
 MAGIC = 0x3459414C  # "LAY4"
 EMB_ROW = 384
 EMB_CHUNK_ROWS = 64
-EMB_CHUNK_BYTES = (EMB_CHUNK_ROWS * (EMB_ROW // G + EMB_ROW // 2)
-                   + BLOCK - 1) // BLOCK * BLOCK  # 12672 -> 12800
+EMB_CHUNK_BLOCKS = 26
+EMB_CHUNK_BYTES = EMB_CHUNK_BLOCKS * BLOCK
+assert (EMB_CHUNK_ROWS * (4 + 4 + EMB_ROW // G + EMB_ROW // 2)
+        <= EMB_CHUNK_BYTES)
 
 
 def encode(w8):
@@ -78,17 +81,24 @@ def pack_blob(raw, w_off):
             + raw[:w_off] + amax.tobytes() + nibs.tobytes())
 
 
-def pack_emb(q):
-    """int8 [n, 384] pruned embedding -> embp4 entry bytes."""
+def pack_emb(q, scl, ids):
+    """int8 [n, 384] pruned embedding + f32 row scales + u32 ids ->
+    "embc4" entry bytes (firmware app.rs lm_head mirrors the layout)."""
     n = q.shape[0]
     rows = -(-n // EMB_CHUNK_ROWS) * EMB_CHUNK_ROWS
     qp = np.zeros((rows, EMB_ROW), np.int8)
     qp[:n] = q
+    sp = np.zeros(rows, "<f4")
+    sp[:n] = scl
+    ip = np.zeros(rows, "<u4")
+    ip[:n] = ids
     out = bytearray()
     for c in range(rows // EMB_CHUNK_ROWS):
-        chunk = qp[c * EMB_CHUNK_ROWS:(c + 1) * EMB_CHUNK_ROWS].reshape(-1)
-        amax, nibs = encode(chunk)
-        part = amax.tobytes() + nibs.tobytes()
+        sl = slice(c * EMB_CHUNK_ROWS, (c + 1) * EMB_CHUNK_ROWS)
+        amax, nibs = encode(qp[sl].reshape(-1))
+        part = (sp[sl].tobytes() + ip[sl].tobytes() + amax.tobytes()
+                + nibs.tobytes())
+        assert len(part) <= EMB_CHUNK_BYTES
         out += part + b"\0" * (EMB_CHUNK_BYTES - len(part))
     return bytes(out)
 

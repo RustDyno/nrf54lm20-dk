@@ -208,8 +208,8 @@ def main():
     # Decoder blobs ship RAW int8 by default. The in-place slot expansion
     # (unpack_slot) feeds the NPU slightly-wrong weights and freezes decode
     # into a constant token (verified 2026-09-01; raw int8 decodes cleanly,
-    # 4-bit does not). embp4 (LM head) uses the disjoint q4::unpack and is
-    # fine, so it stays 4-bit below. Set Q4_PACK=1 to re-enable per-token
+    # 4-bit does not). The LM-head chunks (embc4) expand into a disjoint
+    # buffer and are fine, so they stay 4-bit below. Set Q4_PACK=1 to re-enable per-token
     # packing once the in-place path is fixed (disjoint expansion / barrier).
     pack_q4 = bool(os.environ.get("Q4_PACK"))
     for i, (name, data) in enumerate(entries):
@@ -242,10 +242,12 @@ def main():
         saved += len(data) - len(packed)
         entries[i] = (name, packed)
     emb_q = np.frombuffer(vocab["embp"], np.int8).reshape(-1, 384)
-    emb4 = quant4.pack_emb(emb_q)
-    entries.append(("embp4", emb4))
-    saved += len(vocab["embp"]) - len(emb4)  # embp kept for rollback
-    print(f"q4: {packed_n} decoder blobs + embp4 packed, "
+    embc = quant4.pack_emb(emb_q,
+                           np.frombuffer(vocab["embpscl"], "<f4"),
+                           np.frombuffer(vocab["embpids"], "<u4"))
+    entries.append(("embc4", embc))
+    saved += len(vocab["embp"]) - len(embc)  # embp kept for host tooling
+    print(f"q4: {packed_n} decoder blobs + embc4 packed, "
           f"{saved / 1e6:.1f} MB less SD traffic per token cycle")
 
     # firmware match id: the buffer addresses of the ELF the blobs were

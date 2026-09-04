@@ -1,9 +1,9 @@
 # Whisper speed analysis: where the time goes and how to cut it
 
-2026-09-03 UPDATE: the profile was re-measured on the USB-stick build
-(section 9). Storage is no longer the limit; the CPU attention kernel is
-71 percent of a ctx-600 encoder and the LM head is half of every decode
-step. Sections 1-6 describe the SD-era ranking and are kept for history.
+2026-09-04 UPDATE: section 9's levers 1-6 are IMPLEMENTED and verified
+on the mock rig (section 10): encoder 100 -> 38 s, decode 2.4 -> 1.08 s
+per step, transcript and every scratch region bit-identical. Sections
+1-6 describe the SD-era ranking and are kept for history.
 
 Status: 3.1 (SPIM00 at 32 MHz), 3.4 (VAD endpointing), the attention
 kernel rewrite, and the mel FFT (section 7) are IMPLEMENTED; everything
@@ -398,3 +398,30 @@ Also cheap: the whole crate builds at opt-level "s". Kernels-only
 opt-level 3 is not expressible in stable Rust, but a crate-wide switch
 is a zero-effort experiment now that the blobs bind only to pinned
 data addresses (text-only changes keep the card valid).
+
+## 10. 2026-09-04: levers 1-6 implemented; measured on the rig
+
+Mock rig, JFK clip, ctx 600, same session before/after (NOTES.md has the
+design of each kernel):
+
+| phase | before | after |
+|---|---|---|
+| encoder | 100 s | 38 s (CPU attention 80 -> 20.6 s) |
+| cross K/V | 2.3 s | 2.2 s |
+| decode per step (25 steps) | 2.4 s | 1.08 s |
+| of which storage (rig, ~24 MB/s) | 0.64 s | 0.52 s |
+| of which LM head (dots + unpack) | ~1.5 s | 0.24 s |
+| of which cross-attention paging | ~0.3 s | 0.15 s |
+| speak-to-done | ~168 s | ~71 s |
+
+Accuracy: transcript identical; mock_diff.py finds 0 of 5480 scratch
+blocks (mel, residual, encoder output, cross K/V) differing from the
+previous firmware's run, fast exponential included. Host gates:
+attncheck 0 bytes off the golden, exp within 2 ulp, lm16_check 0/24
+argmax flips (max logit deviation 0.0014 against a 0.89 minimum gap).
+
+Remaining decode step on the rig: storage 0.52, unpack 0.16, attention
+0.15 (mostly the per-head transposition at one query), LM dots 0.08,
+byte-sums 0.05, NPU/LN/misc ~0.12. On the stick the storage term is
+~1.3 s, so the stick is now the decode floor: levers 7 (faster stick)
+and 8 (IO overlap) are next; 10 (batched positions) divides everything.

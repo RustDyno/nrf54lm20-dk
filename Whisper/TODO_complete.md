@@ -136,3 +136,28 @@ VERIFIED, three ways:
   and decodes as repeated punctuation, so "loud" no longer implies
   "speech" and the mic-check trigger threshold is not a VAD.
 
+
+## 2026-09-04: speed pass 4, CPU kernels on the DSP extension
+
+Profiled on the USB stick (output9.log): 85 of 123 encoder seconds in
+the scalar attention kernel, 1.5 of 2.9 s per decode step in the LM
+head. Moved onto the Cortex-M33 DSP extension (firmware/src/dsp.rs,
+inline asm with portable fallbacks):
+
+- attention: keys transposed / values widened to int16 in the idle
+  weight slot, 2x2 SMLAD blocks, one read per head for Q/K/V and one
+  write for the context tiles (bit-exact: attncheck 0 bytes off)
+- softmax tail: VCVTA rounding, exact *256, fast exp (2 ulp, moved
+  nothing on the real utterance)
+- LM head: int16 hidden x int16-expanded 4-bit rows on SMLAD, one read
+  per 64-row chunk with scales and ids inside (new "embc4" entry;
+  lm16_check.py 0/24 flips), reconstruction tables built once per decode
+- blob byte-sum on USADA8; decode cross K/V paged in one read per head
+- recording stops after 3 silent chunks past speech (never before 7),
+  keeping every frame the encoder touches real
+
+Verified on the mock rig (JFK clip): transcript identical, mel /
+residual / encoder output / cross K/V scratch bit-identical to the
+previous firmware (mock_diff.py, 0 of 5480 blocks), encoder 100 -> 38 s,
+decode 2.4 -> 1.08 s per step, speak-to-done ~168 -> ~71 s. Image
+rebuilt (embc4 replaces embp4; old cards need a re-dd).

@@ -17,6 +17,8 @@ use crate::kernels::{self, Quant};
 use crate::{display, mel, pdm, sd, slot, storage};
 use rtt_target::rprintln;
 
+use crate::dsp;
+
 const C: usize = 384;
 const HD: usize = 64;
 const HEADS: usize = 6;
@@ -63,11 +65,6 @@ const A_OUT: usize = 50176; // 24576, to 74752
 const A_AUX: usize = 74752; // 12288, to 87040
 const A_GB: usize = 87040; // 3072, to 90112
 const A_LUT: usize = 90112; // 512, to 90624
-// Attention phase overlay (no A_IN/A_OUT/A_AUX use):
-const A_K: usize = 0; // 40960 planar [64, 640]
-const A_V: usize = 40960; // 40960
-const A_Q: usize = 81920; // 4096
-const A_TMP: usize = 86016; // 4096 block scratch / ctx out
 
 fn arena(off: usize, len: usize) -> &'static mut [u8] {
     unsafe {
@@ -106,11 +103,132 @@ fn as_f32(off: usize, len: usize) -> &'static [f32] {
 /// as scratch (mel filterbank) but nothing may park data there across an
 /// NPU inference -- every blob DMAs activations through it.
 fn interlayer(len: usize) -> &'static mut [u8] {
+    interlayer_at(0, len)
+}
+
+fn interlayer_at(off: usize, len: usize) -> &'static mut [u8] {
+    assert!(off + len <= crate::INTERLAYER_BUFFER_BYTES);
     unsafe {
         core::slice::from_raw_parts_mut(
-            core::ptr::addr_of_mut!(crate::nrf_axon_interlayer_buffer) as *mut u8,
+            (core::ptr::addr_of_mut!(crate::nrf_axon_interlayer_buffer) as *mut u8).add(off),
             len,
         )
+    }
+}
+
+// --- the weight slot as CPU scratch --------------------------------------------
+//
+// During CPU attention no blob is needed (the next NPU stage reloads its
+// own in ~18 ms), so the 208 KB slot holds the key-major int16 keys, the
+// int16 values and a staging area for one head's tile blocks. Anything
+// that uses it sets Ctxt::loaded back to "nothing".
+const SL_KT: usize = 0; // i16 [640][64], 81920 B
+const SL_V16: usize = SL_KT + 2 * kernels::KV16_LEN; // i16 [64][640], 81920 B
+const SL_STAGE: usize = SL_V16 + 2 * kernels::KV16_LEN; // one head's tile blocks
+const _: () = assert!(SL_STAGE + N_TILES * HB <= slot::SLOT_BYTES);
+// Interlayer buffer during CPU attention: the two-query scratch, then
+// the head's context tiles staged for a single write.
+const IL_SCRATCH2: usize = 0;
+const IL_CTX: usize = 16384;
+const _: () = assert!(core::mem::size_of::<kernels::AttnScratch2>() <= IL_CTX);
+const _: () = assert!(IL_CTX + N_TILES * HB <= crate::INTERLAYER_BUFFER_BYTES);
+
+fn slot_u8(off: usize, len: usize) -> &'static mut [u8] {
+    assert!(off + len <= slot::SLOT_BYTES);
+    unsafe { core::slice::from_raw_parts_mut((slot::SLOT_BASE + off) as *mut u8, len) }
+}
+
+fn slot_i8(off: usize, len: usize) -> &'static [i8] {
+    assert!(off + len <= slot::SLOT_BYTES);
+    unsafe { core::slice::from_raw_parts((slot::SLOT_BASE + off) as *const i8, len) }
+}
+
+fn slot_i16(off: usize, len: usize) -> &'static mut [i16] {
+    assert!(off % 2 == 0 && off + 2 * len <= slot::SLOT_BYTES);
+    unsafe { core::slice::from_raw_parts_mut((slot::SLOT_BASE + off) as *mut i16, len) }
+}
+
+fn attn_scratch2() -> &'static mut kernels::AttnScratch2 {
+    let b = interlayer_at(IL_SCRATCH2, core::mem::size_of::<kernels::AttnScratch2>());
+    unsafe { &mut *(b.as_mut_ptr() as *mut kernels::AttnScratch2) }
+}
+
+/// Softmax exponential for the DSP attention kernels: `dsp::exp_neg` is
+/// within ~2 ulp of libm::expf at about a third of the cost; `false`
+/// reproduces the numpy golden bit for bit (tools/attncheck reports what
+/// the fast one moves).
+const FAST_EXP: bool = true;
+
+#[inline(always)]
+fn softmax_exp(x: f32) -> f32 {
+    if FAST_EXP {
+        dsp::exp_neg(x)
+    } else {
+        libm::expf(x)
+    }
+}
+
+/// Transposed keys for one head from its tile blocks staged in the slot
+/// ([tile][64 channels][64 keys] int8): key-major int16 rows in SL_KT.
+/// Tile-wise slice loops rather than the generic kernels::attn_prepare_kt
+/// closure form: at decode this runs per token and per head, where the
+/// index arithmetic was costing more than the attention itself.
+fn prepare_kv_from_stage(tk: usize) {
+    let tkp = kernels::keys_padded(tk);
+    let stage = slot_i8(SL_STAGE, N_TILES * HB);
+    let kt = slot_i16(SL_KT, kernels::KV16_LEN);
+    let kp = kt.as_mut_ptr();
+    for i in 0..tk.div_ceil(T) {
+        let take = T.min(tk - i * T);
+        for ch in 0..HD {
+            let src = &stage[i * HB + ch * T..i * HB + ch * T + take];
+            // SAFETY: destination index (i*T + col)*HD + ch < tk*HD <= KV16_LEN
+            let mut d = unsafe { kp.add(i * T * HD + ch) };
+            for &x in src {
+                unsafe {
+                    *d = x as i16;
+                    d = d.add(HD);
+                }
+            }
+        }
+    }
+    kt[tk * HD..tkp * HD].fill(0);
+}
+
+/// Widened values for one head, same staging: int16 [64][MAX_KEYS] in
+/// SL_V16, columns tk..tkp zero.
+fn prepare_v_from_stage(tk: usize) {
+    let tkp = kernels::keys_padded(tk);
+    let stage = slot_i8(SL_STAGE, N_TILES * HB);
+    let v16 = slot_i16(SL_V16, kernels::KV16_LEN);
+    for ch in 0..HD {
+        let row = &mut v16[ch * kernels::MAX_KEYS..ch * kernels::MAX_KEYS + tkp];
+        for i in 0..tk.div_ceil(T) {
+            let take = T.min(tk - i * T);
+            let src = &stage[i * HB + ch * T..i * HB + ch * T + take];
+            let dst = &mut row[i * T..i * T + take];
+            for (d, &x) in dst.iter_mut().zip(src) {
+                *d = x as i16;
+            }
+        }
+        row[tk..].fill(0);
+    }
+}
+
+// --- CPU phase profile ---------------------------------------------------------
+const P_ATTN: usize = 0;
+const P_LM: usize = 1;
+const P_UNPACK: usize = 2;
+const P_SUM: usize = 3;
+static mut PROF: [u64; 4] = [0; 4];
+
+fn cycles() -> u32 {
+    cortex_m::peripheral::DWT::cycle_count()
+}
+
+fn prof_add(i: usize, t0: u32) {
+    unsafe {
+        (*core::ptr::addr_of_mut!(PROF))[i] += cycles().wrapping_sub(t0) as u64;
     }
 }
 
@@ -394,6 +512,23 @@ impl Ctxt {
         )
     }
 
+    /// Whole blocks of a scratch region into any buffer.
+    fn read_raw(&self, region: u32, byte_off: usize, dst: &mut [u8]) -> i32 {
+        storage::read_blocks(
+            self.scratch + region + (byte_off / storage::BLOCK) as u32,
+            dst.as_mut_ptr(),
+            (dst.len() / storage::BLOCK) as u32,
+        )
+    }
+
+    fn write_raw(&self, region: u32, byte_off: usize, src: &[u8]) -> i32 {
+        storage::write_blocks(
+            self.scratch + region + (byte_off / storage::BLOCK) as u32,
+            src.as_ptr(),
+            (src.len() / storage::BLOCK) as u32,
+        )
+    }
+
     /// Load a whole named asset to an arena offset.
     fn asset(&self, name: &str, off: usize) -> Result<Entry, i32> {
         let e = lookup(name).ok_or(-901)?;
@@ -423,14 +558,13 @@ impl Ctxt {
                 if rc != 0 {
                     return rc;
                 }
-                let mut sum = 0u32;
                 let bytes = unsafe {
                     core::slice::from_raw_parts(slot::SLOT_BASE as *const u8,
                                                 e.len as usize)
                 };
-                for &b in bytes {
-                    sum = sum.wrapping_add(b as u32);
-                }
+                let t0 = cycles();
+                let sum = dsp::byte_sum(bytes);
+                prof_add(P_SUM, t0);
                 if expect == 0 || sum == expect {
                     ok = true;
                     break;
@@ -510,10 +644,7 @@ fn unpack_slot(e: Entry, idx: usize) -> Result<(), i32> {
         if !seen {
             let raw = core::slice::from_raw_parts(slot::SLOT_BASE as *const u8,
                                                   raw_len);
-            let mut sum = 0u32;
-            for &b in raw {
-                sum = sum.wrapping_add(b as u32);
-            }
+            let sum = dsp::byte_sum(raw);
             if sum != raw_sum {
                 rtt_target::rprintln!(
                     "blob unpack sum mismatch (got {:#x} want {:#x})", sum, raw_sum);
@@ -706,9 +837,9 @@ fn utterance(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         mel_tables(c)?;
         mel_pass1(c)?;
     } else {
-    rprintln!("=== speak now (12 s) ===");
+    rprintln!("=== speak now (up to 12 s) ===");
     display::clear();
-    display::print("== speak now (12 s)\n");
+    display::print("== speak now (12 s max)\n");
     // Mel pass 1 overlaps the recording (chunk-sized PDM buffers). The
     // old direct DFT overran the mic deterministically (17/boot, each
     // 64-frame chunk cost more than its 640 ms period); the mixed-radix
@@ -765,11 +896,7 @@ fn utterance(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
 fn fp(c: &Ctxt, region: u32, label: &str) {
     let rc = c.read(region, 0, 0, 512);
     if rc == 0 {
-        let mut s = 0u32;
-        for &x in as_i8(0, 512) {
-            s = s.wrapping_add(x as u8 as u32);
-        }
-        rprintln!("fp[{}]: {:#07x}", label, s);
+        rprintln!("fp[{}]: {:#07x}", label, dsp::byte_sum(arena(0, 512)));
     }
 }
 
@@ -780,6 +907,12 @@ fn sd_stats(phase: &str) {
     rprintln!(
         "sd[{}]: rd {} KB / {} ms, wr {} KB / {} ms",
         phase, rb / 1024, rc / 128_000, wb / 1024, wc / 128_000
+    );
+    let p = unsafe { core::mem::replace(&mut *core::ptr::addr_of_mut!(PROF), [0; 4]) };
+    rprintln!(
+        "cpu[{}]: attn {} ms, lm {} ms, unpack {} ms, sums {} ms",
+        phase, p[P_ATTN] / 128_000, p[P_LM] / 128_000, p[P_UNPACK] / 128_000,
+        p[P_SUM] / 128_000
     );
 }
 
@@ -810,6 +943,20 @@ const R_MELF: usize = 28168; // 20480 (f32 mel chunk)
 const R_PDM0: usize = 48648; // 20480
 const R_PDM1: usize = 69128; // 20480 (ends 89608 < arena top)
 const R_TILE: usize = 48648; // pass 2 int8 tile staging (PDM idle by then)
+const R_MEANS: usize = 89608; // 4800: per-frame mean log-mel for the online VAD
+
+/// Recording ends early once speech has been heard and SIL_CHUNKS whole
+/// chunks (0.64 s each) after it stayed silent, never before MIN_CHUNKS.
+/// The two bounds keep every frame the encoder can touch inside the
+/// recording -- the VAD context floor (192 frames = 6 chunks), the 0.64 s
+/// margin, the round-up to a 128-frame tile and conv1's one-frame halo --
+/// so the encoder input is identical to the full 12 s capture's whenever
+/// the VAD picks the same endpoint. A pause longer than SIL_CHUNKS ends
+/// the utterance: that is the trade.
+const SIL_CHUNKS: usize = 3;
+const MIN_CHUNKS: usize = 7;
+/// Chunks the last capture produced (N_CHUNKS = the full 12 s).
+static mut REC_CHUNKS: usize = N_CHUNKS;
 
 // Each pipeline phase keeps its scratch on the stack, and the stack has
 // ~16.5 KB between the top of RAM and .bss. Inlined into one another the
@@ -828,6 +975,56 @@ fn mel_tables(c: &Ctxt) -> Result<(), i32> {
     c.asset("melcos", R_COS)?;
     arena(R_MAX, 4).copy_from_slice(&(-1e30f32).to_le_bytes());
     Ok(())
+}
+
+/// Per-frame mean log-mel of the chunk just computed (R_MELF, planar
+/// [80][n_frames]) into R_MEANS -- the same sums mel_pass2 forms from the
+/// spilled data, so the online and offline VAD see identical numbers.
+fn chunk_means(ci: usize, n_frames: usize) {
+    let m = as_f32(R_MELF, 80 * n_frames);
+    let means = unsafe {
+        core::slice::from_raw_parts_mut(arena_addr(R_MEANS) as *mut f32, 1200)
+    };
+    for f in 0..n_frames {
+        let mut sum = 0f32;
+        for r in 0..80 {
+            sum += m[r * n_frames + f];
+        }
+        means[ci * T + f] = sum / 80.0;
+    }
+}
+
+/// Per-frame speech test over mean log-mel energies: louder than the
+/// quietest frame + 10 dB and within 20 dB of the loudest. Returns
+/// (floor, peak, thresh, last speech frame if any).
+fn vad_scan(means: &[f32]) -> (f32, f32, f32, Option<usize>) {
+    let mut floor = f32::MAX;
+    let mut peak = f32::MIN;
+    for &v in means {
+        if v < floor {
+            floor = v;
+        }
+        if v > peak {
+            peak = v;
+        }
+    }
+    let thresh = (floor + VAD_THRESH_LOG10).max(peak - VAD_PEAK_DROP_LOG10);
+    let mut last = None;
+    for (f, &v) in means.iter().enumerate() {
+        if v > thresh {
+            last = Some(f);
+        }
+    }
+    (floor, peak, thresh, last)
+}
+
+/// Whole silent chunks after the last speech chunk, over `k` chunks.
+fn silent_tail(k: usize) -> usize {
+    let means = as_f32(R_MEANS, k * T);
+    match vad_scan(means).3 {
+        Some(last) => (k - 1) - last / T,
+        None => 0,
+    }
 }
 
 fn mel_chunk(ci: usize, n_samples: usize, n_frames: usize) {
@@ -859,6 +1056,7 @@ fn record_mel(c: &Ctxt) -> Result<u32, i32> {
     stream.overruns = 0;
 
     let mut have = 0usize; // valid samples in the sliding window
+    let mut n_chunks = N_CHUNKS;
     for k in 0..N_CHUNKS {
         let hop = stream.next_buffer(); // buffer k; DMA now fills the other
         // Development rig only: keep a copy of what the microphone
@@ -876,7 +1074,12 @@ fn record_mel(c: &Ctxt) -> Result<u32, i32> {
         // chunk k-1: append buffer k's first 256 samples (right halo)
         win[have..have + 256].copy_from_slice(&hop[..256]);
         mel_chunk(k - 1, have + 256, T);
+        chunk_means(k - 1, T);
         try_rc!(c.write(S_MELF, (k - 1) * 20480, R_MELF, 20480), "mel spill");
+        if k >= MIN_CHUNKS && silent_tail(k) >= SIL_CHUNKS {
+            n_chunks = k; // chunks 0..k-1 are complete and spilled
+            break;
+        }
         // slide: 1280-sample left halo, then all of buffer k
         win.copy_within(have - 1280..have, 0);
         win[1280..1280 + CHUNK].copy_from_slice(hop);
@@ -884,12 +1087,19 @@ fn record_mel(c: &Ctxt) -> Result<u32, i32> {
     }
     let ov = stream.overruns;
     stream.stop();
-    // final chunk (48 frames) needs no further input from the mic: the
-    // window already covers [18*CHUNK - 1280, N_SAMPLES)
-    mel_chunk(N_CHUNKS - 1, N_SAMPLES - ((N_CHUNKS - 1) * CHUNK - 1280), 48);
-    try_rc!(c.write(S_MELF, (N_CHUNKS - 1) * 20480, R_MELF,
-                    (80 * 48 * 4usize).div_ceil(storage::BLOCK) * storage::BLOCK),
-            "mel spill");
+    if n_chunks == N_CHUNKS {
+        // final chunk (48 frames) needs no further input from the mic: the
+        // window already covers [18*CHUNK - 1280, N_SAMPLES)
+        mel_chunk(N_CHUNKS - 1, N_SAMPLES - ((N_CHUNKS - 1) * CHUNK - 1280), 48);
+        chunk_means(N_CHUNKS - 1, 48);
+        try_rc!(c.write(S_MELF, (N_CHUNKS - 1) * 20480, R_MELF,
+                        (80 * 48 * 4usize).div_ceil(storage::BLOCK) * storage::BLOCK),
+                "mel spill");
+    } else {
+        rprintln!("rec: silence, stopped after {} chunks ({} ms)",
+                  n_chunks, n_chunks * CHUNK / 16);
+    }
+    unsafe { REC_CHUNKS = n_chunks };
     Ok(ov)
 }
 
@@ -991,6 +1201,7 @@ fn record(c: &Ctxt) -> Result<(), i32> {
 /// of 160 and 256). Windows are identical to record_mel's streaming ones.
 #[inline(never)]
 fn mel_pass1(c: &Ctxt) -> Result<(), i32> {
+    unsafe { REC_CHUNKS = N_CHUNKS };
     for ci in 0..N_CHUNKS {
         let f0 = ci * T;
         let n_frames = if ci == 18 { 48 } else { T };
@@ -1085,9 +1296,11 @@ fn mel_pass2(plan: &Plan, c: &Ctxt) -> Result<(usize, usize), i32> {
     let means = unsafe {
         core::slice::from_raw_parts_mut(arena_addr(R_WIN) as *mut f32, 1200)
     };
+    let rec = unsafe { REC_CHUNKS };
+    let n_frames = if rec >= N_CHUNKS { 1200 } else { rec * T };
     for mt in 0..MEL_TILES {
         let dst = as_i8_mut(R_TILE, 80 * T);
-        if mt < 18 {
+        if mt < 18 && mt < rec {
             try_rc!(c.read(S_MELF, mt * 20480, R_MELF, 20480), "melf rd");
             let m = as_f32(R_MELF, 80 * T);
             for f in 0..T {
@@ -1106,7 +1319,7 @@ fn mel_pass2(plan: &Plan, c: &Ctxt) -> Result<(usize, usize), i32> {
                 lift,
             };
             unsafe { mel::mel_normalize(&p) };
-        } else if mt == 18 {
+        } else if mt == 18 && rec >= N_CHUNKS {
             // 48 real frames stored planar [80,48]; expand to [80,64]
             try_rc!(c.read(S_MELF, mt * 20480, R_MELF, 15360), "melf rd");
             let m = as_f32(R_MELF, 80 * 48);
@@ -1139,28 +1352,13 @@ fn mel_pass2(plan: &Plan, c: &Ctxt) -> Result<(usize, usize), i32> {
     // Endpoint: last mel frame that is both louder than (quietest frame
     // + 10 dB) and within 20 dB of the loudest frame, plus margin,
     // floored and capped, rounded up to whole tiles.
-    let mut floor = f32::MAX;
-    let mut peak = f32::MIN;
-    for &v in means[..1200].iter() {
-        if v < floor {
-            floor = v;
-        }
-        if v > peak {
-            peak = v;
-        }
-    }
-    let thresh = (floor + VAD_THRESH_LOG10).max(peak - VAD_PEAK_DROP_LOG10);
-    let mut last = 0usize;
-    for (f, &v) in means[..1200].iter().enumerate() {
-        if v > thresh {
-            last = f;
-        }
-    }
+    let (floor, peak, thresh, last) = vad_scan(&means[..n_frames]);
+    let last = last.unwrap_or(0);
     let ctx = (last / 2 + VAD_MARGIN_CTX).clamp(VAD_FLOOR_CTX, CTX);
     let tiles = ctx.div_ceil(T);
     rprintln!(
-        "vad: floor {:.2} peak {:.2} thresh {:.2}, speech to mel frame {} -> ctx {} ({} tiles of {})",
-        floor, peak, thresh, last, ctx, tiles, N_TILES
+        "vad: floor {:.2} peak {:.2} thresh {:.2}, speech to mel frame {} of {} -> ctx {} ({} tiles of {})",
+        floor, peak, thresh, last, n_frames, ctx, tiles, N_TILES
     );
     Ok((tiles, ctx))
 }
@@ -1230,25 +1428,6 @@ fn res_add(c: &Ctxt, region8: u32, qa: Quant, qb: Quant, qd: Quant) -> Result<()
     Ok(())
 }
 
-/// Reassemble per-head [64,64] blocks from `region` into a planar
-/// [64, out_w] buffer at `dst_off`, dropping columns >= out_w.
-fn assemble_head(c: &Ctxt, region: u32, head: usize, dst_off: usize,
-                 out_w: usize) -> Result<(), i32> {
-    for i in 0..c.tiles {
-        try_rc!(c.read(region, (head * N_TILES + i) * HB, A_TMP, HB), "hb rd");
-        let tmp = as_i8(A_TMP, HB);
-        let dst = as_i8_mut(dst_off, HD * out_w);
-        let c0 = i * T;
-        let take = T.min(out_w.saturating_sub(c0));
-        for r in 0..HD {
-            for col in 0..take {
-                dst[r * out_w + c0 + col] = tmp[r * T + col];
-            }
-        }
-    }
-    Ok(())
-}
-
 #[inline(never)]
 fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     let zin = quant8(0.0, plan.conv1_in);
@@ -1312,23 +1491,43 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
                 }
             }
         }
-        // attention
+        // attention: a head's K, V and Q tile blocks are contiguous in
+        // their regions, so each is one read; keys/values go transposed
+        // and widened into the idle slot, every tile's context is staged
+        // in the interlayer and written with one command per head
         crate::crumb(0x524 + (l as u32) * 0x10);
         let sm = bq.q_out.scale * bq.k_out.scale / 8.0;
-        let aw = c.tiles * T;
+        let stage = c.tiles * HB;
+        c.loaded = Entry::default();
         for h in 0..HEADS {
-            assemble_head(c, S_KH, h, A_K, aw)?;
-            assemble_head(c, S_VH, h, A_V, aw)?;
+            try_rc!(c.read_raw(S_KH, h * N_TILES * HB, slot_u8(SL_STAGE, stage)), "k rd");
+            let t0 = cycles();
+            prepare_kv_from_stage(c.ctx);
+            prof_add(P_ATTN, t0);
+            try_rc!(c.read_raw(S_VH, h * N_TILES * HB, slot_u8(SL_STAGE, stage)), "v rd");
+            let t0 = cycles();
+            prepare_v_from_stage(c.ctx);
+            prof_add(P_ATTN, t0);
+            try_rc!(c.read_raw(S_QH, h * N_TILES * HB, slot_u8(SL_STAGE, stage)), "q rd");
+            let t0 = cycles();
+            let kv = kernels::AttnKv {
+                kt: slot_i16(SL_KT, kernels::KV16_LEN),
+                v16: slot_i16(SL_V16, kernels::KV16_LEN),
+                tk: c.ctx,
+            };
             for i in 0..c.tiles {
-                try_rc!(c.read(S_QH, (h * N_TILES + i) * HB, A_Q, HB), "q rd");
-                kernels::attn_head(
-                    as_i8(A_Q, HB), as_i8(A_K, HD * aw), as_i8(A_V, HD * aw),
-                    as_i8_mut(A_TMP, HB), HD, T, T, c.ctx, aw,
+                let ctx = interlayer_at(IL_CTX + i * HB, HB);
+                let ctx = unsafe {
+                    core::slice::from_raw_parts_mut(ctx.as_mut_ptr() as *mut i8, HB)
+                };
+                kernels::attn_head_kt(
+                    &slot_i8(SL_STAGE, stage)[i * HB..(i + 1) * HB], &kv, ctx, T, T,
                     bq.q_out.zp, bq.k_out.zp, bq.v_out.zp,
-                    sm, bq.v_out.scale, bq.ctx, attn_scratch(),
+                    sm, bq.v_out.scale, bq.ctx, attn_scratch2(), softmax_exp,
                 );
-                try_rc!(c.write(S_CH, (h * N_TILES + i) * HB, A_TMP, HB), "ctx wr");
             }
+            prof_add(P_ATTN, t0);
+            try_rc!(c.write_raw(S_CH, h * N_TILES * HB, interlayer_at(IL_CTX, stage)), "ctx wr");
         }
         // out-projection
         crate::crumb(0x525 + (l as u32) * 0x10);
@@ -1446,11 +1645,18 @@ const D_O: usize = 10752;
 const D_P: usize = 12288; // 4 x 1536
 const D_GB: usize = 18432; // 3072
 const D_LUT: usize = 21504; // 512
-// Cross K/V planar [64, 600] pair: 25088 + 2 x 38400 = 101888, inside the
-// arena's usable span (the top 8 bytes are the crash breadcrumb). Head
-// blocks stage through D_P, which is idle during cross-attention.
-const D_BIGK: usize = 25088;
-const D_BIGV: usize = 25088 + HD * CTX;
+// LM head: one 64-row chunk of the embedding widened to int16 (49152 B,
+// to 74240; the arena's top 8 bytes are the crash breadcrumb). Cross K/V
+// no longer stage here: they go through the idle weight slot.
+const D_ROWS: usize = 25088;
+// 4-bit reconstruction tables for every amax (16 KB, built once per
+// decode), to 90624.
+const D_LUT16: usize = 74240;
+const _: () = assert!(D_LUT16 + 4 * crate::q4::TABLES16 <= crate::ARENA_BYTES - 8);
+
+fn lut16_tables() -> &'static mut [u32; crate::q4::TABLES16] {
+    unsafe { &mut *(arena_addr(D_LUT16) as *mut [u32; crate::q4::TABLES16]) }
+}
 
 fn sd_read_bytes(e: Entry, byte_off: usize, dst: &mut [u8]) -> i32 {
     // unaligned helper via a bounce block (small reads only)
@@ -1472,9 +1678,7 @@ fn sd_read_bytes(e: Entry, byte_off: usize, dst: &mut [u8]) -> i32 {
 #[inline(never)]
 fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     let embf = lookup("embf").ok_or(-901)?;
-    let embp = lookup("embp").ok_or(-901)?;
-    let embp4 = lookup("embp4"); // 4-bit packed rows (halves the stream)
-    let scl = lookup("embpscl").ok_or(-901)?;
+    let embc = lookup("embc4").ok_or(-901)?; // LM-head chunks (2026-09 image)
     let ids = lookup("embpids").ok_or(-901)?;
     let posd = lookup("posdec").ok_or(-901)?;
     let vtb = lookup("vocabtb").ok_or(-901)?;
@@ -1485,6 +1689,7 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
             m.fill(0);
         }
     }
+    crate::q4::tables16(lut16_tables());
     let mut n_tok = 0usize; // cache length
     let mut token = plan.sot[0];
     let mut next_sot = 1usize;
@@ -1558,17 +1763,32 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
                    D_X16, sq, D_LN, bq.xln)?;
             try_rc!(c.npu(dec_blob(l, "xq", 0).s(), D_LN, D_Q), "dxq");
             let smx = bq.xq_out.scale * bq.xk_out.scale / 8.0;
+            // each head's K and V tile blocks: one read each into the
+            // slot (idle between dxq and dxout), transposed/widened there
+            let stage = c.tiles * HB;
+            c.loaded = Entry::default();
             for h in 0..HEADS {
-                assemble_head_ctx(c, S_XKV, l * 2, h, D_BIGK)?;
-                assemble_head_ctx(c, S_XKV, l * 2 + 1, h, D_BIGV)?;
-                kernels::attn_head(
-                    &as_i8(D_Q, C * W4)[h * HD * W4..(h + 1) * HD * W4],
-                    as_i8(D_BIGK, HD * c.ctx), as_i8(D_BIGV, HD * c.ctx),
+                let kreg = S_XKV + (l as u32 * 2) * HREG_BLOCKS;
+                let vreg = S_XKV + (l as u32 * 2 + 1) * HREG_BLOCKS;
+                try_rc!(c.read_raw(kreg, h * N_TILES * HB, slot_u8(SL_STAGE, stage)), "xk rd");
+                let t0 = cycles();
+                prepare_kv_from_stage(c.ctx);
+                prof_add(P_ATTN, t0);
+                try_rc!(c.read_raw(vreg, h * N_TILES * HB, slot_u8(SL_STAGE, stage)), "xv rd");
+                let t0 = cycles();
+                prepare_v_from_stage(c.ctx);
+                let kv = kernels::AttnKv {
+                    kt: slot_i16(SL_KT, kernels::KV16_LEN),
+                    v16: slot_i16(SL_V16, kernels::KV16_LEN),
+                    tk: c.ctx,
+                };
+                kernels::attn_head_kt(
+                    &as_i8(D_Q, C * W4)[h * HD * W4..(h + 1) * HD * W4], &kv,
                     &mut as_i8_mut(D_CTX, C * W4)[h * HD * W4..(h + 1) * HD * W4],
-                    HD, 1, W4, c.ctx, c.ctx,
-                    bq.xq_out.zp, bq.xk_out.zp, bq.xv_out.zp,
-                    smx, bq.xv_out.scale, bq.xctx, attn_scratch(),
+                    1, W4, bq.xq_out.zp, bq.xk_out.zp, bq.xv_out.zp,
+                    smx, bq.xv_out.scale, bq.xctx, attn_scratch2(), softmax_exp,
                 );
+                prof_add(P_ATTN, t0);
             }
             try_rc!(c.npu(dec_blob(l, "xout", 0).s(), D_CTX, D_O), "dxout");
             dec_add(D_X16, sq, D_O, bq.xout_out, bq.res2);
@@ -1635,7 +1855,7 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         let out_idx = step - (plan.n_sot - 1);
         rprintln!("hid[0,1,2,383] {:.4} {:.4} {:.4} {:.4}",
                   hid[0], hid[1], hid[2], hid[C - 1]);
-        let best = lm_head(plan, embp, embp4, scl, ids, &hid, out_idx == 0)?;
+        let best = lm_head(plan, embc, &hid, out_idx == 0)?;
         rprintln!("tok id {}", best);
         if best == plan.eot {
             print_detected(&transcript, tlen);
@@ -1673,106 +1893,87 @@ fn dec_add(x16: usize, qa: Quant, b8: usize, qb: Quant, qd: Quant) {
     kernels::add_i16_i8(a, qa, as_i8(b8, C * W4), qb, dst, qd);
 }
 
-/// Cross K/V head reassembly into planar [64, CTX] (pad columns dropped).
-fn assemble_head_ctx(c: &Ctxt, base: u32, matrix: usize, head: usize,
-                     dst_off: usize) -> Result<(), i32> {
-    let w = c.ctx;
-    for i in 0..c.tiles {
-        try_rc!(c.read(base + matrix as u32 * HREG_BLOCKS,
-                       (head * N_TILES + i) * HB, D_P, HB),
-                "xhb");
-        let tmp = as_i8(D_P, HB);
-        let dst = as_i8_mut(dst_off, HD * w);
-        let c0 = i * T;
-        let take = T.min(w.saturating_sub(c0));
-        for r in 0..HD {
-            for col in 0..take {
-                dst[r * w + c0 + col] = tmp[r * T + col];
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Argmax over the pruned int8 embedding, streamed in 64-row chunks.
+/// Argmax over the pruned embedding, streamed in 64-row chunks.
+///
+/// Each "embc4" chunk is one read: the rows' f32 scales and token ids,
+/// then the 4-bit weights (group amax + nibbles), which are expanded to
+/// int16 and dotted on SMLAD with the hidden vector quantized to a
+/// per-utterance int16 grid (gate: model/lm16_check.py, zero argmax
+/// flips on the golden decode). Pad rows carry scale 0 and input-only
+/// rows (SOT etc) scale -1: both skipped.
 ///
 /// (An exact bound-sorted early exit was measured and rejected: Whisper
 /// LM-head cosines are so small that even the loosest row's Cauchy-Schwarz
 /// bound sits ~3x above the best logit -- 0 of 12228 rows prunable.)
-fn lm_head(plan: &Plan, embp: Entry, embp4: Option<Entry>, scl: Entry,
-           ids: Entry, hid: &[f32; C], first: bool) -> Result<u32, i32> {
+fn lm_head(plan: &Plan, embc: Entry, hid: &[f32; C], first: bool) -> Result<u32, i32> {
+    const ROWS: usize = 64;
+    const CH_SCL: usize = 0; // f32[64]
+    const CH_IDS: usize = ROWS * 4; // u32[64]
+    const CH_AMAX: usize = 2 * ROWS * 4; // u8[64 * 6]
+    const CH_NIBS: usize = CH_AMAX + ROWS * C / crate::q4::G;
+    const CH_USED: usize = CH_NIBS + ROWS * C / 2;
+    const CH_BLOCKS: usize = CH_USED.div_ceil(storage::BLOCK);
+    const _: () = assert!(CH_BLOCKS == crate::q4::EMB_CHUNK_BLOCKS);
+
+    let mut hmax = 0f32;
+    for &h in hid.iter() {
+        hmax = hmax.max(libm::fabsf(h));
+    }
+    let hs = if hmax > 0.0 { hmax / 32767.0 } else { 1.0 };
+    let mut hq = [0i16; C];
+    for (q, &h) in hq.iter_mut().zip(hid.iter()) {
+        *q = dsp::round_i32(h / hs).clamp(-32767, 32767) as i16;
+    }
+
     let mut best = f32::MIN;
     let mut best2 = f32::MIN;
-    let mut best_row = 0usize;
-    const ROWS: usize = 64; // 64 x 384 = 24576 B per chunk
-    // 4-bit packed chunk: [amax 64*6][nibbles 64*192], block-padded.
-    const PK_AMAX: usize = ROWS * C / crate::q4::G;
-    const PK_USED: usize = PK_AMAX + ROWS * C / 2;
-    const PK_BLOCKS: u32 = PK_USED.div_ceil(storage::BLOCK) as u32;
-    // f32 row scales, streamed alongside each chunk (256 B, one block).
-    // They cannot be parked anywhere the NPU writes: every decoder blob
-    // runs between decode start and this read.
-    let mut scl_buf = [0u8; ROWS * 4];
-    let mut row_id = [0u8; 4];
+    let mut best_id = plan.eot;
+    let rows16 = as_i16_mut(D_ROWS, ROWS * C);
     for chunk in 0..plan.vocab_n.div_ceil(ROWS) {
-        let r0 = chunk * ROWS;
-        let n = ROWS.min(plan.vocab_n - r0);
-        let rc = if let Some(p4) = embp4 {
-            // bounce the packed chunk through the interlayer buffer --
-            // transient use between NPU runs is fine (nothing persists),
-            // then expand all 64 rows into the usual D_BIGK staging
-            let il = interlayer(PK_USED);
-            let rc = storage::read_blocks(p4.lba + chunk as u32 * PK_BLOCKS,
-                                     il.as_mut_ptr(), PK_BLOCKS);
-            if rc == 0 {
-                let (amax, nibs) = il.split_at(PK_AMAX);
-                crate::q4::unpack(amax, nibs, as_i8_mut(D_BIGK, ROWS * C));
-            }
-            rc
-        } else {
-            storage::read_blocks(embp.lba + (r0 * C / storage::BLOCK) as u32,
-                            arena(D_BIGK, 0).as_mut_ptr(),
-                            (n * C).div_ceil(storage::BLOCK) as u32)
-        };
-        if rc != 0 {
-            return Err(rc);
-        }
-        try_rc!(sd_read_bytes(scl, r0 * 4, &mut scl_buf[..n * 4]), "scl");
-        let rows = as_i8(D_BIGK, n * C);
-        for r in 0..n {
-            let s = f32::from_le_bytes(
-                scl_buf[r * 4..r * 4 + 4].try_into().unwrap());
-            if s <= 0.0 {
-                continue; // input-only row (SOT etc), marked by the image
-            }
-            let mut acc = 0f32;
-            for i in 0..C {
-                acc += rows[r * C + i] as f32 * hid[i];
-            }
-            let logit = acc * s;
-            if logit > best {
-                if first {
-                    // blank suppression on the first sampled token
-                    sd_read_bytes(ids, (r0 + r) * 4, &mut row_id);
-                    let id = u32::from_le_bytes(row_id);
-                    if id == plan.eot
-                        || plan.blank[..plan.n_blank].contains(&id)
-                    {
-                        continue;
-                    }
+        // the packed chunk bounces through the interlayer buffer:
+        // transient use between NPU runs is fine (nothing persists)
+        let il = interlayer(CH_BLOCKS * storage::BLOCK);
+        try_rc!(storage::read_blocks(embc.lba + (chunk * CH_BLOCKS) as u32,
+                                     il.as_mut_ptr(), CH_BLOCKS as u32),
+                "embc rd");
+        let t0 = cycles();
+        crate::q4::unpack16(lut16_tables(), &il[CH_AMAX..CH_NIBS], &il[CH_NIBS..CH_USED],
+                            rows16);
+        prof_add(P_UNPACK, t0);
+        let t0 = cycles();
+        let n = ROWS.min(plan.vocab_n - chunk * ROWS);
+        let mut r = 0;
+        while r < ROWS {
+            let d = unsafe { dsp::dot384_2rows(rows16.as_ptr().add(r * C), hq.as_ptr()) };
+            for k in 0..2 {
+                let row = r + k;
+                let s = f32::from_le_bytes(
+                    il[CH_SCL + row * 4..CH_SCL + row * 4 + 4].try_into().unwrap());
+                if row >= n || s <= 0.0 {
+                    continue;
                 }
-                best2 = best;
-                best = logit;
-                best_row = r0 + r;
-            } else if logit > best2 {
-                best2 = logit;
+                let logit = d[k] as f32 * (s * hs);
+                if logit > best {
+                    let id = u32::from_le_bytes(
+                        il[CH_IDS + row * 4..CH_IDS + row * 4 + 4].try_into().unwrap());
+                    if first
+                        && (id == plan.eot || plan.blank[..plan.n_blank].contains(&id))
+                    {
+                        continue; // blank suppression on the first sampled token
+                    }
+                    best2 = best;
+                    best = logit;
+                    best_id = id;
+                } else if logit > best2 {
+                    best2 = logit;
+                }
             }
+            r += 2;
         }
+        prof_add(P_LM, t0);
     }
-    let mut b = [0u8; 4];
-    try_rc!(sd_read_bytes(ids, best_row * 4, &mut b), "ids");
-    rprintln!("lm: row {} logit {:.3} (2nd {:.3})", best_row, best, best2);
-    Ok(u32::from_le_bytes(b))
+    rprintln!("lm: id {} logit {:.3} (2nd {:.3})", best_id, best, best2);
+    Ok(best_id)
 }
 
 /// Binary search the kept-id table for a token id -> kept position.

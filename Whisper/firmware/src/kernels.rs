@@ -11,6 +11,8 @@
 //! - Attention q/k/v sites are symmetric (zp = 0), so QK^T needs no
 //!   zero-point correction; softmax output is fixed at scale 1/256, zp -128.
 
+use crate::dsp;
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Quant {
@@ -20,13 +22,13 @@ pub struct Quant {
 
 impl Quant {
     #[inline]
-    fn q8(&self, x: f32) -> i8 {
-        (libm::roundf(x / self.scale) as i32 + self.zp).clamp(-128, 127) as i8
+    pub fn q8(&self, x: f32) -> i8 {
+        (dsp::round_i32(x / self.scale) + self.zp).clamp(-128, 127) as i8
     }
 
     #[inline]
     fn q16(&self, x: f32) -> i16 {
-        (libm::roundf(x / self.scale) as i32 + self.zp).clamp(-32768, 32767) as i16
+        (dsp::round_i32(x / self.scale) + self.zp).clamp(-32768, 32767) as i16
     }
 
     #[inline]
@@ -286,4 +288,187 @@ pub fn logits_max(acc: &[i32], mults: &[f32], idx: &[u32], state: &mut ArgmaxSta
             state.best_idx = idx[j];
         }
     }
+}
+
+// --- attention on the DSP extension ---------------------------------------------
+//
+// Same arithmetic as `attn_head` (i32 sums of the same products, the same
+// f32 softmax and quantization expressions), restructured so the two
+// matmul phases are dot products the SMLAD kernels in dsp.rs can run:
+// keys are transposed to key-major int16 once per head (`AttnKv`), values
+// are widened to int16, and queries are processed two at a time against
+// two keys / two value rows per kernel call. Verified bit-identical to the
+// golden by tools/attncheck.
+
+pub const HD64: usize = 64;
+const _: () = assert!(MAX_KEYS == dsp::ROW2);
+
+/// Working buffers for `attn_head_kt`: two queries at a time (~13 KB).
+/// The p16 rows sit exactly ROW2 elements apart, which the 2x2 kernel
+/// bakes in as its second-row offset. Parked in the idle interlayer.
+#[repr(C)]
+pub struct AttnScratch2 {
+    pub acc: [[i32; MAX_KEYS]; 2],
+    pub scores: [[f32; MAX_KEYS]; 2],
+    pub p16: [[i16; MAX_KEYS]; 2],
+    pub q16: [[i16; HD64]; 2],
+}
+
+/// Keys and values in the layouts the kernels consume: `kt` key-major
+/// int16 [tkp][64] (rows tk..tkp zero, tkp = tk rounded up to 8) and
+/// `v16` int16 [64][MAX_KEYS] (columns tk..tkp zero).
+pub struct AttnKv<'a> {
+    pub kt: &'a [i16],
+    pub v16: &'a [i16],
+    pub tk: usize,
+}
+
+/// Elements of a full `kt` / `v16` buffer.
+pub const KV16_LEN: usize = MAX_KEYS * HD64;
+
+#[inline]
+pub fn keys_padded(tk: usize) -> usize {
+    tk.div_ceil(8) * 8
+}
+
+/// Fill `kt` from any int8 key layout through `get(channel, key)`.
+pub fn attn_prepare_kt<F: Fn(usize, usize) -> i8>(get: F, tk: usize, kt: &mut [i16]) {
+    let tkp = keys_padded(tk);
+    assert!(tk >= 1 && tkp <= MAX_KEYS && kt.len() >= tkp * HD64);
+    for j in 0..tk {
+        let row = &mut kt[j * HD64..(j + 1) * HD64];
+        for (c, r) in row.iter_mut().enumerate() {
+            *r = get(c, j) as i16;
+        }
+    }
+    kt[tk * HD64..tkp * HD64].fill(0);
+}
+
+/// Fill `v16` from any int8 value layout through `get(channel, key)`.
+pub fn attn_prepare_v16<F: Fn(usize, usize) -> i8>(get: F, tk: usize, v16: &mut [i16]) {
+    let tkp = keys_padded(tk);
+    assert!(tk >= 1 && tkp <= MAX_KEYS && v16.len() >= KV16_LEN);
+    for c in 0..HD64 {
+        let row = &mut v16[c * MAX_KEYS..c * MAX_KEYS + tkp];
+        for (j, r) in row[..tk].iter_mut().enumerate() {
+            *r = get(c, j) as i16;
+        }
+        row[tk..].fill(0);
+    }
+}
+
+/// One attention head over prepared keys/values; q/ctx are [64, wq] with
+/// column stride `qstride` (channel-planar), exactly like `attn_head`.
+/// `exp` is the softmax exponential: `libm::expf` reproduces the golden
+/// bit for bit, `dsp::exp_neg` is the fast one (see the call sites).
+#[allow(clippy::too_many_arguments)]
+pub fn attn_head_kt<E: Fn(f32) -> f32>(
+    q: &[i8],
+    kv: &AttnKv,
+    ctx: &mut [i8],
+    wq: usize,
+    qstride: usize,
+    zq: i32,
+    zk: i32,
+    zv: i32,
+    score_mult: f32,
+    v_scale: f32,
+    ctx_q: Quant,
+    s: &mut AttnScratch2,
+    exp: E,
+) {
+    let tk = kv.tk;
+    let tkp = keys_padded(tk);
+    assert!(tk >= 1 && tkp <= MAX_KEYS);
+    assert!(kv.kt.len() >= tkp * HD64 && kv.v16.len() >= KV16_LEN);
+    assert!(wq >= 1 && q.len() >= (HD64 - 1) * qstride + wq);
+    assert!(ctx.len() >= (HD64 - 1) * qstride + wq);
+    let ctx_mult = PROBS.scale * v_scale;
+    let mut qi = 0;
+    while qi < wq {
+        // an odd trailing query is paired with itself; its twin's
+        // results are simply not stored
+        let two = qi + 1 < wq;
+        let mut qsum = [0i32; 2];
+        for c in 0..HD64 {
+            let a = q[c * qstride + qi] as i32 - zq;
+            let b = if two { q[c * qstride + qi + 1] as i32 - zq } else { a };
+            s.q16[0][c] = a as i16;
+            s.q16[1][c] = b as i16;
+            qsum[0] += a;
+            qsum[1] += b;
+        }
+        let mut j = 0;
+        while j < tkp {
+            let r = unsafe {
+                dsp::dot64_2x2(s.q16.as_ptr() as *const i16, kv.kt.as_ptr().add(j * HD64))
+            };
+            s.acc[0][j] = r[0];
+            s.acc[0][j + 1] = r[1];
+            s.acc[1][j] = r[2];
+            s.acc[1][j + 1] = r[3];
+            j += 2;
+        }
+        let mut psum = [0i32; 2];
+        for row in 0..2 {
+            let (acc, scores, p16) = (&s.acc[row], &mut s.scores[row], &mut s.p16[row]);
+            psum[row] = softmax_row(&acc[..tk], zk * qsum[row], score_mult,
+                                    &mut scores[..tk], p16, tkp, &exp);
+        }
+        let vcorr = [zv * psum[0], zv * psum[1]];
+        let mut c = 0;
+        while c < HD64 {
+            let r = unsafe {
+                dsp::dot_pv_2x2(s.p16.as_ptr() as *const i16,
+                                kv.v16.as_ptr().add(c * MAX_KEYS), tkp / 8)
+            };
+            ctx[c * qstride + qi] = ctx_q.q8((r[0] - vcorr[0]) as f32 * ctx_mult);
+            ctx[(c + 1) * qstride + qi] = ctx_q.q8((r[1] - vcorr[0]) as f32 * ctx_mult);
+            if two {
+                ctx[c * qstride + qi + 1] = ctx_q.q8((r[2] - vcorr[1]) as f32 * ctx_mult);
+                ctx[(c + 1) * qstride + qi + 1] =
+                    ctx_q.q8((r[3] - vcorr[1]) as f32 * ctx_mult);
+            }
+            c += 2;
+        }
+        qi += 2;
+    }
+}
+
+/// One softmax row: dequantize the i32 scores, exponentiate, quantize
+/// to the fixed 1/256 probability scale, stored +128-biased as int16
+/// (zero beyond `tk` up to `tkp`). Returns the biased sum for the V
+/// zero-point correction.
+fn softmax_row<E: Fn(f32) -> f32>(
+    acc: &[i32],
+    corr: i32,
+    mult: f32,
+    scores: &mut [f32],
+    p16: &mut [i16; MAX_KEYS],
+    tkp: usize,
+    exp: &E,
+) -> i32 {
+    let tk = acc.len();
+    let mut max = f32::MIN;
+    for (s, &a) in scores.iter_mut().zip(acc) {
+        *s = (a - corr) as f32 * mult;
+        if *s > max {
+            max = *s;
+        }
+    }
+    let mut sum = 0.0f32;
+    for s in scores.iter_mut() {
+        *s = exp(*s - max);
+        sum += *s;
+    }
+    let inv = 1.0 / sum;
+    let mut psum = 0i32;
+    for (p, &s) in p16[..tk].iter_mut().zip(scores.iter()) {
+        // PROBS.q8(s * inv) + 128, with the /(1/256) as an exact *256
+        let pv = (dsp::round_i32(s * inv * 256.0) - 128).clamp(-128, 127) + 128;
+        *p = pv as i16;
+        psum += pv;
+    }
+    p16[tk..tkp].fill(0);
+    psum
 }
