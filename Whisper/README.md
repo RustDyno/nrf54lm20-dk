@@ -178,8 +178,10 @@ activations| ORCH
       standing accuracy problem to the MICROPHONE, not the model: the same
       pipeline fed the reference clip produces a mel matching the host
       mirror (max diff 0.018, correlation 0.99999, full int8 range), while
-      a live-mic run produces PCM at -55 dBFS and a mel pinned against the
-      int8 floor. See "Testing without a USB stick" below.
+      a live-mic run produces PCM ~31 dB quieter and a mel pinned against
+      the int8 floor. Proven by a round trip: that same mic recording,
+      multiplied by 36 on the host and injected back through the SAME
+      firmware, transcribes correctly. See "Testing without a USB stick" below.
 
 ## Testing the standalone build (when the SD breakout is wired)
 

@@ -1,35 +1,56 @@
 # TODO
 
-## 0. ACCURACY: fix the microphone level (was "inaccurate on device")
+## 0. ACCURACY: the microphone needs ~31 dB of gain (PROVEN END TO END)
 
-Localized 2026-09-03 with the mock rig (TODO_complete). The pipeline is
-fine -- fed the reference clip the device reproduces the reference
-transcript and a mel matching the host mirror to 2 int8 steps. The
-microphone is ~63 dB too quiet: PCM peak 58/32768 (-55 dBFS) where the
-clip is 25647 (-2.1 dBFS), which pins the mel at the int8 floor
-([-128, -91], 24 of 256 codes).
+Localized AND proven 2026-09-03 with the mock rig. The mic, the mel code,
+the encoder, the quantization and the NPU path are ALL fine; the input is
+simply ~31 dB too quiet.
 
-The level matters because whisper's mel normalization is only partly
-relative: the floor is `max - 8` but the offset is an absolute
-`(log_spec + 4) / 4`, so a quiet input shifts the whole normalized mel
-down instead of being absorbed.
+Proof: recorded a live mic window (`--features mic-check`), multiplied the
+samples by 36 on the host, injected the result back through the SAME
+firmware and image -- the device transcribed it correctly
+(" 1 2 3 4 5 1 2 3 4 5 ...", the operator counting). The mel went from
+floor-pinned int8 [-128,-91] to a healthy [-119,127] against the
+reference clip's [-128,127]. Nothing in the firmware changed.
 
-pdm.rs runs GAINL/GAINR at 0x28 = 0 dB; the register tops out at 0x50 =
-+20 dB, which is only 10x and will not close a 1400x gap on its own. So
-decide between:
-  a. PDM gain to +20 dB AND a fixed software gain on the PCM, calibrated
-     against the clip's level; or
-  b. normalize per utterance (scale the PCM so its peak matches the
-     calibration clip's) -- robust to speaking distance, but changes the
-     mel the encoder was calibrated on, so re-gate with simulate.py; or
-  c. check first whether the PDM decimation output is simply being
-     shifted down too far -- 58 counts of ambient noise is low even for
-     0 dB, so measure a known-loud source before adding gain.
+Measured levels (100 ms frames, speech-active frames only):
 
-Measure with: mockusb serve --no-audio, then
-`pixi run python mock_compare.py out/mock-work.img` (it writes the
-recorded audio out as a wav). Do (c) before (a) or (b).
+    source            peak    active rms   noise floor
+    mic (as recorded)  5568         156          3.4
+    jfk reference     25647        5615        254.5
 
+So peak is only 13 dB down but SUSTAINED level is 31 dB down -- the mic
+capture has a much higher crest factor (one transient at 5568 while
+speech sits near 156). The spectrum of the loudest second is a ~128 Hz
+fundamental with harmonics at 258/516 Hz and 59% of energy in
+300-3400 Hz: clean speech, just quiet. Audio sounds undistorted.
+
+Why the level matters at all, given whisper normalizes: the floor is
+relative (`max - 8`) but the offset is ABSOLUTE (`(log_spec + 4) / 4`),
+so a quiet input shifts the whole normalized mel down instead of being
+absorbed.
+
+Fixing it -- 36x is 31 dB and pdm.rs GAINL/GAINR only reach +20 dB
+(0x28 = 0 dB now, 0x50 = +20 dB max), so the register alone cannot do it:
+  a. PDM gain to +20 dB plus ~3.6x in software. Simple, but a fixed
+     software gain clips loud speakers: 36x on this clip already clips
+     0.23% of samples on one transient.
+  b. Per-utterance normalization (scale so a high percentile -- NOT the
+     raw peak, which was 35x the speech rms here -- hits ~0.7 FS). This
+     is closest to what whisper actually expects, since its reference
+     pipeline is fed float audio peaking near full scale, and it is
+     robust to speaking distance. Re-gate with simulate.py because it
+     changes the mel the encoder was calibrated on.
+  c. Still worth one measurement first: 58 counts of ambient and 156 of
+     speech is low even for 0 dB gain, so check whether the PDM
+     decimation output is being shifted down further than intended
+     before compensating for it downstream.
+
+Reproduce: `mockusb serve --no-audio` + `cargo run --release --features
+mic-check` records 12 s windows, prints peak/dBFS/rms each, and stops at
+the first one above the noise floor with the audio left in S_PCM. Then
+`pixi run python mock_compare.py out/mock-work.img` writes it out as a
+wav.
 
 Speed queue (2026-08-27). Baseline: the 2026-08-26 verified run, ~2 min
 speak-to-done, sd[...] stats in NOTES.md.

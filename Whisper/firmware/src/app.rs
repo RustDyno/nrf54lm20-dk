@@ -639,7 +639,53 @@ fn injected(c: &Ctxt) -> Option<u32> {
     Some(u32::from_le_bytes([b[8], b[9], b[10], b[11]]))
 }
 
+/// Microphone bring-up aid: record windows and report the level of each,
+/// stopping at the first one loud enough to be speech so that window's
+/// audio is still sitting in S_PCM for the host to pull off the work
+/// image. Skips the encoder and decoder entirely, so a window costs 12 s
+/// rather than three minutes.
+#[cfg(feature = "mic-check")]
+#[inline(never)]
+fn mic_check(c: &Ctxt) -> Result<(), i32> {
+    const WINDOWS: u32 = 30;
+    // Ambient noise measures a peak near 60, so this is comfortably above
+    // the floor and still low enough to trip on quiet speech if the gain
+    // really is as low as it looks.
+    const TRIGGER: i32 = 200;
+    rprintln!("=== mic check: {} windows of 12 s, speak into the mic ===", WINDOWS);
+    for w in 0..WINDOWS {
+        rprintln!("mic: window {}/{} recording...", w + 1, WINDOWS);
+        display::clear();
+        display::print("mic check\n");
+        mic_reset();
+        let ov = record_mel(c)?;
+        let (peak, rms) = mic_level();
+        rprintln!(
+            "mic: window {} peak {} ({:.1} dBFS) rms {:.1}, {} overruns",
+            w + 1,
+            peak,
+            20.0 * libm::log10f(if peak > 0 { peak as f32 } else { 1.0 } / 32768.0),
+            rms,
+            ov
+        );
+        if peak >= TRIGGER {
+            rprintln!("mic: window {} kept in S_PCM (peak >= {})", w + 1, TRIGGER);
+            return Ok(());
+        }
+    }
+    rprintln!("mic: nothing reached peak {}; last window kept in S_PCM", TRIGGER);
+    Ok(())
+}
+
 fn utterance(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
+    #[cfg(feature = "mic-check")]
+    {
+        let _ = plan;
+        let r = mic_check(c);
+        rprintln!("mic check done ({:?}); idling so the audio survives", r);
+        crate::mailbox_loop();
+    }
+
     // Decoder iteration without paying for a full encoder pass: the cross
     // K/V scratch persists on the card (dd stops before the scratch
     // blocks), so a build with this feature jumps straight to decode
@@ -847,11 +893,47 @@ fn record_mel(c: &Ctxt) -> Result<u32, i32> {
     Ok(ov)
 }
 
+/// Level of the window being recorded, accumulated as its chunks arrive.
+#[cfg(feature = "mock-usb")]
+static mut MIC_PEAK: i32 = 0;
+#[cfg(feature = "mock-usb")]
+static mut MIC_SUMSQ: u64 = 0;
+#[cfg(feature = "mock-usb")]
+static mut MIC_N: u32 = 0;
+
+#[cfg(feature = "mock-usb")]
+fn mic_reset() {
+    unsafe {
+        MIC_PEAK = 0;
+        MIC_SUMSQ = 0;
+        MIC_N = 0;
+    }
+}
+
+/// (peak, rms) of the window just recorded.
+#[cfg(feature = "mock-usb")]
+fn mic_level() -> (i32, f32) {
+    unsafe {
+        let n = MIC_N.max(1) as f32;
+        (MIC_PEAK, libm::sqrtf(MIC_SUMSQ as f32 / n))
+    }
+}
+
 /// Copy one recorded chunk into S_PCM, clipped to the region's 750 blocks
 /// (19 chunks of 10240 samples overrun 192000 by 2560, and S_INJECT sits
 /// immediately after).
 #[cfg(feature = "mock-usb")]
 fn spill_pcm(c: &Ctxt, k: usize, hop: &[i16]) {
+    unsafe {
+        for &x in hop {
+            let a = (x as i32).abs();
+            if a > MIC_PEAK {
+                MIC_PEAK = a;
+            }
+            MIC_SUMSQ += (x as i32 * x as i32) as u64;
+            MIC_N += 1;
+        }
+    }
     let off = k * CHUNK * 2;
     if off >= N_SAMPLES * 2 {
         return;

@@ -779,7 +779,13 @@ pub fn init(wait_ms: u32) -> i32 {
         write_volatile(core_reg(GINTSTS), !0);
         write_volatile(core_reg(DCTL), read_volatile(core_reg(DCTL)) | DCTL_PWRONPRGDONE);
     }
-    ms_wait(2);
+    // Hold the disconnect long enough for the host to actually register a
+    // detach before we re-attach. A reset that leaves VBUS up (a reflash,
+    // say) can otherwise present so brief a gap that the host never
+    // notices, keeps its old view of the device, never issues a bus reset,
+    // and enumeration simply never happens -- the device then sits in
+    // DSTS.SuspSts with no USBRst forever. USB 2.0 debounce is 100 ms.
+    ms_wait(150);
     unsafe {
         // Attach: the PC now sees a device and starts enumeration.
         write_volatile(core_reg(DCTL), read_volatile(core_reg(DCTL)) & !DCTL_SFTDISCON);

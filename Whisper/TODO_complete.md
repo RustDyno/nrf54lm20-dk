@@ -90,8 +90,16 @@ firmware, same image, two runs:
   clip's 25647 (-2.1 dBFS, rms 4458) -- ~63 dB down. Mel pinned at the
   int8 floor, [-128, -91], using 24 of 256 codes.
 
-That is the "~6 log10 units low" mel already noted: an amplitude ratio of
-~1400 is 6.3 log10 units of power, and whisper's mel normalization has an
-absolute `(log_spec + 4) / 4` term, so the shift is not absorbed. The
-model, the quantization and the NPU path are exonerated.
+That is the "~6 log10 units low" mel already noted (that first mic run
+was ambient silence; with speech it is ~31 dB / 3.1 log10 units down).
+Whisper's mel normalization has an absolute `(log_spec + 4) / 4` term, so
+the shift is not absorbed.
+
+PROVEN by a round trip the same day: a live mic window recorded off the
+device (`--features mic-check`), multiplied by 36 on the host and injected
+back through the SAME firmware and image, transcribed CORRECTLY
+(" 1 2 3 4 5 ...") with the mel moving to [-119,127]. Nothing in the
+firmware changed between the failing and passing runs, which exonerates
+every stage after the microphone. Remaining work is choosing the gain
+scheme -- TODO item 0.
 

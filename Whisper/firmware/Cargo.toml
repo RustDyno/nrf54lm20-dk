@@ -40,3 +40,7 @@ decode-only = []
 # instead of reading a stick (tools/mockusb). Mutually exclusive with the
 # USB host backend -- same peripheral, opposite role.
 mock-usb = []
+# Record microphone windows and report their level, stopping at the first
+# one loud enough to be speech and leaving it in S_PCM for the host to
+# pull. Needs the mock rig for the PCM spill and the work image.
+mic-check = ["mock-usb"]
