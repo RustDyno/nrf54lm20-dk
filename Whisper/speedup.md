@@ -297,8 +297,10 @@ overruns -- the ~22 s mel pass is fully hidden behind capture.
 
 ## 9. 2026-09-03: profile on the USB stick; the M33 is the bottleneck
 
-Source: firmware/output9.log (mock rig, USB device mode, reads ~9-10 MB/s,
-writes ~1 MB/s; the real stick is in the same range). Phase boundaries
+Source: firmware/output9.log (the 14cd:1212 USB stick in host mode,
+reads ~9-10 MB/s, writes ~1 MB/s). Commits after that run touched only
+the microphone path (PDM gain, mel lift, mock rig), not the encoder,
+decoder or LM head, so the compute profile still stands. Phase boundaries
 come from the host timestamps on the "npu <blob>" lines (RTT is
 NoBlockSkip, so logging does not stall the firmware; the 120 ms bursts
 are the host's poll cadence). The sd[phase] lines give the storage
