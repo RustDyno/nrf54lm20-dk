@@ -1,5 +1,10 @@
 # Whisper speed analysis: where the time goes and how to cut it
 
+2026-09-03 UPDATE: the profile was re-measured on the USB-stick build
+(section 9). Storage is no longer the limit; the CPU attention kernel is
+71 percent of a ctx-600 encoder and the LM head is half of every decode
+step. Sections 1-6 describe the SD-era ranking and are kept for history.
+
 Status: 3.1 (SPIM00 at 32 MHz), 3.4 (VAD endpointing), the attention
 kernel rewrite, and the mel FFT (section 7) are IMPLEMENTED; everything
 up to the attention rewrite is hardware-verified (2026-08-26 run, ~2 min
@@ -289,3 +294,105 @@ overruns -- the ~22 s mel pass is fully hidden behind capture.
 - nRF54LM20 DK HW user guide v0.7.0 (P2.00-P2.05 NOR/header switching,
   USB connectors): https://mm.digikey.com/Volume0/opasdata/d220001/medias/docus/8897/nRF54LM20_DK_HW_User_Guide_v0.7.0.pdf
 - Zephyr nRF54LM20 DK board docs (udc_dwc2 USBHS support): https://docs.zephyrproject.org/latest/boards/nordic/nrf54lm20dk/doc/index.html
+
+## 9. 2026-09-03: profile on the USB stick; the M33 is the bottleneck
+
+Source: firmware/output9.log (mock rig, USB device mode, reads ~9-10 MB/s,
+writes ~1 MB/s; the real stick is in the same range). Phase boundaries
+come from the host timestamps on the "npu <blob>" lines (RTT is
+NoBlockSkip, so logging does not stall the firmware; the 120 ms bursts
+are the host's poll cadence). The sd[phase] lines give the storage
+share of each phase directly.
+
+### Encoder, ctx 600 (10 tiles): 122.8 s wall, storage 24.7 s
+
+| Phase (per block unless noted) | Wall | What it is |
+|---|---|---|
+| conv1 + conv2 + posenc (once) | 4.7 s | 50 NPU runs, halo assembly, IO |
+| q/k/v projections | 1.2-2.0 s | 30 NPU runs, 180 4 KB head writes |
+| v -> out gap = ATTENTION | 21.2 s | 60 attn_head calls on the CPU |
+| out-proj + res_add + ln2 | 0.8-1.7 s | 10 NPU runs, IO |
+| MLP (fc1 x4, fc2p x4) | 3.1-4.0 s | 80 NPU runs, 960 KB partial writes |
+| recombination + next ln1 | 0.9-1.6 s | 3.8 MB of partial/residual IO |
+| final LN (once) | 1.75 s | |
+
+Attention: 4 x 21.2 s = 85 s = 71 percent of the encoder. Per block
+that is 295 M MACs + 2.3 M expf + 2.3 M roundf/div quantizations in
+~2.7 G cycles: ~8 cycles per MAC. The kernel is scalar (ldrsb, ldr,
+mla, str, loop per MAC at opt-level s); the M33 DSP extension does two
+16-bit MACs per cycle (SMLAD) and the acc read-modify-write pattern of
+the rank-1 formulation is the wrong shape for it. Everything else in
+the encoder (NPU ~530 runs, ~9 MB reads of activations, 15.8 MB of
+writes at ~1 MB/s) totals ~38 s.
+
+The ctx-192 run (3 tiles) scales as predicted: attention 2.2-3.0 s per
+block, whole encoder 20.8 s, storage 7.7 s.
+
+### Decode: 2.9-3.0 s per sampled token (6 tokens: 23 s)
+
+| Component | Time/step | Basis |
+|---|---|---|
+| four decoder blocks (56 blobs, 9.3 MB) | 1.3-1.4 s | d0q -> d3fc1a timestamps |
+| of which storage | ~1.0 s | 9.3 MB blobs + 1.9 MB cross-KV pages at ~10 MB/s |
+| of which blob byte-sum check | ~0.2 s | 9.3 MB at ~3 cycles/byte |
+| LM head (hid -> lm: row) | 1.53 s | measured twice, identical |
+| SOT warm-up (once per utterance) | 1.4-1.6 s | one block pass, no LM head |
+
+The LM head streams the 4-bit embedding (2.35 MB, ~0.25 s) but spends
+the rest on the CPU and on command count: 192 chunks, each a packed
+read plus a separate 1-block row-scale read, a nibble unpack through a
+16-entry table, and f32 dot products with a bounds-checked index
+(~8 cycles per element for 4.7 M elements). NPU time per step is
+negligible (56 runs at width 4, well under 0.1 s).
+
+### Ranked levers (savings for a ctx-600, 10-token utterance, ~160 s)
+
+1. Attention kernel on the DSP extension: transpose K to [key][dim]
+   int16 and expand V to int16 once per head (153 KB; the weight SLOT
+   is idle during CPU attention and reloading the next blob costs
+   18 ms), then SMLAD dot products with 2x2 register blocking. Same
+   i32 arithmetic, so bit-exact by construction. ~8 -> ~1.2
+   cycles/MAC: 21 s -> ~5 s per block. SAVES ~65 s. Small/medium
+   effort, one file plus a scratch reservation.
+2. Softmax tail: expf via a table or a short exp2 polynomial, and the
+   probability quantization via VRINTA/VCVTA (1 instruction, roundf
+   semantics) with the /(1/256) as an exact *256. ~2 s/block -> ~0.5.
+   SAVES ~6 s. Small. Not bit-identical to libm::expf in the last ulp;
+   the tape's 1-LSB tolerance and the transcript gate cover it.
+3. LM head: int16 hid x int8 rows on SMLAD (the original design was
+   int8 x int8 -> i32 anyway), row scales stored inside each packed
+   chunk (one read per chunk, not two), unpack written as a word loop.
+   1.5 s -> ~0.5 s/token. SAVES ~10 s. Small.
+4. Blob byte-sum on the USB backend: the bulk protocol already CRC16s
+   every packet; skip it there, or sum words with USAD8 (4 bytes per
+   cycle). SAVES ~2 s (0.2 s/token) plus ~0.2 s in the encoder. Trivial.
+5. Cross-KV planar on the card (section 3.5): 480 4 KB reads per token
+   -> 48 reads of 38 KB, no repack loops. SAVES ~2-3 s. Small.
+6. Stop recording at silence: the VAD already runs chunk by chunk on
+   the streaming mel pass, but the capture always runs the full 12 s
+   (16.4 s from "speak now" to encoder start on a 2.3 s utterance).
+   SAVES up to ~9 s on short utterances. Small.
+7. Try a fast stick (zero code): reads are a flat ~9-10 MB/s at every
+   transfer size (4 KB head blocks to 166 KB blobs), so the limit is
+   bandwidth, not per-command overhead: the bargain 14cd:1212 stick or
+   the polled DMA loop. A USB 2.0 stick can read 30-40 MB/s and write
+   10+ MB/s; that would cut the 16 s of encoder scratch writes and
+   the ~1.3 s/token of decode reads by 2-3x if the driver keeps up.
+8. Overlap storage with compute (DWC2 buffer DMA runs autonomously;
+   start a transfer, do CPU work, poll later): worth up to the
+   storage share (~25 s encoder, ~1 s/token) once 1-3 are in. Medium.
+9. 4-bit decoder blobs (TODO B/D): -4.6 MB/token of stream (~0.5 s)
+   against ~0.2-0.3 s of unpack. Net ~0.3 s/token. Medium, and the
+   G=32 quality regate comes first.
+10. Speculative decoding (section 3.3b): the only lever that divides
+    the 9.3 MB/token weight floor; acceptance rate with a cheap draft
+    is unmeasured. Large.
+
+Projection after 1-6: encoder ~45 s, decode ~1.7 s/token, so the same
+utterance lands at ~85 s; a fast stick (7) or IO overlap (8) takes the
+encoder toward ~30 s.
+
+Also cheap: the whole crate builds at opt-level "s". Kernels-only
+opt-level 3 is not expressible in stable Rust, but a crate-wide switch
+is a zero-effort experiment now that the blobs bind only to pinned
+data addresses (text-only changes keep the card valid).
