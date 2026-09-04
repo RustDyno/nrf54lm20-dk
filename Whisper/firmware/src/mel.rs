@@ -270,15 +270,26 @@ pub struct MelNormParams {
     pub max_acc: u32, // f32, global max from the mel pass
     pub out: u32,     // i8[n]
     pub q: crate::kernels::Quant,
+    /// Per-utterance level correction, in log10 power units, added
+    /// alongside whisper's absolute +4.0. Zero reproduces whisper
+    /// exactly; see app.rs mel_pass2 for how it is derived and why.
+    pub lift: f32,
 }
 
 /// whisper's normalization: clamp to max-8, then (x+4)/4, then quantize.
+///
+/// The clamp is relative to the utterance's own peak but the +4.0 offset
+/// is ABSOLUTE, so quiet audio does not get normalized -- it just lands
+/// lower in the output range. `lift` corrects for that; it is added to
+/// the same absolute offset and so is exactly equivalent to having
+/// recorded the audio louder (a gain g on the samples multiplies power by
+/// g^2, shifting log10 power by 2*log10(g) uniformly).
 pub unsafe fn mel_normalize(p: &MelNormParams) {
     let mel = core::slice::from_raw_parts(p.mel as *const f32, p.n as usize);
     let out = core::slice::from_raw_parts_mut(p.out as *mut i8, p.n as usize);
     let floor = *(p.max_acc as *const f32) - 8.0;
     for i in 0..mel.len() {
-        let x = (if mel[i] < floor { floor } else { mel[i] } + 4.0) / 4.0;
+        let x = (if mel[i] < floor { floor } else { mel[i] } + 4.0 + p.lift) / 4.0;
         let q = (libm::roundf(x / p.q.scale) as i32 + p.q.zp).clamp(-128, 127);
         out[i] = q as i8;
     }

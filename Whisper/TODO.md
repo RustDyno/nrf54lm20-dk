@@ -1,56 +1,31 @@
 # TODO
 
-## 0. ACCURACY: the microphone needs ~31 dB of gain (PROVEN END TO END)
+## 0. DONE 2026-09-03: microphone level fixed on the board
 
-Localized AND proven 2026-09-03 with the mock rig. The mic, the mel code,
-the encoder, the quantization and the NPU path are ALL fine; the input is
-simply ~31 dB too quiet.
+Shipped, verified on hardware (see TODO_complete). Two levers:
 
-Proof: recorded a live mic window (`--features mic-check`), multiplied the
-samples by 36 on the host, injected the result back through the SAME
-firmware and image -- the device transcribed it correctly
-(" 1 2 3 4 5 1 2 3 4 5 ...", the operator counting). The mel went from
-floor-pinned int8 [-128,-91] to a healthy [-119,127] against the
-reference clip's [-128,127]. Nothing in the firmware changed.
+- pdm.rs GAIN 0x28 (0 dB) -> 0x28+24 (+12 dB), applied inside the
+  peripheral ahead of the 16-bit output so it keeps detail a later
+  software scale cannot recover. Measured: no clipping, 0 overruns.
+- app.rs mel_lift(): the remainder taken out per utterance in the
+  log-mel domain, where it cannot clip. whisper's normalization clamps
+  relative to the utterance peak but applies an ABSOLUTE +4.0 offset, so
+  it does not normalize level; mel_lift adds the shift that puts this
+  utterance's peak where the calibration clip's was (MEL_TARGET_MAX
+  1.845, from ref.npz mel_chunk max 1.46126 * 4 - 4). A gain g on the
+  samples shifts log10 power by 2*log10(g) uniformly, so this is exactly
+  equivalent to recording louder -- but pass 1 already computed the
+  peak, so it is free. Clamped to [-2.0, +4.0] log10 so silence is not
+  lifted to speech level and a shout is brought down.
 
-Measured levels (100 ms frames, speech-active frames only):
-
-    source            peak    active rms   noise floor
-    mic (as recorded)  5568         156          3.4
-    jfk reference     25647        5615        254.5
-
-So peak is only 13 dB down but SUSTAINED level is 31 dB down -- the mic
-capture has a much higher crest factor (one transient at 5568 while
-speech sits near 156). The spectrum of the loudest second is a ~128 Hz
-fundamental with harmonics at 258/516 Hz and 59% of energy in
-300-3400 Hz: clean speech, just quiet. Audio sounds undistorted.
-
-Why the level matters at all, given whisper normalizes: the floor is
-relative (`max - 8`) but the offset is ABSOLUTE (`(log_spec + 4) / 4`),
-so a quiet input shifts the whole normalized mel down instead of being
-absorbed.
-
-Fixing it -- 36x is 31 dB and pdm.rs GAINL/GAINR only reach +20 dB
-(0x28 = 0 dB now, 0x50 = +20 dB max), so the register alone cannot do it:
-  a. PDM gain to +20 dB plus ~3.6x in software. Simple, but a fixed
-     software gain clips loud speakers: 36x on this clip already clips
-     0.23% of samples on one transient.
-  b. Per-utterance normalization (scale so a high percentile -- NOT the
-     raw peak, which was 35x the speech rms here -- hits ~0.7 FS). This
-     is closest to what whisper actually expects, since its reference
-     pipeline is fed float audio peaking near full scale, and it is
-     robust to speaking distance. Re-gate with simulate.py because it
-     changes the mel the encoder was calibrated on.
-  c. Still worth one measurement first: 58 counts of ambient and 156 of
-     speech is low even for 0 dB gain, so check whether the PDM
-     decimation output is being shifted down further than intended
-     before compensating for it downstream.
-
-Reproduce: `mockusb serve --no-audio` + `cargo run --release --features
-mic-check` records 12 s windows, prints peak/dBFS/rms each, and stops at
-the first one above the noise floor with the audio left in S_PCM. Then
-`pixi run python mock_compare.py out/mock-work.img` writes it out as a
-wav.
+Still open, minor: the reference clip and a live mic window now both
+land at the same mel peak, but the mic's noise floor is much lower
+relative to speech (3.4 vs 254 at 0 dB gain), so a lifted quiet
+utterance presents a cleaner-than-calibration background. Worth a
+simulate.py pass over several recorded clips to confirm the encoder is
+happy with that, and to re-check MEL_TARGET_MAX against more than one
+reference. MEL_AUTOLEVEL = false restores stock whisper behaviour for
+comparison.
 
 Speed queue (2026-08-27). Baseline: the 2026-08-26 verified run, ~2 min
 speak-to-done, sd[...] stats in NOTES.md.

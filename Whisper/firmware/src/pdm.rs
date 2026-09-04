@@ -34,8 +34,20 @@ const ENABLE_ENABLED: u32 = 1;
 const MODE_OPERATION_MONO: u32 = 1 << 0;
 const MODE_EDGE_LEFTRISING: u32 = 0 << 1; // board-validated for this mic
 
-// Digital gain, 0.5 dB per step around 0x28 = 0 dB (0x00 = -20 dB, 0x50 = +20 dB).
-const GAIN: u32 = 0x28;
+// Digital gain, 0.5 dB per step around 0x28 = 0 dB (0x00 = -20 dB,
+// 0x50 = +20 dB). Applied inside the peripheral ahead of the 16-bit
+// output, so unlike a later software scale it keeps detail that would
+// otherwise be truncated away.
+//
+// +12 dB (24 steps). Measured at 0 dB the mic delivered ordinary speech
+// at an active rms of ~156 of 32768 -- about 7 bits of the 16 -- with a
+// noise floor near 3. Four times that still leaves speech peaks (~10x
+// the rms) an order of magnitude below full scale, so it buys headroom
+// back without risking clipped speech; a desk knock may clip, which is
+// harmless. The rest of the shortfall against the calibration clip is
+// taken out per-utterance in the log-mel domain, where it cannot clip at
+// all (app.rs mel_lift).
+const GAIN: u32 = 0x28 + 24;
 
 // Clocking: PDM_CLK = 32 MHz / 25 = 1.28 MHz, / RATIO 80 = 16000 Hz exactly.
 const RATIO_80: u32 = 0x4;

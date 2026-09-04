@@ -1027,6 +1027,46 @@ const VAD_THRESH_LOG10: f32 = 1.0; // 10 dB over the noise floor
 // 10 dB above the quietest frame, pinning the endpoint at frame 1199.
 const VAD_PEAK_DROP_LOG10: f32 = 2.0;
 
+/// Peak log10-mel of the calibration clip (out/ref.npz mel_chunk max
+/// 1.46126 un-normalized: 1.46126 * 4 - 4). Recorded audio is levelled to
+/// this so the encoder sees the distribution it was calibrated on.
+const MEL_TARGET_MAX: f32 = 1.845;
+/// Ceiling on the correction, in log10 power units (4.0 = 40 dB of audio
+/// gain). Past this an utterance is silence, and lifting it just
+/// amplifies the noise floor to speech level.
+const MEL_MAX_LIFT: f32 = 4.0;
+/// Floor, so a shouted utterance is brought down as well as up.
+const MEL_MIN_LIFT: f32 = -2.0;
+/// Set false to get whisper's stock absolute normalization back.
+const MEL_AUTOLEVEL: bool = true;
+
+/// How far this utterance's log-mel has to move to sit where the
+/// calibration clip did.
+///
+/// whisper's normalization clamps relative to the utterance peak but then
+/// applies an absolute +4.0 offset, so it does NOT normalize level: audio
+/// 31 dB below the reference (which is what the PDM mic delivers at
+/// ordinary speaking volume) lands pinned against the int8 floor and
+/// transcribes as nonsense. Correcting in the log-mel domain is exactly
+/// equivalent to having applied the matching gain to the samples, but it
+/// costs nothing -- pass 1 already accumulated the peak -- and it cannot
+/// clip. Proven on hardware: the same mic recording scaled by 36x on the
+/// host transcribed correctly where the original did not.
+fn mel_lift() -> f32 {
+    if !MEL_AUTOLEVEL {
+        return 0.0;
+    }
+    let observed = f32::from_le_bytes(arena(R_MAX, 4).try_into().unwrap());
+    let lift = MEL_TARGET_MAX - observed;
+    if lift > MEL_MAX_LIFT {
+        MEL_MAX_LIFT
+    } else if lift < MEL_MIN_LIFT {
+        MEL_MIN_LIFT
+    } else {
+        lift
+    }
+}
+
 /// Pass 2: normalize into int8 mel tiles; pad frames = quantized 0.0.
 /// Needs the global max in R_MAX from either pass 1. Also scans the f32
 /// mel energies for speech (mean log-mel per frame vs the quietest
@@ -1034,6 +1074,13 @@ const VAD_PEAK_DROP_LOG10: f32 = 2.0;
 #[inline(never)]
 fn mel_pass2(plan: &Plan, c: &Ctxt) -> Result<(usize, usize), i32> {
     let pad = quant8(0.0, plan.conv1_in);
+    let lift = mel_lift();
+    rprintln!(
+        "mel: peak {:.3}, level correction {:+.3} log10 ({:+.1} dB of audio gain)",
+        f32::from_le_bytes(arena(R_MAX, 4).try_into().unwrap()),
+        lift,
+        10.0 * lift
+    );
     // per-mel-frame mean energies staged in the (idle) R_WIN region
     let means = unsafe {
         core::slice::from_raw_parts_mut(arena_addr(R_WIN) as *mut f32, 1200)
@@ -1056,6 +1103,7 @@ fn mel_pass2(plan: &Plan, c: &Ctxt) -> Result<(usize, usize), i32> {
                 max_acc: arena_addr(R_MAX),
                 out: arena_addr(R_TILE),
                 q: plan.conv1_in,
+                lift,
             };
             unsafe { mel::mel_normalize(&p) };
         } else if mt == 18 {
@@ -1075,6 +1123,7 @@ fn mel_pass2(plan: &Plan, c: &Ctxt) -> Result<(usize, usize), i32> {
                 max_acc: arena_addr(R_MAX),
                 out: arena_addr(R_TILE + 80 * T), // staging past the tile
                 q: plan.conv1_in,
+                lift,
             };
             unsafe { mel::mel_normalize(&p) };
             let st = as_i8(R_TILE + 80 * T, 80 * 48);

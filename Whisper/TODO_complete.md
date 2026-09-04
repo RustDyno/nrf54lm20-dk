@@ -103,3 +103,36 @@ firmware changed between the failing and passing runs, which exonerates
 every stage after the microphone. Remaining work is choosing the gain
 scheme -- TODO item 0.
 
+## Microphone level fixed on the board (2026-09-03)
+
+Asked as "can we boost the mic on the board?" -- yes, and it needed two
+levers because neither alone is enough.
+
+- pdm.rs GAIN 0 dB -> +12 dB (0x28 + 24). Digital gain inside the PDM
+  peripheral, applied ahead of the 16-bit output, so unlike a software
+  scale it keeps detail that would otherwise be truncated. Stopped at
+  +12 of the available +20 dB because speech peaks were already
+  -15.4 dBFS; measured after the change: peak 4292, 0 clipped samples,
+  0 overruns.
+- app.rs mel_lift() + mel.rs MelNormParams.lift: the remaining ~25 dB
+  taken out per utterance in the log-mel domain, where it cannot clip.
+  Equivalent to recording louder (a gain g shifts log10 power by
+  2*log10(g) uniformly) but free, since mel pass 1 already accumulates
+  the peak. Clamped to [-2.0, +4.0] log10.
+
+VERIFIED, three ways:
+- reference clip: correction computes as +0.000 and fp[mel8] is 0x138d4,
+  BYTE-IDENTICAL to the pre-change verified run -- the calibration path
+  is untouched.
+- the raw mic recording that used to transcribe as nonsense (peak 1707,
+  active rms 137, NO host-side gain) now gets +26.9 dB of correction
+  automatically, a mel of [-128,127] against the reference's [-128,127],
+  and transcribes CORRECTLY: " 1 2 3 4 5 1 2 3 4 5 ...".
+- a second capture transcribed as " . . . ." -- but its spectrum has no
+  voice fundamental (dominant 1378 Hz, only 9% of energy below 300 Hz)
+  against the good capture's clear 128 Hz with harmonics, i.e. nothing
+  was said in that window rather than a regression. Worth knowing: once
+  the lift is in, a window with no speech gets amplified to full scale
+  and decodes as repeated punctuation, so "loud" no longer implies
+  "speech" and the mic-check trigger threshold is not a VAD.
+
