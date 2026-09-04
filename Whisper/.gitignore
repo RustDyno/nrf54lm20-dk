@@ -10,3 +10,8 @@ tools/*/target/
 .vscode
 host/out-*.bin
 datasheets/
+firmware/bins/
+model/decode_golden_run3.txt
+model/decode_golden_substep.txt
+model/decode_golden_qvec.txt
+firmware/output*.log

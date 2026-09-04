@@ -15,7 +15,7 @@
 
 use crate::kernels::{self, Quant};
 use crate::{display, mel, pdm, sd, slot, storage};
-use rtt_target::{rprint, rprintln};
+use rtt_target::rprintln;
 
 const C: usize = 384;
 const HD: usize = 64;
@@ -37,6 +37,11 @@ const HREG_BLOCKS: u32 = (HEADS * N_TILES * HB / storage::BLOCK) as u32; // 480
 
 // --- SD scratch regions (block offsets from plan.scratch_lba) ----------------
 const S_PCM: u32 = 0; // 750 blocks
+// Marker block written by tools/mockusb when S_PCM already holds a fixed
+// clip: the run then skips the microphone so it is reproducible and
+// directly comparable to the host mirror. Sits in the gap between S_PCM's
+// 750 blocks and S_MELF.
+const S_INJECT: u32 = 750;
 const S_MELF: u32 = 768; // pass-1 f32 mel chunks, 20 x 40 blocks
 const S_MEL: u32 = 1600; // int8 mel tiles [80,64], 20 x 10 blocks
 const S_A: u32 = 1856; // mel-rate int8 tiles, 20 x 48 blocks
@@ -620,6 +625,20 @@ pub fn run() -> ! {
 /// Streaming mode failed once (mel fell behind the mic): stay sequential.
 static mut STREAM_MEL_OK: bool = true;
 
+/// True when the storage backend is serving pre-loaded audio in S_PCM
+/// (the mock-usb development rig). Checked every utterance so the same
+/// firmware records live or replays a clip with no rebuild.
+fn injected(c: &Ctxt) -> Option<u32> {
+    if c.read(S_INJECT, 0, 0, storage::BLOCK) != 0 {
+        return None;
+    }
+    let b = arena(0, 16);
+    if &b[..8] != b"WMOCKAU1" {
+        return None;
+    }
+    Some(u32::from_le_bytes([b[8], b[9], b[10], b[11]]))
+}
+
 fn utterance(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     // Decoder iteration without paying for a full encoder pass: the cross
     // K/V scratch persists on the card (dd stops before the scratch
@@ -634,6 +653,13 @@ fn utterance(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         crate::mailbox_loop();
     }
     rprintln!("");
+    if let Some(n) = injected(c) {
+        rprintln!("=== injected audio ({} samples, no mic) ===", n);
+        display::clear();
+        display::print("== injected clip\n");
+        mel_tables(c)?;
+        mel_pass1(c)?;
+    } else {
     rprintln!("=== speak now (12 s) ===");
     display::clear();
     display::print("== speak now (12 s)\n");
@@ -664,6 +690,7 @@ fn utterance(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         rprintln!("mel...");
         mel_tables(c)?;
         mel_pass1(c)?;
+    }
     }
     let (tiles, actx) = mel_pass2(plan, c)?;
     sd_stats("mel");
@@ -738,6 +765,15 @@ const R_PDM0: usize = 48648; // 20480
 const R_PDM1: usize = 69128; // 20480 (ends 89608 < arena top)
 const R_TILE: usize = 48648; // pass 2 int8 tile staging (PDM idle by then)
 
+// Each pipeline phase keeps its scratch on the stack, and the stack has
+// ~16.5 KB between the top of RAM and .bss. Inlined into one another the
+// phases' frames SUM -- decode's ~8 KB of buffers then stay live through
+// mel, whose mel_frames needs 6 KB of its own, and the run dies in an
+// MSPLIM stack-overflow fault whose backtrace names mel, not decode.
+// Keeping the phases out of line makes each frame live only while that
+// phase runs. (Found the hard way: the sequential mel path faulted here
+// the first time anything exercised it.)
+#[inline(never)]
 fn mel_tables(c: &Ctxt) -> Result<(), i32> {
     // filterbank borrows the interlayer buffer; small tables in the arena
     let filt = lookup("melfilt").ok_or(-901)?;
@@ -765,6 +801,7 @@ fn mel_chunk(ci: usize, n_samples: usize, n_frames: usize) {
 
 /// Record 12 s while computing mel pass 1 in the buffer gaps. Returns the
 /// PDM overrun count (any overrun lost audio: caller must discard).
+#[inline(never)]
 fn record_mel(c: &Ctxt) -> Result<u32, i32> {
     mel_tables(c)?;
 
@@ -778,6 +815,12 @@ fn record_mel(c: &Ctxt) -> Result<u32, i32> {
     let mut have = 0usize; // valid samples in the sliding window
     for k in 0..N_CHUNKS {
         let hop = stream.next_buffer(); // buffer k; DMA now fills the other
+        // Development rig only: keep a copy of what the microphone
+        // actually heard. The streaming path never otherwise persists its
+        // PCM (only the sequential fallback writes S_PCM), which leaves a
+        // live-mic run with nothing to inspect when its mel looks wrong.
+        #[cfg(feature = "mock-usb")]
+        spill_pcm(c, k, hop);
         let win = as_i16_mut(R_WIN, WIN);
         if k == 0 {
             win[..CHUNK].copy_from_slice(hop);
@@ -804,8 +847,27 @@ fn record_mel(c: &Ctxt) -> Result<u32, i32> {
     Ok(ov)
 }
 
+/// Copy one recorded chunk into S_PCM, clipped to the region's 750 blocks
+/// (19 chunks of 10240 samples overrun 192000 by 2560, and S_INJECT sits
+/// immediately after).
+#[cfg(feature = "mock-usb")]
+fn spill_pcm(c: &Ctxt, k: usize, hop: &[i16]) {
+    let off = k * CHUNK * 2;
+    if off >= N_SAMPLES * 2 {
+        return;
+    }
+    let bytes = (N_SAMPLES * 2 - off).min(CHUNK * 2);
+    let src = hop.as_ptr() as u32;
+    let arena_off = (src - arena_addr(0)) as usize;
+    let rc = c.write(S_PCM, off, arena_off, bytes);
+    if rc != 0 {
+        rprintln!("pcm spill rc={}", rc);
+    }
+}
+
 /// Sequential fallback: plain recording to SD (used when streaming mel
 /// once fell behind; pass 1 then reads the PCM back from the card).
+#[inline(never)]
 fn record(c: &Ctxt) -> Result<(), i32> {
     const HOP: usize = 320;
     let ring = arena(0, 16 * HOP * 2);
@@ -845,6 +907,7 @@ fn record(c: &Ctxt) -> Result<(), i32> {
 /// (1280 samples) early so that (a) the reflect halo has real samples and
 /// (b) the SD byte offset stays block-aligned (1280 samples = 2560 B, lcm
 /// of 160 and 256). Windows are identical to record_mel's streaming ones.
+#[inline(never)]
 fn mel_pass1(c: &Ctxt) -> Result<(), i32> {
     for ci in 0..N_CHUNKS {
         let f0 = ci * T;
@@ -886,6 +949,7 @@ const VAD_PEAK_DROP_LOG10: f32 = 2.0;
 /// Needs the global max in R_MAX from either pass 1. Also scans the f32
 /// mel energies for speech (mean log-mel per frame vs the quietest
 /// frame) and returns the VAD extent (tiles, ctx) for the encoder.
+#[inline(never)]
 fn mel_pass2(plan: &Plan, c: &Ctxt) -> Result<(usize, usize), i32> {
     let pad = quant8(0.0, plan.conv1_in);
     // per-mel-frame mean energies staged in the (idle) R_WIN region
@@ -1054,6 +1118,7 @@ fn assemble_head(c: &Ctxt, region: u32, head: usize, dst_off: usize,
     Ok(())
 }
 
+#[inline(never)]
 fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     let zin = quant8(0.0, plan.conv1_in);
 
@@ -1206,6 +1271,7 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
 
 // --- cross K/V ---------------------------------------------------------------------
 
+#[inline(never)]
 fn cross_kv(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     crate::crumb(0x571);
     for l in 0..BLOCKS {
@@ -1272,6 +1338,7 @@ fn sd_read_bytes(e: Entry, byte_off: usize, dst: &mut [u8]) -> i32 {
     0
 }
 
+#[inline(never)]
 fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     let embf = lookup("embf").ok_or(-901)?;
     let embp = lookup("embp").ok_or(-901)?;
@@ -1291,6 +1358,9 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     let mut token = plan.sot[0];
     let mut next_sot = 1usize;
     let mut printed = 0usize;
+    // Accumulate the decoded token pieces; emitted on one "Detected:" line.
+    let mut transcript = [0u8; 256];
+    let mut tlen = 0usize;
 
     for step in 0..(plan.n_sot - 1 + MAX_TOKENS) {
         // x16 = quantize(embf[kept_pos(token)] + posdec[step])
@@ -1437,21 +1507,20 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         let best = lm_head(plan, embp, embp4, scl, ids, &hid, out_idx == 0)?;
         rprintln!("tok id {}", best);
         if best == plan.eot {
-            rprintln!("");
+            print_detected(&transcript, tlen);
             rprintln!("=== done ({} tokens) ===", printed);
-            display::print("\n== done\n");
             return Ok(());
         }
-        print_token(vtb, kept_position(ids, best)?)?;
+        append_token(vtb, kept_position(ids, best)?, &mut transcript, &mut tlen)?;
         printed += 1;
         token = best;
         if n_tok >= MAX_TOKENS {
-            rprintln!("");
+            print_detected(&transcript, tlen);
             rprintln!("=== token budget reached ===");
-            display::print("\n== token budget\n");
             return Ok(());
         }
     }
+    print_detected(&transcript, tlen);
     Ok(())
 }
 
@@ -1600,13 +1669,15 @@ fn kept_position(ids: Entry, token: u32) -> Result<usize, i32> {
     Err(-906)
 }
 
-/// Print a kept token's text piece from the vocabulary table.
-fn print_token(vtb: Entry, kept_pos: usize) -> Result<(), i32> {
+/// Append a kept token's text piece from the vocabulary table to the
+/// running transcript buffer (`buf[..len]`), truncating if it fills.
+fn append_token(vtb: Entry, kept_pos: usize, buf: &mut [u8; 256],
+                len: &mut usize) -> Result<(), i32> {
     let mut offs = [0u8; 8];
     try_rc!(sd_read_bytes(vtb, 4 + kept_pos * 4, &mut offs), "vtb off");
     let o0 = u32::from_le_bytes(offs[0..4].try_into().unwrap()) as usize;
     let o1 = u32::from_le_bytes(offs[4..8].try_into().unwrap()) as usize;
-    let len = (o1 - o0).min(48);
+    let n = (o1 - o0).min(48);
     let mut sbuf = [0u8; 48];
     // strings start after the offset table: 4 + (n+1)*4 bytes in
     let n_off = {
@@ -1615,10 +1686,22 @@ fn print_token(vtb: Entry, kept_pos: usize) -> Result<(), i32> {
         u32::from_le_bytes(nb) as usize
     };
     let base = 4 + (n_off + 1) * 4;
-    try_rc!(sd_read_bytes(vtb, base + o0, &mut sbuf[..len]), "vtb s");
-    if let Ok(s) = core::str::from_utf8(&sbuf[..len]) {
-        rprint!("{}", s);
-        display::print(s);
-    }
+    try_rc!(sd_read_bytes(vtb, base + o0, &mut sbuf[..n]), "vtb s");
+    let take = n.min(buf.len() - *len);
+    buf[*len..*len + take].copy_from_slice(&sbuf[..take]);
+    *len += take;
     Ok(())
+}
+
+/// Emit the decoded transcript on its own line, prefixed "Detected: ",
+/// to both the RTT log and the OLED (leading BPE space trimmed).
+fn print_detected(buf: &[u8; 256], len: usize) {
+    if let Ok(s) = core::str::from_utf8(&buf[..len]) {
+        let s = s.trim_start();
+        rprintln!("");
+        rprintln!("Detected: {}", s);
+        display::print("\nDetected: ");
+        display::print(s);
+        display::print("\n");
+    }
 }

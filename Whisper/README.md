@@ -59,9 +59,11 @@ attn matmuls, argmax]
     OLED[SSD1306 OLED
 TWIM22, optional]
     STOR[(model image, standalone:
-microSD on SPIM00 32 MHz
-or USB stick on USBHS
-DWC2 forced-host, ch0)]
+microSD on SPIM00 32 MHz,
+USB stick on USBHS
+DWC2 forced-host, ch0,
+or a PC over USBHS
+forced-device, CDC-ACM)]
     EXEC -->|transcript| OLED
     EXEC <-->|512 B blocks
 storage.rs dispatch| STOR
@@ -72,6 +74,10 @@ storage.rs dispatch| STOR
   end
   ORCH -->|SWD: layer blobs,
 activation pages| SLOT
+  MOCK[mockusb daemon
+serves sd.img, injects audio,
+keeps every scratch write] <-->|512 B blocks
+CDC-ACM over J3| STOR
   EXEC -->|tokens, spilled
 activations| ORCH
   EXEC --> GLUE
@@ -164,6 +170,17 @@ activations| ORCH
       app.rs/mailbox/host tooling are backend-agnostic. Protocol code
       is host-verified (tools/usbcheck, 19 descriptor/framing vectors).
 
+- [x] MOCK USB RIG: the model image can be served from a PC over the same
+      USBHS block in DEVICE mode (CDC-ACM), with the recording replaced by
+      a fixed clip. A full deterministic utterance runs in under 3 minutes
+      and reproduces the reference transcript exactly (23/23 word tokens;
+      only the known audio_ctx=600 comma is missing). This localized the
+      standing accuracy problem to the MICROPHONE, not the model: the same
+      pipeline fed the reference clip produces a mel matching the host
+      mirror (max diff 0.018, correlation 0.99999, full int8 range), while
+      a live-mic run produces PCM at -55 dBFS and a mel pinned against the
+      int8 floor. See "Testing without a USB stick" below.
+
 ## Testing the standalone build (when the SD breakout is wired)
 
 1. Wire a microSD breakout to the expansion board header P17. The card
@@ -224,6 +241,32 @@ BEFORE CONNECTING THE STICK.
    the log. The mailbox SD commands and all host tape tools run against
    whichever backend probed first, so the sdtest tape doubles as the
    USB smoke test.
+
+## Testing without a USB stick: the mock rig
+
+`tools/mockusb` serves the model image to the board over the nRF USB port
+in DEVICE mode, so the whole standalone pipeline runs on silicon with no
+stick to re-dd and nothing to unplug between iterations. It also injects a
+fixed audio clip in place of the microphone, which makes a run repeatable
+and directly comparable to the host mirror, and every scratch block the
+device writes lands back in the host's work file where `model/mock_compare.py`
+can read it (mel, encoder output, cross K/V, and the recorded PCM).
+
+    cd tools/mockusb && cargo build --release
+    ./target/release/mockusb serve --fresh --audio ../../model/out/jfk16k.wav
+    # in another shell:
+    cd firmware && cargo run --release --features mock-usb
+
+The daemon waits for the board to enumerate and survives reflashes, so the
+loop is just `cargo run` again. `--no-audio` clears the injection and the
+device records from the microphone as usual. Analysis:
+
+    cd model && pixi run python mock_compare.py out/mock-work.img
+
+Wiring is a plain USB-C cable from J3 to the PC (the PC supplies VBUS);
+the host-mode 5 V feed described above must NOT be connected. Only one USB
+role can be live at a time, so a `mock-usb` build never probes the stick.
+Throughput is ~1-6 MB/s against the stick's 8.5-9.4 and SWD's 0.074.
 
 ### M1 results (JFK clip, 11 s)
 

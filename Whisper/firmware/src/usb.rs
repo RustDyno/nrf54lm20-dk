@@ -51,14 +51,14 @@ const WRAP_ENABLE: usize = 0x400; // bit0 CORE, bit1 PHY
 
 const CORE_BASE: usize = 0x5002_0000; // USBHSCORE (DWC2)
 const GOTGCTL: usize = 0x000;
-const GAHBCFG: usize = 0x008;
-const GUSBCFG: usize = 0x00C;
-const GRSTCTL: usize = 0x010;
-const GINTSTS: usize = 0x014;
-const GRXFSIZ: usize = 0x024;
-const GNPTXFSIZ: usize = 0x028;
-const GSNPSID: usize = 0x040;
-const GHWCFG2: usize = 0x048;
+pub(crate) const GAHBCFG: usize = 0x008;
+pub(crate) const GUSBCFG: usize = 0x00C;
+pub(crate) const GRSTCTL: usize = 0x010;
+pub(crate) const GINTSTS: usize = 0x014;
+pub(crate) const GRXFSIZ: usize = 0x024;
+pub(crate) const GNPTXFSIZ: usize = 0x028;
+pub(crate) const GSNPSID: usize = 0x040;
+pub(crate) const GHWCFG2: usize = 0x048;
 const HPTXFSIZ: usize = 0x100;
 const HCFG: usize = 0x400;
 const HPRT: usize = 0x440;
@@ -74,19 +74,19 @@ const HCDMA0: usize = 0x514;
 const OTG_VBVALID_OV: u32 = (1 << 2) | (1 << 3);
 const OTG_AVALID_OV: u32 = (1 << 4) | (1 << 5);
 
-const GRSTCTL_CSFTRST: u32 = 1 << 0;
-const GRSTCTL_RXFFLSH: u32 = 1 << 4;
-const GRSTCTL_TXFFLSH: u32 = 1 << 5;
+pub(crate) const GRSTCTL_CSFTRST: u32 = 1 << 0;
+pub(crate) const GRSTCTL_RXFFLSH: u32 = 1 << 4;
+pub(crate) const GRSTCTL_TXFFLSH: u32 = 1 << 5;
 // HARDWARE-CONFIRMED: this core is DWC2 v5.00b (GSNPSID 0x4F54500B), and
 // since v4.20a soft reset is a handshake -- CSftRst does NOT self-clear.
 // The core sets CSftRstDone (bit 29, absent from the SVD/datasheet) and
 // software must then write both bits back to 0. Polling for self-clear
 // hangs forever with the reset long since finished.
-const GRSTCTL_CSFTRSTDONE: u32 = 1 << 29;
-const GRSTCTL_AHBIDLE: u32 = 1 << 31;
+pub(crate) const GRSTCTL_CSFTRSTDONE: u32 = 1 << 29;
+pub(crate) const GRSTCTL_AHBIDLE: u32 = 1 << 31;
 const GUSBCFG_FRCHSTMODE: u32 = 1 << 29;
-const GAHBCFG_DMAEN: u32 = 1 << 5;
-const GAHBCFG_BURST_INCR4: u32 = 3 << 1;
+pub(crate) const GAHBCFG_DMAEN: u32 = 1 << 5;
+pub(crate) const GAHBCFG_BURST_INCR4: u32 = 3 << 1;
 const GINTSTS_CURMOD_HOST: u32 = 1 << 0;
 
 const HPRT_CONNSTS: u32 = 1 << 0;
@@ -137,19 +137,19 @@ fn wrap(off: usize) -> *mut u32 {
 }
 
 #[inline]
-fn core_reg(off: usize) -> *mut u32 {
+pub(crate) fn core_reg(off: usize) -> *mut u32 {
     (CORE_BASE + off) as *mut u32
 }
 
 const CYC_PER_MS: u32 = 128_000; // DWT at the 128 MHz core clock
 
-fn ms_wait(ms: u32) {
+pub(crate) fn ms_wait(ms: u32) {
     let start = cortex_m::peripheral::DWT::cycle_count();
     while cortex_m::peripheral::DWT::cycle_count().wrapping_sub(start) < ms * CYC_PER_MS {}
 }
 
 /// Poll `reg` until `(read & mask) == want` or `ms` elapses.
-fn poll(reg: *mut u32, mask: u32, want: u32, ms: u32) -> bool {
+pub(crate) fn poll(reg: *mut u32, mask: u32, want: u32, ms: u32) -> bool {
     let start = cortex_m::peripheral::DWT::cycle_count();
     loop {
         if unsafe { read_volatile(reg) } & mask == want {
@@ -477,7 +477,7 @@ fn hprt_set(bits: u32) {
     }
 }
 
-fn power_down() {
+pub(crate) fn power_down() {
     unsafe {
         write_volatile(wrap(WRAP_TASKS_STOP), 1);
         write_volatile(wrap(WRAP_ENABLE), 0);
@@ -485,19 +485,13 @@ fn power_down() {
     }
 }
 
-/// Bring up the port, enumerate the stick, and get its SCSI unit ready.
-/// Returns 0 or a negative stage-tagged error (-600 = no VBUS: nothing is
-/// wired, the caller should fall back to SD quietly).
-pub fn init() -> i32 {
-    unsafe {
-        *core::ptr::addr_of_mut!(DEV) = Dev {
-            mps0: 64,
-            pid_in: PID_DATA0,
-            pid_out: PID_DATA0,
-            ..Default::default()
-        };
-    }
-
+/// Power and clock bring-up shared by both roles: 24 MHz PHY reference,
+/// VBUS detection, wrapper enable, and the v4.20a+ core soft-reset
+/// handshake. Leaves the core reset and idle, in whatever mode the
+/// hardware defaults to -- the caller then forces host (init, below) or
+/// device (usbdev) mode. Returns 0, or -600 for "no VBUS wired" and
+/// -601..-604 for the bring-up stage that timed out.
+pub(crate) fn platform_up() -> i32 {
     // The USB PHY reference is the 24 MHz PLL off HFXO (PHY.CLOCK reset
     // FSEL already selects 24 MHz); nothing else in this firmware starts
     // the crystal.
@@ -565,6 +559,27 @@ pub fn init() -> i32 {
         power_down();
         return -604;
     }
+    0
+}
+
+/// Bring up the port, enumerate the stick, and get its SCSI unit ready.
+/// Returns 0 or a negative stage-tagged error (-600 = no VBUS: nothing is
+/// wired, the caller should fall back to SD quietly).
+pub fn init() -> i32 {
+    unsafe {
+        *core::ptr::addr_of_mut!(DEV) = Dev {
+            mps0: 64,
+            pid_in: PID_DATA0,
+            pid_out: PID_DATA0,
+            ..Default::default()
+        };
+    }
+
+    let rc = platform_up();
+    if rc != 0 {
+        return rc;
+    }
+
     unsafe {
         let cfg = read_volatile(core_reg(GUSBCFG));
         write_volatile(core_reg(GUSBCFG), cfg | GUSBCFG_FRCHSTMODE);

@@ -1,0 +1,12 @@
+[package]
+name = "mockusb"
+version = "0.1.0"
+edition = "2021"
+description = "Serves the Whisper model image to the DK over USB device mode, so the on-device pipeline can be run and inspected without a USB stick"
+
+# Independent of the firmware and host workspaces.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"

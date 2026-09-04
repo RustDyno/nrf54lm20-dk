@@ -205,9 +205,18 @@ def main():
                 per_token[name] = mq_dec[l][k]
     packed_n = 0
     saved = 0
+    # Decoder blobs ship RAW int8 by default. The in-place slot expansion
+    # (unpack_slot) feeds the NPU slightly-wrong weights and freezes decode
+    # into a constant token (verified 2026-09-01; raw int8 decodes cleanly,
+    # 4-bit does not). embp4 (LM head) uses the disjoint q4::unpack and is
+    # fine, so it stays 4-bit below. Set Q4_PACK=1 to re-enable per-token
+    # packing once the in-place path is fixed (disjoint expansion / barrier).
+    pack_q4 = bool(os.environ.get("Q4_PACK"))
     for i, (name, data) in enumerate(entries):
         sm = per_token.get(name)
         if sm is None:
+            continue
+        if not pack_q4:
             continue
         w = None
         for d in sm.interp.get_tensor_details():

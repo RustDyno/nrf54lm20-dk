@@ -34,6 +34,8 @@ mod display;
 mod kernels;
 mod libm_shims;
 mod mel;
+#[cfg(feature = "mock-usb")]
+mod mockblk;
 #[allow(dead_code)]
 mod pdm;
 mod platform;
@@ -42,6 +44,8 @@ mod sd;
 mod slot;
 mod storage;
 mod usb;
+#[cfg(feature = "mock-usb")]
+mod usbdev;
 mod usbproto;
 
 use kernels::Quant;

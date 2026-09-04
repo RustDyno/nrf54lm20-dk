@@ -5,6 +5,8 @@
 //! (app.rs, the mailbox SD commands, the host tape tools) is
 //! backend-agnostic.
 
+#[cfg(feature = "mock-usb")]
+use crate::mockblk;
 use crate::{sd, usb};
 use rtt_target::rprintln;
 
@@ -15,6 +17,9 @@ pub enum Backend {
     None,
     Sd,
     Usb,
+    /// Blocks served by a PC over the USB device-mode link (feature
+    /// "mock-usb"). Development rig only -- see mockblk.rs.
+    Mock,
 }
 
 static mut BACKEND: Backend = Backend::None;
@@ -27,6 +32,7 @@ pub fn name() -> &'static str {
     match backend() {
         Backend::Usb => "USB stick",
         Backend::Sd => "SD card",
+        Backend::Mock => "host image (mock USB)",
         Backend::None => "none",
     }
 }
@@ -36,6 +42,26 @@ pub fn name() -> &'static str {
 /// existing tooling knows). Pins/power of a failed probe are left clean.
 pub fn init() -> i32 {
     unsafe { BACKEND = Backend::None };
+
+    // The mock and the USB stick are the same peripheral in opposite
+    // roles, so a mock build never probes host mode: forcing host after
+    // device mode would tear down a working link.
+    #[cfg(feature = "mock-usb")]
+    {
+        let mrc = mockblk::init();
+        if mrc == 0 {
+            unsafe { BACKEND = Backend::Mock };
+            return 0;
+        }
+        // No SD fallback in a mock build: the card is not wired on this
+        // rig, and its probe spends minutes in pin diagnostics that only
+        // delay the real error.
+        rprintln!("storage: mock usb failed rc={} (no SD fallback in mock builds)", mrc);
+        return mrc;
+    }
+
+    #[cfg(not(feature = "mock-usb"))]
+    {
     let urc = usb::init();
     if urc == 0 {
         unsafe { BACKEND = Backend::Usb };
@@ -52,13 +78,16 @@ pub fn init() -> i32 {
         return 0;
     }
     src
+    }
 }
 
 pub fn read_blocks(lba: u32, dst: *mut u8, count: u32) -> i32 {
     match backend() {
         Backend::Usb => usb::read_blocks(lba, dst, count),
         Backend::Sd => sd::read_blocks(lba, dst, count),
-        Backend::None => -490,
+        #[cfg(feature = "mock-usb")]
+        Backend::Mock => mockblk::read_blocks(lba, dst, count),
+        _ => -490,
     }
 }
 
@@ -66,7 +95,9 @@ pub fn write_blocks(lba: u32, src: *const u8, count: u32) -> i32 {
     match backend() {
         Backend::Usb => usb::write_blocks(lba, src, count),
         Backend::Sd => sd::write_blocks(lba, src, count),
-        Backend::None => -490,
+        #[cfg(feature = "mock-usb")]
+        Backend::Mock => mockblk::write_blocks(lba, src, count),
+        _ => -490,
     }
 }
 
@@ -75,6 +106,8 @@ pub fn stats_take() -> (u64, u64, u64, u64) {
     match backend() {
         Backend::Usb => usb::stats_take(),
         Backend::Sd => sd::stats_take(),
-        Backend::None => (0, 0, 0, 0),
+        #[cfg(feature = "mock-usb")]
+        Backend::Mock => mockblk::stats_take(),
+        _ => (0, 0, 0, 0),
     }
 }

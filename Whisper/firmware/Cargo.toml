@@ -36,3 +36,7 @@ sd-spim22 = []
 # Skip mic/mel/encoder/cross and decode against the scratch already on
 # the card (from the last complete run). Development iteration aid.
 decode-only = []
+# Development rig: serve the model image from a PC over USB device mode
+# instead of reading a stick (tools/mockusb). Mutually exclusive with the
+# USB host backend -- same peripheral, opposite role.
+mock-usb = []
