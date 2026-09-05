@@ -21,12 +21,16 @@ cc = "1"
 bindgen = "0.70"
 
 # Optimize even in dev so the CPU kernels and the C driver behave like the
-# real target.
+# real target: the mock-usb rig builds this profile, and its timings must
+# be the stick's. Overflow checks and debug assertions would otherwise
+# put a panic check in every hot loop the release build does not have.
 [profile.dev]
-opt-level = "s"
+opt-level = 3
+overflow-checks = false
+debug-assertions = false
 
 [profile.release]
-opt-level = "s"
+opt-level = 3
 lto = true
 
 [features]

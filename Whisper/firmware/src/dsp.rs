@@ -140,18 +140,21 @@ pub unsafe fn dot64_2x2(q: *const i16, k: *const i16) -> [i32; 4] {
     {
         // One step = one int16 pair of every row: the two loads of a
         // row's second half use the post-incremented pointer, hence the
-        // +124 (= 128 - 4) offsets. Fully unrolled: 32 steps.
+        // +124 (= 128 - 4) offsets. The four loads come first so that
+        // they pipeline (consecutive loads issue one per cycle after the
+        // first), then the four multiply-accumulates. Fully unrolled:
+        // 32 steps.
         macro_rules! step {
             () => {
                 concat!(
                     "ldr {t0}, [{qa}], #4\n",
+                    "ldr {t1}, [{qa}, #124]\n",
                     "ldr {t2}, [{ka}], #4\n",
-                    "smlad {a00}, {t0}, {t2}, {a00}\n",
                     "ldr {t3}, [{ka}, #124]\n",
+                    "smlad {a00}, {t0}, {t2}, {a00}\n",
                     "smlad {a01}, {t0}, {t3}, {a01}\n",
-                    "ldr {t0}, [{qa}, #124]\n",
-                    "smlad {a10}, {t0}, {t2}, {a10}\n",
-                    "smlad {a11}, {t0}, {t3}, {a11}\n",
+                    "smlad {a10}, {t1}, {t2}, {a10}\n",
+                    "smlad {a11}, {t1}, {t3}, {a11}\n",
                 )
             };
         }
@@ -180,6 +183,7 @@ pub unsafe fn dot64_2x2(q: *const i16, k: *const i16) -> [i32; 4] {
             a10 = inout(reg) a10,
             a11 = inout(reg) a11,
             t0 = out(reg) _,
+            t1 = out(reg) _,
             t2 = out(reg) _,
             t3 = out(reg) _,
             options(pure, readonly, nostack),
@@ -214,18 +218,19 @@ pub unsafe fn dot_pv_2x2(p: *const i16, v: *const i16, n8: usize) -> [i32; 4] {
     debug_assert!(n8 >= 1 && n8 * 8 <= ROW2);
     #[cfg(target_arch = "arm")]
     {
-        // Second-row offset after the post-increment: ROW2 * 2 - 4.
+        // Second-row offset after the post-increment: ROW2 * 2 - 4. Loads
+        // grouped ahead of the multiply-accumulates so they pipeline.
         macro_rules! step {
             () => {
                 concat!(
                     "ldr {t0}, [{pa}], #4\n",
+                    "ldr {t1}, [{pa}, #1276]\n",
                     "ldr {t2}, [{va}], #4\n",
-                    "smlad {s00}, {t0}, {t2}, {s00}\n",
                     "ldr {t3}, [{va}, #1276]\n",
+                    "smlad {s00}, {t0}, {t2}, {s00}\n",
                     "smlad {s01}, {t0}, {t3}, {s01}\n",
-                    "ldr {t0}, [{pa}, #1276]\n",
-                    "smlad {s10}, {t0}, {t2}, {s10}\n",
-                    "smlad {s11}, {t0}, {t3}, {s11}\n",
+                    "smlad {s10}, {t1}, {t2}, {s10}\n",
+                    "smlad {s11}, {t1}, {t3}, {s11}\n",
                 )
             };
         }
@@ -250,6 +255,7 @@ pub unsafe fn dot_pv_2x2(p: *const i16, v: *const i16, n8: usize) -> [i32; 4] {
             s10 = inout(reg) s10,
             s11 = inout(reg) s11,
             t0 = out(reg) _,
+            t1 = out(reg) _,
             t2 = out(reg) _,
             t3 = out(reg) _,
             options(pure, readonly, nostack),
@@ -287,8 +293,8 @@ pub unsafe fn dot384_2rows(rows: *const i16, h: *const i16) -> [i32; 2] {
                 concat!(
                     "ldr {t0}, [{h}], #4\n",
                     "ldr {t1}, [{r}], #4\n",
-                    "smlad {s0}, {t0}, {t1}, {s0}\n",
                     "ldr {t2}, [{r}, #764]\n",
+                    "smlad {s0}, {t0}, {t1}, {s0}\n",
                     "smlad {s1}, {t0}, {t2}, {s1}\n",
                 )
             };
@@ -329,4 +335,259 @@ pub unsafe fn dot384_2rows(rows: *const i16, h: *const i16) -> [i32; 2] {
         }
         a
     }
+}
+
+/// int8 -> int16 widening, `dst[i] = src[i] as i16` for every element of
+/// `src`.
+///
+/// Four elements per step on the DSP extension: SXTB16 sign-extends the
+/// even bytes of a word, and the odd bytes after a rotate, into two
+/// halfword pairs; PKHBT / PKHTB reorder them into consecutive pairs and
+/// STRD stores both words. Both slices must be 4-byte aligned; a tail of
+/// up to three elements is widened one at a time.
+pub fn widen_i8_i16(src: &[i8], dst: &mut [i16]) {
+    let n = src.len();
+    assert!(dst.len() >= n);
+    let n4 = n / 4;
+    #[cfg(target_arch = "arm")]
+    {
+        if n4 > 0 {
+            assert!(src.as_ptr() as usize % 4 == 0 && dst.as_ptr() as usize % 4 == 0);
+            let mut s = src.as_ptr();
+            let mut d = dst.as_mut_ptr();
+            let mut k = n4;
+            unsafe {
+                core::arch::asm!(
+                    "1:",
+                    "ldr {w}, [{s}], #4",
+                    "sxtb16 {e}, {w}",
+                    "sxtb16 {o}, {w}, ror #8",
+                    "pkhbt {p0}, {e}, {o}, lsl #16",
+                    "pkhtb {p1}, {o}, {e}, asr #16",
+                    "strd {p0}, {p1}, [{d}], #8",
+                    "subs {k}, {k}, #1",
+                    "bne 1b",
+                    s = inout(reg) s,
+                    d = inout(reg) d,
+                    k = inout(reg) k,
+                    w = out(reg) _,
+                    e = out(reg) _,
+                    o = out(reg) _,
+                    p0 = out(reg) _,
+                    p1 = out(reg) _,
+                    options(nostack),
+                );
+            }
+            let _ = (s, d, k);
+        }
+    }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        for i in 0..n4 * 4 {
+            dst[i] = src[i] as i16;
+        }
+    }
+    for i in n4 * 4..n {
+        dst[i] = src[i] as i16;
+    }
+}
+
+/// Two int8 rows (row 1 at +384 bytes) dotted with a permuted int16
+/// vector. `h` holds, for every four columns 4i..4i+3, the pair
+/// (h[4i], h[4i+2]) and then (h[4i+1], h[4i+3]): the order SXTB16
+/// produces from a word of four int8 (the even bytes, then the odd bytes
+/// after a rotate), so the rows are widened in registers and never
+/// stored. Returns [row0 . h, row1 . h] as wrapping i32 sums.
+///
+/// # Safety
+/// `rows` must be readable for 768 bytes and 4-byte aligned, `h` for
+/// 384 i16 and 4-byte aligned (LDRD).
+#[inline(always)]
+pub unsafe fn dot384_2rows_i8(rows: *const i8, h: *const i16) -> [i32; 2] {
+    #[cfg(target_arch = "arm")]
+    {
+        // One step = four columns of both rows. Row 1 sits 384 bytes past
+        // row 0: 380 after the post-increment.
+        macro_rules! step {
+            () => {
+                concat!(
+                    "ldrd {ha}, {hb}, [{h}], #8\n",
+                    "ldr {w0}, [{r}], #4\n",
+                    "ldr {w1}, [{r}, #380]\n",
+                    "sxtb16 {t}, {w0}\n",
+                    "smlad {s0}, {t}, {ha}, {s0}\n",
+                    "sxtb16 {t}, {w0}, ror #8\n",
+                    "smlad {s0}, {t}, {hb}, {s0}\n",
+                    "sxtb16 {t}, {w1}\n",
+                    "smlad {s1}, {t}, {ha}, {s1}\n",
+                    "sxtb16 {t}, {w1}, ror #8\n",
+                    "smlad {s1}, {t}, {hb}, {s1}\n",
+                )
+            };
+        }
+        let (mut s0, mut s1) = (0i32, 0i32);
+        let mut r = rows;
+        let mut hp = h;
+        let mut n = 24usize; // 96 steps of four columns, 4 per iteration
+        core::arch::asm!(
+            "1:",
+            step!(),
+            step!(),
+            step!(),
+            step!(),
+            "subs {n}, {n}, #1",
+            "bne 1b",
+            r = inout(reg) r,
+            h = inout(reg) hp,
+            n = inout(reg) n,
+            s0 = inout(reg) s0,
+            s1 = inout(reg) s1,
+            ha = out(reg) _,
+            hb = out(reg) _,
+            w0 = out(reg) _,
+            w1 = out(reg) _,
+            t = out(reg) _,
+            options(pure, readonly, nostack),
+        );
+        let _ = (r, hp, n);
+        [s0, s1]
+    }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        let rows = core::slice::from_raw_parts(rows, 768);
+        let h = core::slice::from_raw_parts(h, 384);
+        let mut a = [0i32; 2];
+        for i in 0..96 {
+            let c = 4 * i;
+            // h's pairs back to column order
+            let hc = [h[c], h[c + 2], h[c + 1], h[c + 3]];
+            for j in 0..4 {
+                a[0] = a[0].wrapping_add(rows[c + j] as i32 * hc[j] as i32);
+                a[1] = a[1].wrapping_add(rows[384 + c + j] as i32 * hc[j] as i32);
+            }
+        }
+        a
+    }
+}
+
+/// Index of column `c` of the hidden vector in the layout
+/// `dot384_2rows_i8` expects (the middle two of every four swapped).
+#[inline(always)]
+pub fn perm4(c: usize) -> usize {
+    (c & !3) | ((c & 1) << 1) | ((c >> 1) & 1)
+}
+
+/// On-target check of every asm body against a scalar evaluation of the
+/// same definition, on pseudo-random data. The host comparators compile
+/// only the portable bodies, so this is what actually exercises the
+/// instructions. `scratch` needs 8 KB, 4-byte aligned. Returns a bit per
+/// failing primitive (0 = all agree); on the host it is a no-op.
+pub fn selftest(scratch: &mut [u8]) -> u32 {
+    assert!(scratch.len() >= 8192 && scratch.as_ptr() as usize % 4 == 0);
+    let mut x = 0x2545_f491u32;
+    for b in scratch.iter_mut() {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *b = (x >> 24) as u8;
+    }
+    let mut bad = 0u32;
+    let i8s = |off: usize, n: usize| -> &[i8] {
+        // SAFETY: in-bounds view of the caller's scratch
+        unsafe { core::slice::from_raw_parts(scratch.as_ptr().add(off) as *const i8, n) }
+    };
+    let i16s = |off: usize, n: usize| -> &[i16] {
+        unsafe { core::slice::from_raw_parts(scratch.as_ptr().add(off) as *const i16, n) }
+    };
+
+    // round_i32: halves, negatives, large, tiny
+    for &v in &[0.5f32, 1.5, 2.5, -0.5, -1.5, -2.5, 0.49999, -0.49999, 12345.5, -12345.5,
+                3.0e9, -3.0e9, 1.0e-30, -0.0, 0.0] {
+        if round_i32(v) != libm::roundf(v) as i32 {
+            bad |= 1;
+        }
+    }
+    // byte_sum with a tail that is not a multiple of 16
+    {
+        let b = &scratch[..1003];
+        let want = b.iter().fold(0u32, |a, &v| a.wrapping_add(v as u32));
+        if byte_sum(b) != want {
+            bad |= 2;
+        }
+    }
+    // dot64_2x2: q rows at 0 and 64, k rows at 0 and 64 (i16 each)
+    {
+        let q = i16s(0, 128);
+        let k = i16s(256, 128);
+        let r = unsafe { dot64_2x2(q.as_ptr(), k.as_ptr()) };
+        let mut w = [0i32; 4];
+        for c in 0..64 {
+            w[0] = w[0].wrapping_add(q[c] as i32 * k[c] as i32);
+            w[1] = w[1].wrapping_add(q[c] as i32 * k[64 + c] as i32);
+            w[2] = w[2].wrapping_add(q[64 + c] as i32 * k[c] as i32);
+            w[3] = w[3].wrapping_add(q[64 + c] as i32 * k[64 + c] as i32);
+        }
+        if r != w {
+            bad |= 4;
+        }
+    }
+    // dot_pv_2x2 over 24 keys, rows ROW2 apart
+    {
+        let n8 = 3;
+        let p = i16s(512, ROW2 + n8 * 8);
+        let v = i16s(512 + 2 * (ROW2 + n8 * 8), ROW2 + n8 * 8);
+        let r = unsafe { dot_pv_2x2(p.as_ptr(), v.as_ptr(), n8) };
+        let mut w = [0i32; 4];
+        for j in 0..n8 * 8 {
+            w[0] = w[0].wrapping_add(p[j] as i32 * v[j] as i32);
+            w[1] = w[1].wrapping_add(p[j] as i32 * v[ROW2 + j] as i32);
+            w[2] = w[2].wrapping_add(p[ROW2 + j] as i32 * v[j] as i32);
+            w[3] = w[3].wrapping_add(p[ROW2 + j] as i32 * v[ROW2 + j] as i32);
+        }
+        if r != w {
+            bad |= 8;
+        }
+    }
+    // dot384_2rows: int16 rows at 0 and 384, vector after them
+    {
+        let rows = i16s(4096, 768);
+        let h = i16s(4096 + 1536, 384);
+        let r = unsafe { dot384_2rows(rows.as_ptr(), h.as_ptr()) };
+        let mut w = [0i32; 2];
+        for i in 0..384 {
+            w[0] = w[0].wrapping_add(rows[i] as i32 * h[i] as i32);
+            w[1] = w[1].wrapping_add(rows[384 + i] as i32 * h[i] as i32);
+        }
+        if r != w {
+            bad |= 16;
+        }
+    }
+    // dot384_2rows_i8: int8 rows, the vector in perm4 order
+    {
+        let rows = i8s(6144, 768);
+        let h = i16s(4096 + 1536, 384);
+        let r = unsafe { dot384_2rows_i8(rows.as_ptr(), h.as_ptr()) };
+        let mut w = [0i32; 2];
+        for c in 0..384 {
+            let hc = h[perm4(c)] as i32;
+            w[0] = w[0].wrapping_add(rows[c] as i32 * hc);
+            w[1] = w[1].wrapping_add(rows[384 + c] as i32 * hc);
+        }
+        if r != w {
+            bad |= 32;
+        }
+    }
+    // widen_i8_i16 with a three-element tail, into the scratch tail
+    {
+        let n = 259;
+        let src: [i8; 259] = core::array::from_fn(|i| i8s(6144, 768)[i]);
+        let mut dst = [0i16; 259];
+        widen_i8_i16(&src, &mut dst);
+        for i in 0..n {
+            if dst[i] != src[i] as i16 {
+                bad |= 64;
+            }
+        }
+    }
+    bad
 }

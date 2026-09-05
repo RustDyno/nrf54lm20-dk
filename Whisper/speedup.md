@@ -554,3 +554,56 @@ pumped from a timer interrupt would hide the projection and cross K/V
 head-block writes (~4 s). Decode is CPU-bound again: the 4-bit unpack
 (0.165 s) and the cross-attention transposition (0.14 s) are the next
 kernels, then batched positions.
+
+## 13. 2026-09-04: speed pass 6, build profile, layouts, int8 LM head, pumped writes, kernel order
+
+Mock rig, JFK clip, ctx 582, 23 tokens (25 decoder passes), same-session
+baseline of the pass-5 firmware. Every row: transcript identical,
+mock_diff.py 0 of 5480 scratch blocks differ (cross K compared under its
+new block transposition), per-step hidden vectors and token ids
+identical. Wall times from the sd[phase] timestamps, "total" the
+firmware's processing time from the end of the clip.
+
+| change (cumulative) | encoder | cross | decode | /step | total |
+|---|---|---|---|---|---|
+| baseline (pass 5, opt-level s) | 39.0 s | 2.8 s | 26.0 s | 1.040 s | 67.9 s |
+| 1. opt-level 3, both profiles | 38.3 | 2.5 | 22.6 | 0.903 | 63.4 |
+| 2. cross K stored key-major, decode widens instead of transposing | 38.4 | 2.5 | 22.2 | 0.889 | 63.1 |
+| 3. int8 LM-head rows (embc8), SXTB16 dot kernel | 38.2 | 2.5 | 19.1 | 0.765 | 59.9 |
+| 4. head-block writes pumped from the NPU wait (projections, cross K/V) | 38.2 | 2.3 | 19.2 | 0.767 | 59.6 |
+| 5a. dev profile without overflow checks / debug assertions | 36.4 | 2.2 | 18.7 | 0.748 | 57.3 |
+| 5b. loads grouped in the 2x2 kernels, exact softmax restructure | 32.9 | 2.2 | 18.3 | 0.732 | 53.2 |
+
+Where the encoder attention went (cpu[encoder] split, new this pass):
+21.2 s = QK 6.5 + softmax 7.5 + PV 6.9 at the start; 16.7 s = QK 4.8 +
+softmax 6.3 + PV 5.4 at the end. QK runs at 1.18 cycles per MAC (was
+1.6), PV at 1.31 (was 1.7): the M33 issues consecutive loads one per
+cycle after the first, so a step that loads its four operand words and
+then does its four SMLADs beats the interleaved order the kernels had.
+Softmax is now the largest term at ~99 cycles per key: two float passes
+(exp with a degree-7 polynomial, then the quantization) over 8.1 M keys
+per utterance. Decode attention 2.90 -> 2.30 s per utterance; of what is
+left, ~1.2 s is widening K and V to int16 for the kernels.
+
+Item 3 is the one numeric change: the int8 rows are the pre-4-bit
+embedding, closer to the f32 model than the 4-bit-coded rows the LM head
+used since pass 4. lm16_check.py --int8: 0/24 argmax flips against the
+int8-row f32-hidden head, transcript equal to the 4-bit head's; on the
+rig the best logits moved by up to 1.07 (of ~25) and no token changed.
+The image carries both entries; the firmware prefers embc8 (LM_ROWS_INT8)
+and falls back to embc4.
+
+What the rig cannot show: item 4 hides writes that cost the rig 0.5 s and
+the stick ~3.5 s (projection head blocks 2.9 MB, cross K/V 1.7 MB, at
+~2.7 ms of command overhead plus 2 MB/s); item 3 is read-bound on the
+rig (4.7 MB per token at ~22 MB/s) and should be ~0.08 s per step better
+than embc4 on the 28 MB/s stick. Also found: the rig built the dev
+profile with overflow checks on (release never had them), so earlier rig
+CPU numbers were inflated by ~5 percent against the stick's.
+
+Remaining levers, in order: the softmax passes (interleave two keys so
+the FPU chains overlap, ~99 -> ~60 cycles per key would be ~2.5 s); int8
+K/V variants of the 2x2 kernels for decode (removes the ~1.2 s of
+widening per utterance); 4x2 register blocking of QK/PV (~10 percent of
+10 s); the residual/layernorm passes (5.7 MB of synchronous writes, still
+nothing to hide them under); speculative decode positions (large).

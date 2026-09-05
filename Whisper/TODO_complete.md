@@ -189,3 +189,30 @@ rebuilt (embc4 replaces embp4; old cards need a re-dd).
   37.5 s, decode 0.80 s/step, end of speech to transcript 62.6 s; the
   silence stop worked live (2.0 s tail). First-read budget raised to
   2 s and the index read retried (the stick timed out its first read).
+
+## 2026-09-04: speed pass 6
+
+- Cargo profiles: opt-level 3 (was "s") in dev and release; dev without
+  overflow checks and debug assertions so the mock rig measures what
+  the release stick build runs.
+- cross_kv writes the K head blocks key-major (one CPU transposition per
+  block per utterance); decode widens them linearly (prepare_kt_from,
+  dsp::widen_i8_i16 on SXTB16/PKH). mock_diff.py --xk-t compares the
+  region under the transposition.
+- LM head: "embc8" image entry (int8 rows, 49 blocks per 64-row chunk)
+  next to embc4; firmware prefers it (LM_ROWS_INT8); dsp::dot384_2rows_i8
+  widens rows in registers, hidden vector in perm4 order. Gate
+  lm16_check.py --int8: 0/24 flips, transcripts equal.
+- Encoder q/k/v projections and cross K/V as tile pipelines: tile i-1's
+  six head-block writes drain behind tile i's NPU run through an IoQueue
+  pumped from the Axon wait loop (platform::set_wait_hook); inputs
+  alternate in A_IN, outputs in the idle KV cache.
+- dsp.rs: loads grouped ahead of the SMLADs in dot64_2x2, dot_pv_2x2,
+  dot384_2rows; kernels.rs softmax_row with an integer row max and the
+  *256 folded into the reciprocal (attncheck 0 bytes moved); no twin-row
+  softmax for a lone query.
+- cpu[phase] lines show attn (qk, softmax, pv) and npu; dsp::selftest at
+  boot checks every asm body against a scalar evaluation on target.
+- Rig (JFK clip, ctx 582): processing 67.9 -> 53.2 s, encoder 39.0 ->
+  32.9 s, decode 1.04 -> 0.73 s/step; every scratch region, hidden
+  vector and token id identical to the baseline (speedup.md 13).

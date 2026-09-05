@@ -8,7 +8,7 @@
 //! `nrf_axon_process_driver_event()` directly on bare metal).
 
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use crate::bindings;
 
@@ -180,6 +180,15 @@ pub extern "C" fn nrf_axon_platform_generate_user_event() {
     USER_EVENT.store(true, Ordering::SeqCst);
 }
 
+/// Called on every turn of the inference wait loop below (thread mode,
+/// between the interrupt-status polls): the storage pipelines use it to
+/// keep their transfer queue moving while the NPU runs.
+static WAIT_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_wait_hook(f: Option<fn()>) {
+    WAIT_HOOK.store(f.map_or(0, |f| f as usize), Ordering::SeqCst);
+}
+
 #[no_mangle]
 pub extern "C" fn nrf_axon_platform_wait_for_user_event() {
     // Model inference blocks in NRF_AXON_SYNC_MODE_BLOCKING_EVENT
@@ -202,6 +211,12 @@ pub extern "C" fn nrf_axon_platform_wait_for_user_event() {
         cortex_m::interrupt::free(|_| unsafe {
             bindings::nrf_axon_handle_interrupt();
         });
+        let hook = WAIT_HOOK.load(Ordering::Relaxed);
+        if hook != 0 {
+            // SAFETY: stored from a `fn()` by set_wait_hook.
+            let f: fn() = unsafe { core::mem::transmute(hook) };
+            f();
+        }
     }
 }
 

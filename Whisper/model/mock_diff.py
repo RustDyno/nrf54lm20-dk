@@ -5,7 +5,12 @@ same scratch behind wherever the arithmetic is unchanged. This reports,
 per scratch region, how many 512-byte blocks and bytes differ, so a
 kernel rewrite that claims bit-exactness can be held to it on silicon.
 
-    pixi run python mock_diff.py before.img after.img
+    pixi run python mock_diff.py before.img after.img [--xk-t]
+
+--xk-t: the second image stores the cross K head blocks key-major
+([64 keys][64 channels] per 4 KB block, firmware from 2026-09-05 on);
+they are transposed back to the first image's channel-major layout
+before comparing, so the check stays element for element.
 """
 
 import struct
@@ -48,12 +53,24 @@ def region(path, base, off, blocks):
         return np.frombuffer(f.read(blocks * BLOCK), np.uint8)
 
 
+def untranspose_xk(buf):
+    """Cross K head blocks of a key-major image back to channel-major."""
+    v = buf.copy().reshape(8, 480 * BLOCK)
+    for l in range(4):
+        blk = v[l * 2].reshape(-1, 64, 64)
+        v[l * 2] = blk.transpose(0, 2, 1).reshape(-1)
+    return v.reshape(-1)
+
+
 def main():
-    a, b = sys.argv[1], sys.argv[2]
+    xk_t = "--xk-t" in sys.argv
+    a, b = [x for x in sys.argv[1:] if not x.startswith("--")][:2]
     sa, sb = scratch_lba(a), scratch_lba(b)
     print(f"scratch at block {sa} / {sb}")
     for name, off, blocks in REGIONS:
         ra, rb = region(a, sa, off, blocks), region(b, sb, off, blocks)
+        if name == "xkv" and xk_t:
+            rb = untranspose_xk(rb)
         if len(ra) != len(rb):
             print(f"{name:8s}: size mismatch")
             continue

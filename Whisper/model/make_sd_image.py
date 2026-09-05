@@ -84,6 +84,29 @@ def build_vocab(sd, ref, suppress, tok):
     }, len(kept)
 
 
+def pack_emb8(q, scl, ids):
+    """int8 [n, 384] pruned embedding + f32 row scales + u32 ids -> "embc8"
+    entry: 64-row chunks of [scales][ids][rows], 49 blocks each (firmware
+    app.rs lm_head mirrors the layout). The same rows the 4-bit chunks
+    are coded from, uncoded: twice the read per token, no nibble unpack.
+    The firmware prefers this entry when present."""
+    n = q.shape[0]
+    rows = -(-n // 64) * 64
+    qp = np.zeros((rows, 384), np.int8)
+    qp[:n] = q
+    sp = np.zeros(rows, "<f4")
+    sp[:n] = scl
+    ip = np.zeros(rows, "<u4")
+    ip[:n] = ids
+    out = bytearray()
+    for c in range(rows // 64):
+        sl = slice(c * 64, (c + 1) * 64)
+        part = sp[sl].tobytes() + ip[sl].tobytes() + qp[sl].tobytes()
+        assert len(part) == 49 * BLOCK
+        out += part
+    return bytes(out)
+
+
 def encoder_assets(sd, scales, mq_enc, conv1, conv2):
     """LN params, GELU LUTs, tile-major positional encoding, mel tables."""
     a = {}
@@ -247,6 +270,11 @@ def main():
                            np.frombuffer(vocab["embpids"], "<u4"))
     entries.append(("embc4", embc))
     saved += len(vocab["embp"]) - len(embc)  # embp kept for host tooling
+    # int8 rows alongside (EMB_INT8=0 leaves them out for a slow stick)
+    if os.environ.get("EMB_INT8", "1") != "0":
+        entries.append(("embc8", pack_emb8(
+            emb_q, np.frombuffer(vocab["embpscl"], "<f4"),
+            np.frombuffer(vocab["embpids"], "<u4"))))
     print(f"q4: {packed_n} decoder blobs + embc4 packed, "
           f"{saved / 1e6:.1f} MB less SD traffic per token cycle")
 

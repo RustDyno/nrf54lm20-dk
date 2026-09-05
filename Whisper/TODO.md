@@ -107,12 +107,26 @@ mic, ctx 531: encoder 37.5 s (8.4 s of write-dominated stall), decode
 silence stop worked live (recording tail 2.0 s). Decode is CPU-bound
 again; the encoder's remaining storage term is the synchronous writes.
 
-Next on this stick: a timer-interrupt pump so several small writes can
-queue behind one NPU run (projection and cross K/V head blocks, ~4 s);
-decode kernels (4-bit unpack 0.165 s/step, cross-attention transposition
-0.14 s/step); batched positions. The blob reloads (fc1/fc2p alternate
-every tile: 53 MB of the encoder's 83 MB of reads) are inherent to the
-tile order that keeps writes small and cost ~2.5 s at 28 MB/s.
+## 7. DONE 2026-09-04: speed pass 6 (rig 67.9 -> 53.2 s, bit-exact)
+
+opt-level 3 in both profiles and no overflow checks in dev; cross K
+written key-major once in cross_kv; int8 LM-head rows ("embc8", gated
+by lm16_check.py --int8); head-block writes pumped from the NPU wait
+loop; loads grouped in the 2x2 kernels; exact softmax restructure;
+attention qk/softmax/pv split and NPU time in the cpu[] lines; on-target
+self-test of the asm primitives at boot. Numbers in speedup.md 13,
+design in NOTES.md, summary in TODO_complete.md.
+
+Not measured on the stick yet (rig hides them): the pumped writes
+(~3.5 s there) and the int8 head (~0.08 s/step there). The stick image
+needs a re-dd for embc8; the firmware falls back to embc4 without it.
+
+Next levers (speedup.md 13): softmax passes interleaved two keys at a
+time (~2.5 s), int8 K/V decode kernels (~1.2 s), 4x2 blocking of QK/PV
+(~1 s), speculative decode positions (large). The blob reloads (fc1/fc2p
+alternate every tile: 53 MB of the encoder's 83 MB of reads) are
+inherent to the tile order that keeps writes small and cost ~2.5 s at
+28 MB/s.
 
 ## 1. Application-class SD card (zero code)
 
@@ -204,7 +218,3 @@ is make_sd_image-side only -- but it needs its own quality gate first
 (full-pipeline simulate.py transcript with patched encoder tflites),
 since quant4_check.py only gated the decoder. Encoder reads ~27 MB per
 utterance; packing would cut ~8 MB of that.
-
-# Model
-
-Swap to Moonshine Tiny, Vosk Small Models, Next-Gen Kaldi / Sherpa-ONNX Zipformer, NVIDIA NeMo FastConformer-CTC Tiny?

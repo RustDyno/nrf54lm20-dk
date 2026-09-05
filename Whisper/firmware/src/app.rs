@@ -58,7 +58,7 @@ const S_VH: u32 = 5952;
 const S_CH: u32 = 6464;
 const S_P: u32 = 6976; // fc2 partials, 4 x 480
 const S_EO: u32 = 8960; // encoder output tiles, 480
-const S_XKV: u32 = 9472; // cross K/V head blocks, 8 x 480 (l*2 + [k|v])
+const S_XKV: u32 = 9472; // cross K/V head blocks, 8 x 480 (l*2 + [k|v]); K key-major
 
 // --- arena layout -------------------------------------------------------------
 // Encoder phase: A_IN holds the largest assembled input (conv2: 49920 B).
@@ -196,6 +196,17 @@ fn prepare_kv_from(stage: &[i8], tk: usize) {
     kt[tk * HD..tkp * HD].fill(0);
 }
 
+/// Transposed keys for one head whose tile blocks are already key-major
+/// ([tile][64 keys][64 channels] int8, the layout cross_kv writes): the
+/// staged blocks read as [key][64] end to end, so this is one linear
+/// widening into SL_KT.
+fn prepare_kt_from(stage: &[i8], tk: usize) {
+    let tkp = kernels::keys_padded(tk);
+    let kt = slot_i16(SL_KT, kernels::KV16_LEN);
+    dsp::widen_i8_i16(&stage[..tk * HD], &mut kt[..tk * HD]);
+    kt[tk * HD..tkp * HD].fill(0);
+}
+
 /// Widened values for one head, same staging: int16 [64][MAX_KEYS] in
 /// SL_V16, columns tk..tkp zero.
 fn prepare_v_from(stage: &[i8], tk: usize) {
@@ -205,13 +216,19 @@ fn prepare_v_from(stage: &[i8], tk: usize) {
         let row = &mut v16[ch * kernels::MAX_KEYS..ch * kernels::MAX_KEYS + tkp];
         for i in 0..tk.div_ceil(T) {
             let take = T.min(tk - i * T);
-            let src = &stage[i * HB + ch * T..i * HB + ch * T + take];
-            let dst = &mut row[i * T..i * T + take];
-            for (d, &x) in dst.iter_mut().zip(src) {
-                *d = x as i16;
-            }
+            dsp::widen_i8_i16(&stage[i * HB + ch * T..i * HB + ch * T + take],
+                              &mut row[i * T..i * T + take]);
         }
         row[tk..].fill(0);
+    }
+}
+
+/// One 64x64 int8 head block transposed: [row][col] -> [col][row].
+fn transpose64(src: &[i8], dst: &mut [i8]) {
+    for r in 0..T {
+        for (c, &x) in src[r * T..(r + 1) * T].iter().enumerate() {
+            dst[c * T + r] = x;
+        }
     }
 }
 
@@ -220,7 +237,8 @@ const P_ATTN: usize = 0;
 const P_LM: usize = 1;
 const P_UNPACK: usize = 2;
 const P_SUM: usize = 3;
-static mut PROF: [u64; 4] = [0; 4];
+const P_NPU: usize = 4;
+static mut PROF: [u64; 5] = [0; 5];
 
 fn cycles() -> u32 {
     cortex_m::peripheral::DWT::cycle_count()
@@ -557,7 +575,23 @@ impl Ctxt {
     /// NPU run.
     fn run_loaded(&mut self, blob: &str, input: u32, output: u32) -> i32 {
         let _wd = crate::WdogGuard::arm();
-        unsafe { slot::run(input, output, blob) }
+        let t0 = cycles();
+        let rc = unsafe { slot::run(input, output, blob) };
+        prof_add(P_NPU, t0);
+        rc
+    }
+
+    /// `run_loaded` with a transfer queue pumped from the inference wait
+    /// loop, so several small transfers (a tile's six head-block writes)
+    /// complete behind one NPU run. The queue's error, if any, surfaces
+    /// at its next pump or drain.
+    fn run_pumped(&mut self, blob: &str, input: u32, output: u32, q: &mut IoQueue) -> i32 {
+        unsafe { PUMP_Q = q as *mut IoQueue };
+        crate::platform::set_wait_hook(Some(pump_hook));
+        let rc = self.run_loaded(blob, input, output);
+        crate::platform::set_wait_hook(None);
+        unsafe { PUMP_Q = core::ptr::null_mut() };
+        rc
     }
 
     /// Blob into the slot (cached by address, sum-verified, LAY4 expanded).
@@ -630,7 +664,21 @@ struct IoQueue {
     rc: i32,
 }
 
-const IOQ_MAX: usize = 4;
+const IOQ_MAX: usize = 8;
+
+/// The queue `run_pumped` is advancing, for the wait-loop hook.
+static mut PUMP_Q: *mut IoQueue = core::ptr::null_mut();
+
+fn pump_hook() {
+    // SAFETY: set for the duration of one run_pumped call, whose queue
+    // outlives it; the hook runs in thread mode inside that call.
+    unsafe {
+        let q = PUMP_Q;
+        if !q.is_null() {
+            let _ = (*q).pump();
+        }
+    }
+}
 
 impl IoQueue {
     const fn new() -> IoQueue {
@@ -819,6 +867,16 @@ pub fn run() -> ! {
         rprintln!("standalone: storage init (host image over USB device mode)");
     } else {
         rprintln!("standalone: storage init (USB stick, {} tries)", storage::USB_TRIES);
+    }
+    // the DSP-extension kernels against their scalar definitions (the
+    // arena is free this early)
+    let bad = dsp::selftest(arena(0, 8192));
+    if bad == 0 {
+        rprintln!("standalone: dsp kernels self-test ok");
+    } else {
+        rprintln!("standalone: DSP KERNEL SELF-TEST FAILED (mask {:#x}); results will be wrong",
+                  bad);
+        display::print("DSP SELFTEST FAIL\n");
     }
     let rc = storage::init();
     if rc != 0 {
@@ -1066,11 +1124,15 @@ fn sd_stats(phase: &str) {
         "sd[{}]: rd {} KB / {} ms, wr {} KB / {} ms",
         phase, rb / 1024, rc / 128_000, wb / 1024, wc / 128_000
     );
-    let p = unsafe { core::mem::replace(&mut *core::ptr::addr_of_mut!(PROF), [0; 4]) };
+    let p = unsafe { core::mem::replace(&mut *core::ptr::addr_of_mut!(PROF), [0; 5]) };
+    let a = unsafe {
+        core::mem::replace(&mut *core::ptr::addr_of_mut!(kernels::ATTN_PROF), [0; 3])
+    };
     rprintln!(
-        "cpu[{}]: attn {} ms, lm {} ms, unpack {} ms, sums {} ms",
-        phase, p[P_ATTN] / 128_000, p[P_LM] / 128_000, p[P_UNPACK] / 128_000,
-        p[P_SUM] / 128_000
+        "cpu[{}]: attn {} ms (qk {}, softmax {}, pv {}), lm {} ms, unpack {} ms, \
+         sums {} ms, npu {} ms",
+        phase, p[P_ATTN] / 128_000, a[0] / 128_000, a[1] / 128_000, a[2] / 128_000,
+        p[P_LM] / 128_000, p[P_UNPACK] / 128_000, p[P_SUM] / 128_000, p[P_NPU] / 128_000
     );
 }
 
@@ -1657,15 +1719,34 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         ln_region(c, Name::of(&["e", DIGITS[l], "ln1_gb"]).s(), sq, bq.ln1)?;
         crate::crumb(0x521 + (l as u32) * 0x10);
         for (kind, reg) in [("q", S_QH), ("k", S_KH), ("v", S_VH)] {
+            // Tile pipeline: tile i-1's six head-block writes drain behind
+            // tile i's NPU run (queue pumped from the inference wait), so
+            // the input and output buffers alternate: inputs in the two
+            // halves of A_IN, outputs in A_OUT and the idle KV cache.
             let nm = enc_blob(l, kind, 0);
+            let mut ioq = IoQueue::new();
+            try_rc!(c.load(nm.s()), "proj load");
+            try_rc!(c.read(S_LN, 0, A_IN, TILE8), "proj in");
             for i in 0..c.tiles {
-                try_rc!(c.read(S_LN, i * TILE8, A_IN, TILE8), "proj in");
-                try_rc!(c.npu(nm.s(), A_IN, A_OUT), "proj");
-                for h in 0..HEADS {
-                    try_rc!(c.write(reg, (h * N_TILES + i) * HB,
-                                    A_OUT + h * HB, HB), "hb wr");
+                let x = if i % 2 == 0 { A_IN } else { A_IN + TILE8 };
+                let (oaddr, out): (u32, &[u8]) = if i % 2 == 0 {
+                    (arena_addr(A_OUT), arena(A_OUT, TILE8))
+                } else {
+                    (kvscratch_addr(KV_PO), kvscratch(KV_PO, TILE8))
+                };
+                try_rc!(c.run_pumped(nm.s(), arena_addr(x), oaddr, &mut ioq), "proj");
+                ioq.drain()?;
+                if i + 1 < c.tiles {
+                    let xn = if i % 2 == 0 { A_IN + TILE8 } else { A_IN };
+                    try_rc!(c.read(S_LN, (i + 1) * TILE8, xn, TILE8), "proj in");
                 }
+                for h in 0..HEADS {
+                    ioq.push(false, c.lba(reg, (h * N_TILES + i) * HB),
+                             &out[h * HB..(h + 1) * HB], "hb wr");
+                }
+                ioq.pump()?;
             }
+            ioq.drain()?;
         }
         // attention: a head's K, V and Q tile blocks are contiguous in
         // their regions, so each is one read; keys/values go transposed
@@ -1839,24 +1920,66 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
 #[inline(never)]
 fn cross_kv(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     crate::crumb(0x571);
+    // enc.out quant != the submodels' input quant: requantize (the lesson
+    // that once garbled the transcript)
+    let requant = |c: &Ctxt, i: usize, x: usize| -> Result<(), i32> {
+        try_rc!(c.read(S_EO, i * TILE8, x, TILE8), "eo rd");
+        for b in as_i8_mut(x, TILE8) {
+            let f = (*b as i32 - plan.enc_out.zp) as f32 * plan.enc_out.scale;
+            *b = quant8(f, plan.xk_in);
+        }
+        Ok(())
+    };
     for l in 0..BLOCKS {
         for (which, kind) in [(0u32, "xk"), (1u32, "xv")] {
+            // Same tile pipeline as the encoder projections: tile i-1's
+            // head-block writes drain behind tile i's NPU run. Inputs
+            // alternate in the halves of A_IN, outputs and the transposed
+            // key blocks in the idle KV cache.
             let nm = dec_blob(l, kind, 0);
+            let reg = S_XKV + (l as u32 * 2 + which) * HREG_BLOCKS;
+            let mut ioq = IoQueue::new();
+            try_rc!(c.load(nm.s()), "xkv load");
+            requant(c, 0, A_IN)?;
             for i in 0..c.tiles {
-                try_rc!(c.read(S_EO, i * TILE8, A_IN, TILE8), "eo rd");
-                // enc.out quant != the submodels' input quant: requantize
-                // (the lesson that once garbled the transcript)
-                for b in as_i8_mut(A_IN, TILE8) {
-                    let f = (*b as i32 - plan.enc_out.zp) as f32 * plan.enc_out.scale;
-                    *b = quant8(f, plan.xk_in);
+                let (x, o, t) = if i % 2 == 0 {
+                    (A_IN, KV_XO0, KV_XT0)
+                } else {
+                    (A_IN + TILE8, KV_XO1, KV_XT1)
+                };
+                try_rc!(c.run_pumped(nm.s(), arena_addr(x), kvscratch_addr(o), &mut ioq),
+                        "xkv");
+                ioq.drain()?;
+                if i + 1 < c.tiles {
+                    requant(c, i + 1, if i % 2 == 0 { A_IN + TILE8 } else { A_IN })?;
                 }
-                try_rc!(c.npu(nm.s(), A_IN, A_OUT), "xkv");
+                // Keys go out key-major ([64 keys][64 channels] per head
+                // block) so decode widens them straight into the attention
+                // kernel's layout instead of transposing every head on
+                // every token. Values keep the NPU's channel-major layout.
+                let src = if which == 0 {
+                    for h in 0..HEADS {
+                        let blk = kvscratch(o + h * HB, HB);
+                        let blk = unsafe {
+                            core::slice::from_raw_parts(blk.as_ptr() as *const i8, HB)
+                        };
+                        let dst = kvscratch(t + h * HB, HB);
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut i8, HB)
+                        };
+                        transpose64(blk, dst);
+                    }
+                    t
+                } else {
+                    o
+                };
                 for h in 0..HEADS {
-                    try_rc!(c.write(S_XKV + (l as u32 * 2 + which) * HREG_BLOCKS,
-                                    (h * N_TILES + i) * HB, A_OUT + h * HB, HB),
-                            "xkv wr");
+                    ioq.push(false, c.lba(reg, (h * N_TILES + i) * HB),
+                             kvscratch(src + h * HB, HB), "xkv wr");
                 }
+                ioq.pump()?;
             }
+            ioq.drain()?;
         }
     }
     Ok(())
@@ -1903,6 +2026,15 @@ const _: () = assert!(A_X1 + TILE8 <= A_OUT);
 const KV_P0: usize = 0;
 const KV_P1: usize = TILE8;
 const _: () = assert!(KV_P1 + TILE8 <= KV_BYTES);
+// projection pipeline: odd tiles' NPU output
+const KV_PO: usize = 0;
+// cross K/V pipeline: NPU output per parity, then the transposed K blocks
+const KV_XO0: usize = 0;
+const KV_XO1: usize = TILE8;
+const KV_XT0: usize = 2 * TILE8;
+const KV_XT1: usize = 3 * TILE8;
+const _: () = assert!(KV_XT1 + TILE8 <= KV_BYTES);
+const _: () = assert!(2 * TILE8 <= A_OUT); // two input tiles in A_IN
 
 // Token-rate arena (decode phase): [384,4] tensors.
 const W4: usize = 4;
@@ -1949,7 +2081,8 @@ fn sd_read_bytes(e: Entry, byte_off: usize, dst: &mut [u8]) -> i32 {
 #[inline(never)]
 fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     let embf = lookup("embf").ok_or(-901)?;
-    let embc = lookup("embc4").ok_or(-901)?; // LM-head chunks (2026-09 image)
+    let embc4 = lookup("embc4").ok_or(-901)?; // LM-head chunks (2026-09 image)
+    let embc8 = if LM_ROWS_INT8 { lookup("embc8") } else { None };
     let ids = lookup("embpids").ok_or(-901)?;
     let posd = lookup("posdec").ok_or(-901)?;
     let vtb = lookup("vocabtb").ok_or(-901)?;
@@ -1960,7 +2093,9 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
             m.fill(0);
         }
     }
-    crate::q4::tables16(lut16_tables());
+    if embc8.is_none() {
+        crate::q4::tables16(lut16_tables());
+    }
     let mut n_tok = 0usize; // cache length
     let mut token = plan.sot[0];
     let mut next_sot = 1usize;
@@ -2037,7 +2172,7 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
             // each head's K and V tile blocks: one read each, K staged in
             // the slot (idle between dxq and dxout) and V in the arena's
             // LM-head rows, so the next read runs while the previous
-            // blocks are transposed/widened and the head computes
+            // blocks are widened and the head computes
             let stage = c.tiles * HB;
             c.loaded = Entry::default();
             let kreg = S_XKV + (l as u32 * 2) * HREG_BLOCKS;
@@ -2047,7 +2182,7 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
             for h in 0..HEADS {
                 io_start(true, c.lba(vreg, h * N_TILES * HB), arena(D_ROWS, stage), "xv rd")?;
                 let t0 = cycles();
-                prepare_kv_from(slot_i8(SL_STAGE, stage), c.ctx);
+                prepare_kt_from(slot_i8(SL_STAGE, stage), c.ctx);
                 prof_add(P_ATTN, t0);
                 io_wait("xv rd")?;
                 if h + 1 < HEADS {
@@ -2137,7 +2272,7 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         let out_idx = step - (plan.n_sot - 1);
         rprintln!("hid[0,1,2,383] {:.4} {:.4} {:.4} {:.4}",
                   hid[0], hid[1], hid[2], hid[C - 1]);
-        let best = lm_head(plan, embc, &hid, out_idx == 0)?;
+        let best = lm_head(plan, embc4, embc8, &hid, out_idx == 0)?;
         rprintln!("tok id {}", best);
         if best == plan.eot {
             print_detected(&transcript, tlen);
@@ -2175,65 +2310,98 @@ fn dec_add(x16: usize, qa: Quant, b8: usize, qb: Quant, qd: Quant) {
     kernels::add_i16_i8(a, qa, as_i8(b8, C * W4), qb, dst, qd);
 }
 
+/// Prefer the int8 LM-head rows ("embc8") when the image carries them:
+/// no nibble unpack, at twice the read (4.7 MB per token). Pays on a
+/// stick reading 20 MB/s or more; below that the 4-bit chunks win.
+const LM_ROWS_INT8: bool = true;
+
 /// Argmax over the pruned embedding, streamed in 64-row chunks.
 ///
-/// Each "embc4" chunk is one read: the rows' f32 scales and token ids,
-/// then the 4-bit weights (group amax + nibbles), which are expanded to
-/// int16 and dotted on SMLAD with the hidden vector quantized to a
-/// per-utterance int16 grid (gate: model/lm16_check.py, zero argmax
-/// flips on the golden decode). Pad rows carry scale 0 and input-only
-/// rows (SOT etc) scale -1: both skipped.
+/// Each chunk is one read: the rows' f32 scales and token ids, then the
+/// weights. "embc4" carries them 4-bit (group amax + nibbles), expanded
+/// to int16 and dotted on SMLAD; "embc8" carries the int8 rows, widened
+/// in registers by the SXTB16 kernel (dsp::dot384_2rows_i8, which takes
+/// the hidden vector with the middle two of every four columns swapped).
+/// The hidden vector is quantized to a per-utterance int16 grid (gate:
+/// model/lm16_check.py, zero argmax flips on the golden decode for both
+/// row formats). Pad rows carry scale 0 and input-only rows (SOT etc)
+/// scale -1: both skipped.
 ///
 /// (An exact bound-sorted early exit was measured and rejected: Whisper
 /// LM-head cosines are so small that even the loosest row's Cauchy-Schwarz
 /// bound sits ~3x above the best logit -- 0 of 12228 rows prunable.)
-fn lm_head(plan: &Plan, embc: Entry, hid: &[f32; C], first: bool) -> Result<u32, i32> {
+fn lm_head(plan: &Plan, embc4: Entry, embc8: Option<Entry>, hid: &[f32; C],
+           first: bool) -> Result<u32, i32> {
     const ROWS: usize = 64;
     const CH_SCL: usize = 0; // f32[64]
     const CH_IDS: usize = ROWS * 4; // u32[64]
+    // 4-bit chunk: group amax bytes, then the nibbles
     const CH_AMAX: usize = 2 * ROWS * 4; // u8[64 * 6]
     const CH_NIBS: usize = CH_AMAX + ROWS * C / crate::q4::G;
-    const CH_USED: usize = CH_NIBS + ROWS * C / 2;
-    const CH_BLOCKS: usize = CH_USED.div_ceil(storage::BLOCK);
-    const _: () = assert!(CH_BLOCKS == crate::q4::EMB_CHUNK_BLOCKS);
+    const CH4_USED: usize = CH_NIBS + ROWS * C / 2;
+    const CH4_BLOCKS: usize = CH4_USED.div_ceil(storage::BLOCK);
+    const _: () = assert!(CH4_BLOCKS == crate::q4::EMB_CHUNK_BLOCKS);
+    // int8 chunk: the rows themselves
+    const CH_ROWS: usize = 2 * ROWS * 4; // i8[64][384]
+    const CH8_BLOCKS: usize = (CH_ROWS + ROWS * C) / storage::BLOCK;
+    const _: () = assert!((CH_ROWS + ROWS * C) % storage::BLOCK == 0 && CH8_BLOCKS == 49);
+    // packed chunks alternate between two interlayer buffers (transient
+    // use between NPU runs): chunk i+1 streams in while chunk i is
+    // unpacked and dotted
+    const _: () = assert!(2 * CH8_BLOCKS * storage::BLOCK <= crate::INTERLAYER_BUFFER_BYTES);
+
+    let (embc, ch_blocks) = match embc8 {
+        Some(e) => (e, CH8_BLOCKS),
+        None => (embc4, CH4_BLOCKS),
+    };
+    let int8 = embc8.is_some();
+    let ch_bytes = ch_blocks * storage::BLOCK;
 
     let mut hmax = 0f32;
     for &h in hid.iter() {
         hmax = hmax.max(libm::fabsf(h));
     }
     let hs = if hmax > 0.0 { hmax / 32767.0 } else { 1.0 };
-    let mut hq = [0i16; C];
-    for (q, &h) in hq.iter_mut().zip(hid.iter()) {
-        *q = dsp::round_i32(h / hs).clamp(-32767, 32767) as i16;
+    // word-aligned for the kernels' paired loads
+    #[repr(C, align(4))]
+    struct Hq([i16; C]);
+    let mut hq = Hq([0i16; C]);
+    for (i, &h) in hid.iter().enumerate() {
+        let at = if int8 { dsp::perm4(i) } else { i };
+        hq.0[at] = dsp::round_i32(h / hs).clamp(-32767, 32767) as i16;
     }
 
     let mut best = f32::MIN;
     let mut best2 = f32::MIN;
     let mut best_id = plan.eot;
     let rows16 = as_i16_mut(D_ROWS, ROWS * C);
-    // packed chunks alternate between two interlayer buffers (transient
-    // use between NPU runs): chunk i+1 streams in while chunk i is
-    // unpacked and dotted
-    const CH_BYTES: usize = CH_BLOCKS * storage::BLOCK;
-    const _: () = assert!(2 * CH_BYTES <= crate::INTERLAYER_BUFFER_BYTES);
     let n_chunks = plan.vocab_n.div_ceil(ROWS);
-    io_start(true, embc.lba, interlayer_at(0, CH_BYTES), "embc rd")?;
+    io_start(true, embc.lba, interlayer_at(0, ch_bytes), "embc rd")?;
     for chunk in 0..n_chunks {
         io_wait("embc rd")?;
         if chunk + 1 < n_chunks {
-            io_start(true, embc.lba + ((chunk + 1) * CH_BLOCKS) as u32,
-                     interlayer_at(((chunk + 1) % 2) * CH_BYTES, CH_BYTES), "embc rd")?;
+            io_start(true, embc.lba + ((chunk + 1) * ch_blocks) as u32,
+                     interlayer_at(((chunk + 1) % 2) * ch_bytes, ch_bytes), "embc rd")?;
         }
-        let il = interlayer_at((chunk % 2) * CH_BYTES, CH_BYTES);
-        let t0 = cycles();
-        crate::q4::unpack16(lut16_tables(), &il[CH_AMAX..CH_NIBS], &il[CH_NIBS..CH_USED],
-                            rows16);
-        prof_add(P_UNPACK, t0);
+        let il = interlayer_at((chunk % 2) * ch_bytes, ch_bytes);
+        if !int8 {
+            let t0 = cycles();
+            crate::q4::unpack16(lut16_tables(), &il[CH_AMAX..CH_NIBS], &il[CH_NIBS..CH4_USED],
+                                rows16);
+            prof_add(P_UNPACK, t0);
+        }
         let t0 = cycles();
         let n = ROWS.min(plan.vocab_n - chunk * ROWS);
         let mut r = 0;
         while r < ROWS {
-            let d = unsafe { dsp::dot384_2rows(rows16.as_ptr().add(r * C), hq.as_ptr()) };
+            let d = unsafe {
+                if int8 {
+                    dsp::dot384_2rows_i8(il.as_ptr().add(CH_ROWS + r * C) as *const i8,
+                                         hq.0.as_ptr())
+                } else {
+                    dsp::dot384_2rows(rows16.as_ptr().add(r * C), hq.0.as_ptr())
+                }
+            };
             for k in 0..2 {
                 let row = r + k;
                 let s = f32::from_le_bytes(

@@ -303,6 +303,35 @@ pub fn logits_max(acc: &[i32], mults: &[f32], idx: &[u32], state: &mut ArgmaxSta
 pub const HD64: usize = 64;
 const _: () = assert!(MAX_KEYS == dsp::ROW2);
 
+/// Cycle split of `attn_head_kt` (QK dots, softmax rows, PV dots and
+/// context quantization); the firmware prints it next to the attention
+/// total and resets it. Host builds count nothing.
+pub static mut ATTN_PROF: [u64; 3] = [0; 3];
+
+#[inline(always)]
+fn cyc() -> u32 {
+    #[cfg(target_arch = "arm")]
+    {
+        cortex_m::peripheral::DWT::cycle_count()
+    }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        0
+    }
+}
+
+#[inline(always)]
+fn prof(i: usize, t0: u32) {
+    #[cfg(target_arch = "arm")]
+    unsafe {
+        ATTN_PROF[i] += cyc().wrapping_sub(t0) as u64;
+    }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        let _ = (i, t0);
+    }
+}
+
 /// Working buffers for `attn_head_kt`: two queries at a time (~13 KB).
 /// The p16 rows sit exactly ROW2 elements apart, which the 2x2 kernel
 /// bakes in as its second-row offset. Parked in the idle interlayer.
@@ -400,6 +429,7 @@ pub fn attn_head_kt<E: Fn(f32) -> f32>(
             qsum[0] += a;
             qsum[1] += b;
         }
+        let t0 = cyc();
         let mut j = 0;
         while j < tkp {
             let r = unsafe {
@@ -411,12 +441,19 @@ pub fn attn_head_kt<E: Fn(f32) -> f32>(
             s.acc[1][j + 1] = r[3];
             j += 2;
         }
+        prof(0, t0);
+        let t0 = cyc();
+        // a lone query's twin row is the same query: its softmax is
+        // skipped (the PV kernel still reads the row, whose contents are
+        // then irrelevant because the twin's results are not stored)
         let mut psum = [0i32; 2];
-        for row in 0..2 {
+        for row in 0..(if two { 2 } else { 1 }) {
             let (acc, scores, p16) = (&s.acc[row], &mut s.scores[row], &mut s.p16[row]);
             psum[row] = softmax_row(&acc[..tk], zk * qsum[row], score_mult,
                                     &mut scores[..tk], p16, tkp, &exp);
         }
+        prof(1, t0);
+        let t0 = cyc();
         let vcorr = [zv * psum[0], zv * psum[1]];
         let mut c = 0;
         while c < HD64 {
@@ -433,6 +470,7 @@ pub fn attn_head_kt<E: Fn(f32) -> f32>(
             }
             c += 2;
         }
+        prof(2, t0);
         qi += 2;
     }
 }
@@ -451,23 +489,28 @@ fn softmax_row<E: Fn(f32) -> f32>(
     exp: &E,
 ) -> i32 {
     let tk = acc.len();
-    let mut max = f32::MIN;
-    for (s, &a) in scores.iter_mut().zip(acc) {
-        *s = (a - corr) as f32 * mult;
-        if *s > max {
-            max = *s;
+    // The row maximum is an integer maximum: the conversion to f32 and
+    // the positive multiplier are both monotonic, so this is the value a
+    // pass over the float scores would find, without storing them.
+    let mut amax = i32::MIN;
+    for &a in acc {
+        if a > amax {
+            amax = a;
         }
     }
+    let max = (amax - corr) as f32 * mult;
     let mut sum = 0.0f32;
-    for s in scores.iter_mut() {
-        *s = exp(*s - max);
+    for (s, &a) in scores.iter_mut().zip(acc) {
+        *s = exp((a - corr) as f32 * mult - max);
         sum += *s;
     }
-    let inv = 1.0 / sum;
+    // PROBS.q8(s * inv) + 128, with the /(1/256) as an exact *256: the
+    // power-of-two scaling commutes with the rounding of s * inv, so
+    // folding it into the reciprocal quantizes identically.
+    let inv256 = (1.0 / sum) * 256.0;
     let mut psum = 0i32;
     for (p, &s) in p16[..tk].iter_mut().zip(scores.iter()) {
-        // PROBS.q8(s * inv) + 128, with the /(1/256) as an exact *256
-        let pv = (dsp::round_i32(s * inv * 256.0) - 128).clamp(-128, 127) + 128;
+        let pv = (dsp::round_i32(s * inv256) - 128).clamp(-128, 127) + 128;
         *p = pv as i16;
         psum += pv;
     }
