@@ -615,3 +615,63 @@ exponential for the softmax (gated: attncheck byte moves, transcript
 parity; up to ~3 s); the residual/layernorm passes (5.7 MB of
 synchronous writes, still nothing to hide them under); speculative
 decode positions (large).
+
+## 14. 2026-09-05: speed pass 7, table softmax, int8 decode attention, paired MLP tiles
+
+Mock rig, JFK clip, ctx 582, 25 decoder passes, same-session baseline of
+the pass-6 firmware. Every row: transcript identical, mock_diff.py 0 of
+5480 scratch blocks differ, per-step hidden vectors and token ids
+identical. Wall times from the sd[phase] timestamps, "total" the
+firmware's processing time from the end of the clip.
+
+| change (cumulative) | encoder | cross | decode | /step | total |
+|---|---|---|---|---|---|
+| baseline (pass 6) | 32.8 s | 2.3 s | 18.3 s | 0.733 s | 53.4 s |
+| 1. softmax exp as an integer-indexed table (encoder) | 29.2 | 2.3 | 18.3 | 0.733 | 50.0 (est.) |
+| 2. int8 K/V decode attention kernels, ~45 fewer small reads per token | 29.2 | 2.3 | 17.0 | 0.682 | 48.6 |
+| 3. byte-sum 32 bytes per iteration | 29.2 | 2.3 | 17.1 | 0.683 | 48.7 |
+| 4. encoder MLP tiles paired per blob load | 28.1 | 2.4 | 17.1 | 0.683 | 47.6 |
+
+(Row 1 was measured together with row 2 in one run; its encoder column
+is exact, the total is the baseline minus the encoder difference.)
+
+Encoder CPU split (cpu[encoder]): attention 16.7 -> 13.1 s (QK 4.8 ->
+4.9, softmax 6.3 -> 2.5, PV 5.4 -> 5.4), NPU 9.8 s unchanged, byte-sums
+0.30 -> 0.14 s, storage stall 3.2 -> 2.5 s with the reads down from 83
+to 57 MB (the fc1/fc2p reloads halved). Decode CPU: attention 2.30 ->
+0.98 s (the K/V widening and the twin-query waste gone), LM head 2.0 s,
+byte-sums 1.15 -> 0.99 s, NPU 2.32 s; storage stall 9.8 -> 10.1 s (less
+CPU to hide the reads behind). The new "validate" figure in the cpu[]
+line is 0 ms: the 1.66 ms per width-4 decode run is the driver's
+inference path and the engine, not the model validation.
+
+Numerics: the table softmax is a different evaluation of the same
+function (each value within ~1.5 ulp of the true exponential of the
+exact integer deficit, where the golden's float path rounds its
+argument first). attncheck moved 0 of 64000 context bytes over five
+score multipliers spanning the image's, and the rig's encoder output is
+bit-identical, so on this clip it is not a numeric change at all; a
+1-LSB probability flip on another clip would be absorbed like the fast
+exponential's were. Everything else in the pass is a reordering.
+
+Found on the way: with `+vfp2` (needed for the asm's FPU operands) LLVM
+compiles f64 to double-precision VFP instructions the M33 does not have;
+the first table build hard-faulted as an undefined instruction.
+`-fp64` in the target features fixes it for good (NOTES.md, skill).
+
+What the rig cannot show: the ~45 small reads per token now gone cost
+the stick ~2.7 ms each (~3 s per utterance); the 26 MB of blob reloads
+now gone cost it ~1 s. Both unmeasured there; the stick image needs a
+re-dd for the "dc" entries (the firmware falls back without them) and,
+still, for embc8.
+
+Remaining levers, in order: the decode blob stream (9.3 MB/token, 0.4 s
+of the 0.68 s step on the rig: 4-bit decoder blobs at G=32 with a
+word-wise int8 expansion, regated on several clips, ~3 s; or batched
+positions); the decode LM head reads (4.7 MB/token int8 rows, hidden
+behind their dots only partly); the encoder attention kernels at ~1.2
+cycles per MAC (a 2x3 blocking with remainder handling, ~1 s; or the QK
+and PV matmuls as NPU blobs with the keys/values as runtime-patched
+weights, several seconds but the int8 requantized scores need a gate);
+the encoder's residual/layernorm passes (IO-bound on the stick, ~1.5 s
+of CPU that a tile pipeline could hide).

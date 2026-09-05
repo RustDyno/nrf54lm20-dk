@@ -22,6 +22,10 @@ struct SlotHeader {
     model: *const bindings::nrf_axon_nn_compiled_model_s,
 }
 
+/// Cycles spent in the driver's model validation, for the phase profile
+/// (a fixed cost per run that the decode's 1400 tiny runs pay too).
+pub static mut VALIDATE_CYCLES: u64 = 0;
+
 /// Validate and run the blob currently in the slot. `input`/`output` are
 /// absolute arena addresses (0 = the model's own interlayer locations, per
 /// the driver's NULL contract).
@@ -34,7 +38,9 @@ pub unsafe fn run(input: u32, output: u32, name: &str) -> i32 {
     if (model as usize) < SLOT_BASE || (model as usize) >= SLOT_BASE + SLOT_BYTES {
         return -102;
     }
+    let t0 = cortex_m::peripheral::DWT::cycle_count();
     let rc = bindings::nrf_axon_nn_model_validate(model);
+    VALIDATE_CYCLES += cortex_m::peripheral::DWT::cycle_count().wrapping_sub(t0) as u64;
     rtt_target::rprintln!("npu {}: validate rc={} infer...", name, rc.0);
     if rc.0 != 0 {
         return rc.0;

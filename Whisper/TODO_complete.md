@@ -216,3 +216,30 @@ rebuilt (embc4 replaces embp4; old cards need a re-dd).
 - Rig (JFK clip, ctx 582): processing 67.9 -> 53.2 s, encoder 39.0 ->
   32.9 s, decode 1.04 -> 0.73 s/step; every scratch region, hidden
   vector and token id identical to the baseline (speedup.md 13).
+
+## 2026-09-05: speed pass 7
+
+- kernels.rs: SoftmaxExp trait (ExpFn, ExpTable); ExpTable is the
+  encoder's softmax exponential, exp(-mult d) = lo[d mod 1024] *
+  hi[d / 1024] for the integer deficit d, built in f64 per encoder
+  block in the slot's free top (SL_EXPTAB). attncheck: 0 bytes moved.
+- kernels::attn_head_x1_i8 + dsp::dot64_q1k4_i8 / dot_pv_q1v4_i8: one
+  query against int8 key-major keys and tile-major values, widened in
+  registers (SXTB16), perm4-ordered query and probability row. Decode
+  cross-attention uses it; prepare_kt_from and the per-head widening
+  are gone. attncheck: bit-identical to the golden over 10 key counts.
+- Decode small reads: lm_head returns (id, kept position); vocabulary
+  string count read once; "dc<l>" image entries (make_sd_image.py: ln1,
+  xln, ln2 gamma/beta + 4 GELU tables per layer) read once per layer
+  per token into D_DC; fallback to the individual entries.
+- dsp::byte_sum: LDM of eight words + eight USADA8 into two accumulators
+  per 32 bytes; unaligned input takes the byte loop; self-test cases.
+- Encoder MLP: tiles in pairs per blob load (fc1 x2, then fc2p x2; the
+  second fc1 output in KV_F1), partial writes and input reads queued
+  behind the NPU runs. Ctxt::asset prints the missing entry's name.
+- slot::run times nrf_axon_nn_model_validate separately (0 ms).
+- .cargo/config.toml: `-C target-feature=+vfp2,+dsp,-fp64` (f64 was
+  compiling to double-precision VFP instructions: HardFault UNDEFINSTR).
+- Rig (JFK clip, ctx 582): processing 53.4 -> 47.6 s, encoder 32.8 ->
+  28.1 s, decode 0.733 -> 0.683 s/step; every scratch region, hidden
+  vector and token id identical to the baseline (speedup.md 14).

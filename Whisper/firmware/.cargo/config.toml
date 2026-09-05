@@ -6,7 +6,7 @@ target = "thumbv8m.main-none-eabihf"
 # cortex-m-rt provides link.x; memory.x is emitted to OUT_DIR by build.rs
 # +dsp/+vfp2: let inline asm use SMLAD/USADA8 and FPU registers (src/dsp.rs);
 # the M33 has both but the generic thumbv8m.main target declares neither.
-rustflags = ["-C", "link-arg=-Tlink.x", "-C", "target-feature=+vfp2,+dsp"]
+rustflags = ["-C", "link-arg=-Tlink.x", "-C", "target-feature=+vfp2,+dsp,-fp64"]
 # probe-rs ships no nRF54LM20B target, so we supply one (cloned from its A
 # definition, which is what physically flashes this DK). See targets/.
 runner = "probe-rs run --disable-double-buffering --chip nRF54LM20B --chip-description-path targets/nRF54LM20B.yaml"

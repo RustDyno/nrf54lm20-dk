@@ -6,8 +6,9 @@
 //!   libm::expf) against a direct transliteration of the numpy golden
 //!   (tape.py attn_golden) over decode/cross/encoder shapes: 0 bytes may
 //!   differ.
-//! - attn_head_kt with the fast exponential: reports how many context
-//!   bytes move (expected: a handful of 1-LSB cases at most).
+//! - attn_head_kt with the fast exponential, and with the integer-indexed
+//!   exponential table the encoder uses: reports how many context bytes
+//!   move (expected: a handful of 1-LSB cases at most).
 //! - dsp::exp_neg vs libm::expf over a dense sweep of the softmax domain.
 //! - q4::unpack16 vs q4::unpack, dsp::byte_sum vs a byte loop.
 
@@ -20,7 +21,8 @@ mod kernels;
 #[path = "../../../firmware/src/q4.rs"]
 mod q4;
 
-use kernels::{AttnKv, AttnScratch, AttnScratch2, Quant, KV16_LEN, MAX_KEYS, PROBS};
+use kernels::{AttnKv, AttnScratch, AttnScratch2, ExpFn, ExpTable, Quant, EXP_HI, EXP_LO,
+              KV16_LEN, MAX_KEYS, PROBS};
 
 /// tape.py attn_golden, one head, transliterated (i64 like numpy).
 #[allow(clippy::too_many_arguments)]
@@ -111,27 +113,34 @@ fn check_attention() -> bool {
     });
     let mut kt = vec![0i16; KV16_LEN];
     let mut v16 = vec![0i16; KV16_LEN];
+    let mut tab = Box::new(ExpTable { lo: [0.0; EXP_LO], hi: [0.0; EXP_HI], mult: 0.0 });
     let mut worst_old = 0usize;
     let mut worst_kt = 0usize;
     let mut fast_total = 0usize;
     let mut fast_bytes = 0usize;
     let mut fast_maxdiff = 0i32;
+    let mut tab_total = 0usize;
+    let mut tab_maxdiff = 0i32;
     let mut r = Lcg(0xa77);
+    // score multipliers spanning the image's attention sites (q k scales
+    // 0.03..0.12, / 8) plus the harness's old fixed value
+    let mults = [0.25f32 * 0.11 / 8.0, 4.26e-4, 7.9e-4, 9.5e-4, 1.4e-3];
     for (case, &(wq, qs, tk, ks)) in shapes.iter().enumerate() {
-        for rep in 0..3 {
+        for rep in 0..5 {
             let q = r.i8v(hd * qs);
             let k = r.i8v(hd * ks);
             let v = r.i8v(hd * ks);
             let (zq, zk, zv) = ((r.next() % 11) as i32 - 5,
                                 (r.next() % 11) as i32 - 5,
                                 (r.next() % 11) as i32 - 5);
-            let sm = 0.25f32 * 0.11 / 8.0;
+            let sm = mults[rep];
             let vs = 0.17f32;
             let cq = Quant { scale: 0.06, zp: 3 };
             let mut a = vec![0i8; hd * qs];
             let mut b = vec![0i8; hd * qs];
             let mut c = vec![0i8; hd * qs];
             let mut d = vec![0i8; hd * qs];
+            let mut e = vec![0i8; hd * qs];
             kernels::attn_head(&q, &k, &v, &mut a, hd, wq, qs, tk, ks,
                                zq, zk, zv, sm, vs, cq, &mut scratch);
             golden(&q, &k, &v, &mut b, hd, wq, qs, tk, ks,
@@ -140,31 +149,119 @@ fn check_attention() -> bool {
             kernels::attn_prepare_v16(|ch, j| v[ch * ks + j], tk, &mut v16);
             let kv = AttnKv { kt: &kt, v16: &v16, tk };
             kernels::attn_head_kt(&q, &kv, &mut c, wq, qs, zq, zk, zv, sm, vs, cq,
-                                  &mut s2, libm::expf);
+                                  &mut s2, &ExpFn(libm::expf));
             kernels::attn_head_kt(&q, &kv, &mut d, wq, qs, zq, zk, zv, sm, vs, cq,
-                                  &mut s2, dsp::exp_neg);
+                                  &mut s2, &ExpFn(dsp::exp_neg));
+            tab.build(sm);
+            kernels::attn_head_kt(&q, &kv, &mut e, wq, qs, zq, zk, zv, sm, vs, cq,
+                                  &mut s2, &*tab);
             let diff_old = a.iter().zip(&b).filter(|(x, y)| x != y).count();
             let diff_kt = c.iter().zip(&b).filter(|(x, y)| x != y).count();
             let diff_fast = d.iter().zip(&b).filter(|(x, y)| x != y).count();
+            let diff_tab = e.iter().zip(&b).filter(|(x, y)| x != y).count();
             let maxd = d.iter().zip(&b).map(|(x, y)| (*x as i32 - *y as i32).abs())
+                .max().unwrap_or(0);
+            let maxt = e.iter().zip(&b).map(|(x, y)| (*x as i32 - *y as i32).abs())
                 .max().unwrap_or(0);
             worst_old = worst_old.max(diff_old);
             worst_kt = worst_kt.max(diff_kt);
             fast_total += diff_fast;
             fast_bytes += hd * wq;
             fast_maxdiff = fast_maxdiff.max(maxd);
+            tab_total += diff_tab;
+            tab_maxdiff = tab_maxdiff.max(maxt);
             if diff_old != 0 || diff_kt != 0 {
                 println!("case {case} rep {rep} (wq={wq} tk={tk} ks={ks}): \
                           scalar {diff_old}, kt {diff_kt} bytes differ");
             }
         }
     }
+    // the decode cross-attention form: one query, int8 keys key-major,
+    // int8 values tile-major, must match the golden exactly with expf
+    let mut worst_x1 = 0usize;
+    for &tk in &[1usize, 5, 8, 63, 64, 65, 192, 582, 600, 640] {
+        for rep in 0..3 {
+            let tkp = kernels::keys_padded(tk);
+            let tiles = tk.div_ceil(64);
+            let ks = 640;
+            let q = r.i8v(hd * 4);
+            let k = r.i8v(hd * ks);
+            let v = r.i8v(hd * ks);
+            let (zq, zk, zv) = ((r.next() % 11) as i32 - 5,
+                                (r.next() % 11) as i32 - 5,
+                                (r.next() % 11) as i32 - 5);
+            let sm = mults[rep];
+            let vs = 0.17f32;
+            let cq = Quant { scale: 0.06, zp: 3 };
+            let mut kk = vec![0i8; tkp.max(tiles * 64) * hd];
+            for j in 0..tk {
+                for ch in 0..hd {
+                    kk[j * hd + ch] = k[ch * ks + j];
+                }
+            }
+            let mut vt = vec![0i8; tiles * hd * 64];
+            for ch in 0..hd {
+                for j in 0..tk {
+                    vt[(j / 64) * hd * 64 + ch * 64 + j % 64] = v[ch * ks + j];
+                }
+            }
+            let mut b = vec![0i8; hd * 4];
+            let mut e = vec![0i8; hd * 4];
+            golden(&q, &k, &v, &mut b, hd, 1, 4, tk, ks, zq, zk, zv, sm, vs, cq);
+            kernels::attn_head_x1_i8(&q, &kk, &vt, tk, &mut e, 4, zq, zk, zv, sm, vs, cq,
+                                     &mut s2, &ExpFn(libm::expf));
+            let diff = e.iter().zip(&b).filter(|(x, y)| x != y).count();
+            if diff != 0 {
+                println!("x1_i8 tk={tk} rep {rep}: {diff} bytes differ");
+            }
+            worst_x1 = worst_x1.max(diff);
+        }
+    }
+    println!("attention, one query on int8 K/V layouts: worst {worst_x1} \
+              mismatching ctx bytes vs the golden (0 = bit-identical)");
+    worst_kt = worst_kt.max(worst_x1);
     let _ = PROBS;
     println!("attention: scalar worst {worst_old}, SMLAD-shaped worst {worst_kt} \
               mismatching ctx bytes vs the golden (0 = bit-identical)");
     println!("attention with fast exp: {fast_total}/{fast_bytes} ctx bytes moved, \
               max |diff| {fast_maxdiff} LSB");
-    worst_old == 0 && worst_kt == 0 && fast_maxdiff <= 1
+    println!("attention with the exp table: {tab_total}/{fast_bytes} ctx bytes moved, \
+              max |diff| {tab_maxdiff} LSB");
+    worst_old == 0 && worst_kt == 0 && fast_maxdiff <= 1 && tab_maxdiff <= 1
+}
+
+/// The table against the true exponential (f64) and against libm::expf
+/// of the f32 argument over the deficits an attention row can produce.
+fn check_exp_table() -> bool {
+    let mut tab = Box::new(ExpTable { lo: [0.0; EXP_LO], hi: [0.0; EXP_HI], mult: 0.0 });
+    let mut worst_true = 0u32;
+    let mut worst_libm = 0u32;
+    let mut ok = true;
+    for &mult in &[4.26e-4f32, 7.9e-4, 1.4e-3, 3.0e-3] {
+        tab.build(mult);
+        if tab.eval(0) != 1.0 {
+            ok = false;
+        }
+        for d in (0u32..300_000).step_by(7) {
+            let x = -(mult as f64) * d as f64;
+            let e = tab.eval(d);
+            if x < -87.0 {
+                // the flush point sits at a `hi` step (mult * 1024) below
+                // -87; values in between are denormal-range and harmless
+                if e != 0.0 && x < -87.0 - (mult as f64) * EXP_LO as f64 {
+                    ok = false;
+                }
+                continue;
+            }
+            let t = libm::exp(x) as f32;
+            worst_true = worst_true.max(ulp_dist(e, t));
+            let xf = -(mult * d as f32);
+            worst_libm = worst_libm.max(ulp_dist(e, libm::expf(xf)));
+        }
+    }
+    println!("exp table vs f64 exp: max {worst_true} ulp; vs libm::expf of the f32 \
+              argument: max {worst_libm} ulp; flush past -87: {ok}");
+    ok && worst_true <= 3
 }
 
 fn check_exp() -> bool {
@@ -245,8 +342,9 @@ fn check_q4_and_sum() -> bool {
 fn main() {
     let a = check_attention();
     let e = check_exp();
+    let t = check_exp_table();
     let q = check_q4_and_sum();
-    if a && e && q {
+    if a && e && t && q {
         println!("attncheck: all checks passed");
     } else {
         println!("attncheck: FAILED");

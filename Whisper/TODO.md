@@ -129,6 +129,27 @@ alternate every tile: 53 MB of the encoder's 83 MB of reads) are
 inherent to the tile order that keeps writes small and cost ~2.5 s at
 28 MB/s.
 
+## 8. DONE 2026-09-05: speed pass 7 (rig 53.4 -> 47.6 s, bit-exact)
+
+Softmax exponential as an integer-indexed table in the encoder
+(kernels::ExpTable, 6.3 -> 2.5 s); decode cross-attention on int8 K/V in
+their storage layouts (attn_head_x1_i8, 2.3 -> 1.0 s); ~45 fewer small
+storage reads per token (LM head returns the kept position, per-layer
+constant bundles "dc<l>" in the image); byte-sum at 32 bytes per
+iteration; encoder MLP tiles paired per blob load (reads 83 -> 57 MB).
+Numbers in speedup.md 14, design in NOTES.md, summary in
+TODO_complete.md. Build fix: `-fp64` in the target features (f64 was
+compiling to double-precision VFP instructions that fault).
+
+Not measured on the stick: the small-read savings (~3 s there), the
+halved blob reloads (~1 s). The stick image needs a re-dd (dc entries,
+embc8).
+
+Next levers (speedup.md 14): the 9.3 MB/token decode blob stream (4-bit
+at G=32 with a word-wise expansion, regated; or batched positions), the
+LM head reads, encoder attention at ~1.2 cycles/MAC (2x3 blocking or
+NPU-side QK/PV), the residual/layernorm passes on the stick.
+
 ## 1. Application-class SD card (zero code)
 
 Reads run at 3.3 MB/s everywhere, but writes crawl at 103-278 KB/s

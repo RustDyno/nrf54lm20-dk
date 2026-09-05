@@ -48,48 +48,60 @@ pub fn round_i32(x: f32) -> i32 {
 }
 
 /// Wrapping u32 sum of all bytes (the image's per-entry integrity sum).
+///
+/// 32 bytes per iteration: one LDM of eight words (the loads pipeline
+/// one per cycle), eight USADA8 into two accumulators, so a 166 KB blob
+/// sums in ~0.6 cycles per byte. Unaligned input takes the byte loop.
 pub fn byte_sum(b: &[u8]) -> u32 {
     let mut s = 0u32;
-    let n16 = b.len() / 16;
+    let n32 = if b.as_ptr() as usize % 4 == 0 { b.len() / 32 } else { 0 };
     #[cfg(target_arch = "arm")]
     {
-        if n16 > 0 {
+        if n32 > 0 {
             let mut p = b.as_ptr();
-            let mut n = n16;
+            let mut n = n32;
+            let mut s2 = 0u32;
             unsafe {
                 core::arch::asm!(
                     "1:",
-                    "ldr {w0}, [{p}], #4",
-                    "ldr {w1}, [{p}], #4",
-                    "ldr {w2}, [{p}], #4",
-                    "ldr {w3}, [{p}], #4",
+                    "ldmia {p}!, {{{w0}, {w1}, {w2}, {w3}, {w4}, {w5}, {w6}, {w7}}}",
                     "usada8 {s}, {w0}, {z}, {s}",
-                    "usada8 {s}, {w1}, {z}, {s}",
+                    "usada8 {s2}, {w1}, {z}, {s2}",
                     "usada8 {s}, {w2}, {z}, {s}",
-                    "usada8 {s}, {w3}, {z}, {s}",
+                    "usada8 {s2}, {w3}, {z}, {s2}",
+                    "usada8 {s}, {w4}, {z}, {s}",
+                    "usada8 {s2}, {w5}, {z}, {s2}",
+                    "usada8 {s}, {w6}, {z}, {s}",
+                    "usada8 {s2}, {w7}, {z}, {s2}",
                     "subs {n}, {n}, #1",
                     "bne 1b",
                     p = inout(reg) p,
                     n = inout(reg) n,
                     s = inout(reg) s,
+                    s2 = inout(reg) s2,
                     z = in(reg) 0u32,
                     w0 = out(reg) _,
                     w1 = out(reg) _,
                     w2 = out(reg) _,
                     w3 = out(reg) _,
+                    w4 = out(reg) _,
+                    w5 = out(reg) _,
+                    w6 = out(reg) _,
+                    w7 = out(reg) _,
                     options(readonly, nostack),
                 );
             }
+            s = s.wrapping_add(s2);
             let _ = (p, n);
         }
     }
     #[cfg(not(target_arch = "arm"))]
     {
-        for &x in &b[..n16 * 16] {
+        for &x in &b[..n32 * 32] {
             s = s.wrapping_add(x as u32);
         }
     }
-    for &x in &b[n16 * 16..] {
+    for &x in &b[n32 * 32..] {
         s = s.wrapping_add(x as u32);
     }
     s
@@ -477,6 +489,173 @@ pub fn perm4(c: usize) -> usize {
     (c & !3) | ((c & 1) << 1) | ((c >> 1) & 1)
 }
 
+/// One int16 query (64 elements in `perm4` order) against four
+/// consecutive int8 key rows of 64: [q.k0, q.k1, q.k2, q.k3].
+///
+/// The key words are widened in registers with SXTB16 (even bytes, then
+/// the odd bytes after a rotate), which is why the query is permuted:
+/// each key word then meets the two query pairs it belongs with. 21
+/// instructions per four columns of four keys.
+///
+/// # Safety
+/// `q` readable for 64 i16 and 4-byte aligned; `k` readable for 256
+/// bytes and 4-byte aligned.
+#[inline(always)]
+pub unsafe fn dot64_q1k4_i8(q: *const i16, k: *const i8) -> [i32; 4] {
+    #[cfg(target_arch = "arm")]
+    {
+        // one step = four columns; rows 1..3 sit 64, 128, 192 bytes past
+        // row 0 (60, 124, 188 after the post-increment)
+        macro_rules! row {
+            ($w:tt, $a:tt) => {
+                concat!(
+                    "sxtb16 {t}, {", $w, "}\n",
+                    "smlad {", $a, "}, {t}, {qa}, {", $a, "}\n",
+                    "sxtb16 {t}, {", $w, "}, ror #8\n",
+                    "smlad {", $a, "}, {t}, {qb}, {", $a, "}\n",
+                )
+            };
+        }
+        macro_rules! step {
+            () => {
+                concat!(
+                    "ldrd {qa}, {qb}, [{q}], #8\n",
+                    "ldr {w0}, [{k}], #4\n",
+                    "ldr {w1}, [{k}, #60]\n",
+                    row!("w0", "a0"),
+                    row!("w1", "a1"),
+                    "ldr {w0}, [{k}, #124]\n",
+                    "ldr {w1}, [{k}, #188]\n",
+                    row!("w0", "a2"),
+                    row!("w1", "a3"),
+                )
+            };
+        }
+        macro_rules! rep4 {
+            ($s:expr) => {
+                concat!($s, $s, $s, $s)
+            };
+        }
+        let (mut a0, mut a1, mut a2, mut a3) = (0i32, 0i32, 0i32, 0i32);
+        let mut qp = q;
+        let mut kp = k;
+        core::arch::asm!(
+            rep4!(step!()),
+            rep4!(step!()),
+            rep4!(step!()),
+            rep4!(step!()),
+            q = inout(reg) qp,
+            k = inout(reg) kp,
+            a0 = inout(reg) a0,
+            a1 = inout(reg) a1,
+            a2 = inout(reg) a2,
+            a3 = inout(reg) a3,
+            qa = out(reg) _,
+            qb = out(reg) _,
+            w0 = out(reg) _,
+            w1 = out(reg) _,
+            t = out(reg) _,
+            options(pure, readonly, nostack),
+        );
+        let _ = (qp, kp);
+        [a0, a1, a2, a3]
+    }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        let q = core::slice::from_raw_parts(q, 64);
+        let k = core::slice::from_raw_parts(k, 256);
+        let mut a = [0i32; 4];
+        for r in 0..4 {
+            for c in 0..64 {
+                a[r] = a[r].wrapping_add(k[r * 64 + c] as i32 * q[perm4(c)] as i32);
+            }
+        }
+        a
+    }
+}
+
+/// One int16 probability row (`n8 * 8` keys in `perm4` order) against
+/// four int8 value rows 64 bytes apart: `acc[r] + p . v_r`.
+///
+/// The value rows are a tile's channel rows ([64 channels][64 keys]
+/// int8), so a full row of keys is accumulated tile by tile through
+/// `acc`. `n8` must be >= 1 and <= 8.
+///
+/// # Safety
+/// `p` readable for n8 * 8 i16 and 4-byte aligned; `v` readable for
+/// 192 + n8 * 8 bytes and 4-byte aligned.
+#[inline(always)]
+pub unsafe fn dot_pv_q1v4_i8(p: *const i16, v: *const i8, n8: usize, acc: [i32; 4]) -> [i32; 4] {
+    debug_assert!((1..=8).contains(&n8));
+    #[cfg(target_arch = "arm")]
+    {
+        macro_rules! row {
+            ($w:tt, $a:tt) => {
+                concat!(
+                    "sxtb16 {t}, {", $w, "}\n",
+                    "smlad {", $a, "}, {t}, {pa}, {", $a, "}\n",
+                    "sxtb16 {t}, {", $w, "}, ror #8\n",
+                    "smlad {", $a, "}, {t}, {pb}, {", $a, "}\n",
+                )
+            };
+        }
+        macro_rules! step {
+            () => {
+                concat!(
+                    "ldrd {pa}, {pb}, [{p}], #8\n",
+                    "ldr {w0}, [{v}], #4\n",
+                    "ldr {w1}, [{v}, #60]\n",
+                    row!("w0", "a0"),
+                    row!("w1", "a1"),
+                    "ldr {w0}, [{v}, #124]\n",
+                    "ldr {w1}, [{v}, #188]\n",
+                    row!("w0", "a2"),
+                    row!("w1", "a3"),
+                )
+            };
+        }
+        let [mut a0, mut a1, mut a2, mut a3] = acc;
+        let mut pp = p;
+        let mut vp = v;
+        let mut n = n8;
+        core::arch::asm!(
+            "1:",
+            step!(),
+            step!(),
+            "subs {n}, {n}, #1",
+            "bne 1b",
+            p = inout(reg) pp,
+            v = inout(reg) vp,
+            n = inout(reg) n,
+            a0 = inout(reg) a0,
+            a1 = inout(reg) a1,
+            a2 = inout(reg) a2,
+            a3 = inout(reg) a3,
+            pa = out(reg) _,
+            pb = out(reg) _,
+            w0 = out(reg) _,
+            w1 = out(reg) _,
+            t = out(reg) _,
+            options(pure, readonly, nostack),
+        );
+        let _ = (pp, vp, n);
+        [a0, a1, a2, a3]
+    }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        let n = n8 * 8;
+        let p = core::slice::from_raw_parts(p, n);
+        let v = core::slice::from_raw_parts(v, 192 + n);
+        let mut a = acc;
+        for r in 0..4 {
+            for j in 0..n {
+                a[r] = a[r].wrapping_add(p[perm4(j)] as i32 * v[r * 64 + j] as i32);
+            }
+        }
+        a
+    }
+}
+
 /// On-target check of every asm body against a scalar evaluation of the
 /// same definition, on pseudo-random data. The host comparators compile
 /// only the portable bodies, so this is what actually exercises the
@@ -507,12 +686,14 @@ pub fn selftest(scratch: &mut [u8]) -> u32 {
             bad |= 1;
         }
     }
-    // byte_sum with a tail that is not a multiple of 16
+    // byte_sum with a tail that is not a multiple of 32, aligned and not
     {
-        let b = &scratch[..1003];
-        let want = b.iter().fold(0u32, |a, &v| a.wrapping_add(v as u32));
-        if byte_sum(b) != want {
-            bad |= 2;
+        for &(off, n) in &[(0usize, 1003usize), (0, 32), (0, 31), (1, 1000), (4, 96)] {
+            let b = &scratch[off..off + n];
+            let want = b.iter().fold(0u32, |a, &v| a.wrapping_add(v as u32));
+            if byte_sum(b) != want {
+                bad |= 2;
+            }
         }
     }
     // dot64_2x2: q rows at 0 and 64, k rows at 0 and 64 (i16 each)
@@ -575,6 +756,37 @@ pub fn selftest(scratch: &mut [u8]) -> u32 {
         }
         if r != w {
             bad |= 32;
+        }
+    }
+    // dot64_q1k4_i8: permuted int16 query, four int8 key rows
+    {
+        let q = i16s(0, 64);
+        let k = i8s(6144, 256);
+        let r = unsafe { dot64_q1k4_i8(q.as_ptr(), k.as_ptr()) };
+        let mut w = [0i32; 4];
+        for rr in 0..4 {
+            for c in 0..64 {
+                w[rr] = w[rr].wrapping_add(k[rr * 64 + c] as i32 * q[perm4(c)] as i32);
+            }
+        }
+        if r != w {
+            bad |= 128;
+        }
+    }
+    // dot_pv_q1v4_i8 over 24 keys with a running accumulator
+    {
+        let n8 = 3;
+        let p = i16s(512, 24);
+        let v = i8s(6144, 192 + 24);
+        let r = unsafe { dot_pv_q1v4_i8(p.as_ptr(), v.as_ptr(), n8, [1, 2, 3, 4]) };
+        let mut w = [1i32, 2, 3, 4];
+        for rr in 0..4 {
+            for j in 0..24 {
+                w[rr] = w[rr].wrapping_add(p[perm4(j)] as i32 * v[rr * 64 + j] as i32);
+            }
+        }
+        if r != w {
+            bad |= 256;
         }
     }
     // widen_i8_i16 with a three-element tail, into the scratch tail

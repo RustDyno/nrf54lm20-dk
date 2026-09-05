@@ -127,7 +127,17 @@ fn interlayer_at(off: usize, len: usize) -> &'static mut [u8] {
 const SL_KT: usize = 0; // i16 [640][64], 81920 B
 const SL_V16: usize = SL_KT + 2 * kernels::KV16_LEN; // i16 [64][640], 81920 B
 const SL_STAGE: usize = SL_V16 + 2 * kernels::KV16_LEN; // one head's tile blocks
-const _: () = assert!(SL_STAGE + N_TILES * HB <= slot::SLOT_BYTES);
+// Softmax exponential table for the encoder's attention, above the
+// staging area: nothing else reaches this high in the slot (the largest
+// blob is 166 KB), so it survives the block's blob loads and is rebuilt
+// per block for that block's score multiplier.
+const SL_EXPTAB: usize = SL_STAGE + N_TILES * HB;
+// Decode cross-attention: two alternating stages of one head's key
+// blocks (int8, consumed as is), in the room of the encoder's widened
+// keys and values.
+const SL_XK: usize = 0;
+const _: () = assert!(SL_EXPTAB % 4 == 0);
+const _: () = assert!(SL_EXPTAB + kernels::EXP_TABLE_BYTES <= slot::SLOT_BYTES);
 // Interlayer buffer during CPU attention: the two-query scratch, then
 // the head's context tiles staged for a single write.
 const IL_SCRATCH2: usize = 0;
@@ -155,10 +165,18 @@ fn attn_scratch2() -> &'static mut kernels::AttnScratch2 {
     unsafe { &mut *(b.as_mut_ptr() as *mut kernels::AttnScratch2) }
 }
 
-/// Softmax exponential for the DSP attention kernels: `dsp::exp_neg` is
+fn exp_table() -> &'static mut kernels::ExpTable {
+    let b = slot_u8(SL_EXPTAB, kernels::EXP_TABLE_BYTES);
+    unsafe { &mut *(b.as_mut_ptr() as *mut kernels::ExpTable) }
+}
+
+/// Softmax exponential for the decode cross-attention: `dsp::exp_neg` is
 /// within ~2 ulp of libm::expf at about a third of the cost; `false`
 /// reproduces the numpy golden bit for bit (tools/attncheck reports what
-/// the fast one moves).
+/// the fast one moves). The encoder uses the integer-indexed table
+/// (kernels::ExpTable) instead: its ~1300-entry rebuild per score
+/// multiplier pays off over a block's 2 M keys, not over a decode
+/// layer's 3.5 K.
 const FAST_EXP: bool = true;
 
 #[inline(always)]
@@ -193,17 +211,6 @@ fn prepare_kv_from(stage: &[i8], tk: usize) {
             }
         }
     }
-    kt[tk * HD..tkp * HD].fill(0);
-}
-
-/// Transposed keys for one head whose tile blocks are already key-major
-/// ([tile][64 keys][64 channels] int8, the layout cross_kv writes): the
-/// staged blocks read as [key][64] end to end, so this is one linear
-/// widening into SL_KT.
-fn prepare_kt_from(stage: &[i8], tk: usize) {
-    let tkp = kernels::keys_padded(tk);
-    let kt = slot_i16(SL_KT, kernels::KV16_LEN);
-    dsp::widen_i8_i16(&stage[..tk * HD], &mut kt[..tk * HD]);
     kt[tk * HD..tkp * HD].fill(0);
 }
 
@@ -546,10 +553,17 @@ impl Ctxt {
 
     /// Load a whole named asset to an arena offset.
     fn asset(&self, name: &str, off: usize) -> Result<Entry, i32> {
-        let e = lookup(name).ok_or(-901)?;
+        let e = match lookup(name) {
+            Some(e) => e,
+            None => {
+                rprintln!("FAIL no asset {}", name);
+                return Err(-901);
+            }
+        };
         let rc = storage::read_blocks(e.lba, arena(off, 0).as_mut_ptr(),
                                  e.len.div_ceil(storage::BLOCK as u32));
         if rc != 0 {
+            rprintln!("FAIL asset {} rc={}", name, rc);
             return Err(rc);
         }
         Ok(e)
@@ -849,8 +863,12 @@ fn attn_scratch() -> &'static mut kernels::AttnScratch {
 }
 
 fn lut_apply(lut_off: usize, buf_off: usize, len: usize) {
+    lut_apply_to(lut_off, as_i8_mut(buf_off, len));
+}
+
+fn lut_apply_to(lut_off: usize, buf: &mut [i8]) {
     let lut: [i8; 256] = core::array::from_fn(|i| as_i8(lut_off, 256)[i]);
-    for b in as_i8_mut(buf_off, len) {
+    for b in buf {
         *b = lut[(*b as i32 + 128) as usize];
     }
 }
@@ -1128,11 +1146,13 @@ fn sd_stats(phase: &str) {
     let a = unsafe {
         core::mem::replace(&mut *core::ptr::addr_of_mut!(kernels::ATTN_PROF), [0; 3])
     };
+    let v = unsafe { core::mem::replace(&mut *core::ptr::addr_of_mut!(slot::VALIDATE_CYCLES), 0) };
     rprintln!(
         "cpu[{}]: attn {} ms (qk {}, softmax {}, pv {}), lm {} ms, unpack {} ms, \
-         sums {} ms, npu {} ms",
+         sums {} ms, npu {} ms (validate {})",
         phase, p[P_ATTN] / 128_000, a[0] / 128_000, a[1] / 128_000, a[2] / 128_000,
-        p[P_LM] / 128_000, p[P_UNPACK] / 128_000, p[P_SUM] / 128_000, p[P_NPU] / 128_000
+        p[P_LM] / 128_000, p[P_UNPACK] / 128_000, p[P_SUM] / 128_000, p[P_NPU] / 128_000,
+        v / 128_000
     );
 }
 
@@ -1757,6 +1777,9 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         let sm = bq.q_out.scale * bq.k_out.scale / 8.0;
         let stage = c.tiles * HB;
         c.loaded = Entry::default();
+        let t0 = cycles();
+        exp_table().build(sm);
+        prof_add(P_ATTN, t0);
         let mut ioq = IoQueue::new();
         ioq.push(true, c.lba(S_KH, 0), arena(A_PK, stage), "k rd");
         ioq.push(true, c.lba(S_VH, 0), arena(A_PV, stage), "v rd");
@@ -1804,7 +1827,7 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
                     kernels::attn_head_kt(
                         &q[q0..], &kv, &mut ctx[q0..], QSTEP, T,
                         bq.q_out.zp, bq.k_out.zp, bq.v_out.zp,
-                        sm, bq.v_out.scale, bq.ctx, attn_scratch2(), softmax_exp,
+                        sm, bq.v_out.scale, bq.ctx, attn_scratch2(), &*exp_table(),
                     );
                     ioq.pump()?;
                 }
@@ -1837,43 +1860,68 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
 
         // mlp
         ln_region(c, Name::of(&["e", DIGITS[l], "ln2_gb"]).s(), bq.res1, bq.ln2)?;
-        // Tile pipeline: the previous tile's partial writes out during
-        // the fc1 NPU run, the next tile's input reads in during fc2p's
-        // (one transfer per NPU run, which is all the serial channel can
-        // overlap). The blobs alternate every tile, so each is loaded,
-        // synchronously, before its transfer starts.
+        // Tiles in pairs per blob load: fc1 runs on both tiles of a pair
+        // (outputs in A_OUT and the KV scratch), then fc2p on both, so
+        // the two blobs alternate every other tile and their reloads,
+        // most of the encoder's storage reads, halve. The previous
+        // pair's partial writes drain behind the fc1 runs, the next
+        // pair's input reads behind the fc2p runs (queue pumped from the
+        // inference wait). The blobs load synchronously between, when
+        // nothing is in flight.
         for j in 0..4usize {
             let f1 = enc_blob(l, "fc1", j);
             let p2 = enc_blob(l, "fc2p", j);
             c.asset(Name::of(&["e", DIGITS[l], "lut", DIGITS[j]]).s(), A_LUT)?;
             let preg = S_P + j as u32 * HREG_BLOCKS;
+            let mut ioq = IoQueue::new();
             try_rc!(c.read(S_LN, 0, A_X0, TILE8), "fc in");
-            for i in 0..c.tiles {
-                let (x, pb) = if i % 2 == 0 { (A_X0, KV_P0) } else { (A_X1, KV_P1) };
+            if c.tiles > 1 {
+                try_rc!(c.read(S_LN, TILE8, A_X1, TILE8), "fc in");
+            }
+            let mut i = 0;
+            while i < c.tiles {
+                let two = i + 1 < c.tiles;
                 try_rc!(c.load(f1.s()), "fc1 load");
                 if i > 0 {
-                    let pp = if i % 2 == 0 { KV_P1 } else { KV_P0 };
-                    io_start(false, c.lba(preg, (i - 1) * TILE8), kvscratch(pp, TILE8), "p wr")?;
+                    ioq.push(false, c.lba(preg, (i - 2) * TILE8), kvscratch(KV_P0, TILE8), "p wr");
+                    ioq.push(false, c.lba(preg, (i - 1) * TILE8), kvscratch(KV_P1, TILE8), "p wr");
+                    ioq.pump()?;
                 }
-                try_rc!(c.run_loaded(f1.s(), arena_addr(x), arena_addr(A_OUT)), "fc1");
-                if i > 0 {
-                    io_wait("p wr")?;
+                try_rc!(c.run_pumped(f1.s(), arena_addr(A_X0), arena_addr(A_OUT), &mut ioq), "fc1");
+                if two {
+                    try_rc!(c.run_pumped(f1.s(), arena_addr(A_X1), kvscratch_addr(KV_F1), &mut ioq),
+                            "fc1");
                 }
+                ioq.drain()?;
                 try_rc!(c.load(p2.s()), "fc2p load");
-                if i + 1 < c.tiles {
-                    let xn = if i % 2 == 0 { A_X1 } else { A_X0 };
-                    io_start(true, c.lba(S_LN, (i + 1) * TILE8), arena(xn, TILE8), "fc in")?;
+                if i + 2 < c.tiles {
+                    ioq.push(true, c.lba(S_LN, (i + 2) * TILE8), arena(A_X0, TILE8), "fc in");
+                    if i + 3 < c.tiles {
+                        ioq.push(true, c.lba(S_LN, (i + 3) * TILE8), arena(A_X1, TILE8), "fc in");
+                    }
+                    ioq.pump()?;
                 }
                 lut_apply(A_LUT, A_OUT, TILE8);
-                try_rc!(c.run_loaded(p2.s(), arena_addr(A_OUT), kvscratch_addr(pb)), "fc2p");
-                if i + 1 < c.tiles {
-                    io_wait("fc in")?;
+                try_rc!(c.run_pumped(p2.s(), arena_addr(A_OUT), kvscratch_addr(KV_P0), &mut ioq),
+                        "fc2p");
+                if two {
+                    let f1b = kvscratch(KV_F1, TILE8);
+                    let f1b = unsafe {
+                        core::slice::from_raw_parts_mut(f1b.as_mut_ptr() as *mut i8, TILE8)
+                    };
+                    lut_apply_to(A_LUT, f1b);
+                    try_rc!(c.run_pumped(p2.s(), kvscratch_addr(KV_F1), kvscratch_addr(KV_P1),
+                                         &mut ioq), "fc2p");
                 }
+                ioq.drain()?;
+                i += 2;
             }
-            let last = if (c.tiles - 1) % 2 == 0 { KV_P0 } else { KV_P1 };
-            try_rc!(storage::write_blocks(c.lba(preg, (c.tiles - 1) * TILE8),
-                                          kvscratch_addr(last) as *const u8,
-                                          (TILE8 / storage::BLOCK) as u32), "p wr");
+            // the last pair's partials
+            let first = if c.tiles % 2 == 0 { c.tiles - 2 } else { c.tiles - 1 };
+            try_rc!(c.write_raw(preg, first * TILE8, kvscratch(KV_P0, TILE8)), "p wr");
+            if c.tiles % 2 == 0 {
+                try_rc!(c.write_raw(preg, (first + 1) * TILE8, kvscratch(KV_P1, TILE8)), "p wr");
+            }
         }
         // recombination: x16 += sum of dequantized partials
         crate::crumb(0x528 + (l as u32) * 0x10);
@@ -2025,7 +2073,9 @@ const A_X1: usize = TILE8;
 const _: () = assert!(A_X1 + TILE8 <= A_OUT);
 const KV_P0: usize = 0;
 const KV_P1: usize = TILE8;
-const _: () = assert!(KV_P1 + TILE8 <= KV_BYTES);
+// second tile's fc1 output (the first's is A_OUT)
+const KV_F1: usize = 2 * TILE8;
+const _: () = assert!(KV_F1 + TILE8 <= KV_BYTES);
 // projection pipeline: odd tiles' NPU output
 const KV_PO: usize = 0;
 // cross K/V pipeline: NPU output per parity, then the transposed K blocks
@@ -2046,8 +2096,7 @@ const D_V: usize = 7680;
 const D_CTX: usize = 9216;
 const D_O: usize = 10752;
 const D_P: usize = 12288; // 4 x 1536
-const D_GB: usize = 18432; // 3072
-const D_LUT: usize = 21504; // 512
+// 18432..25088 free (the layer constants moved to D_DC)
 // LM head: one 64-row chunk of the embedding widened to int16 (49152 B,
 // to 74240; the arena's top 8 bytes are the crash breadcrumb). Cross K/V
 // no longer stage here: they go through the idle weight slot.
@@ -2056,6 +2105,16 @@ const D_ROWS: usize = 25088;
 // decode), to 90624.
 const D_LUT16: usize = 74240;
 const _: () = assert!(D_LUT16 + 4 * crate::q4::TABLES16 <= crate::ARENA_BYTES - 8);
+// One decoder layer's constants ("dc<l>" image entry: ln1, xln and ln2
+// gamma/beta, then the four GELU tables), read once per layer per step
+// instead of seven small reads. Above everything else the decode uses.
+const D_DC: usize = 90624;
+const DC_LN1: usize = 0;
+const DC_XLN: usize = 4 * 2 * C;
+const DC_LN2: usize = 2 * 4 * 2 * C;
+const DC_LUT: usize = 3 * 4 * 2 * C; // 4 x 256
+const DC_BYTES: usize = DC_LUT + 4 * 256; // 10240
+const _: () = assert!(D_DC + DC_BYTES <= crate::ARENA_BYTES - 8);
 
 fn lut16_tables() -> &'static mut [u32; crate::q4::TABLES16] {
     unsafe { &mut *(arena_addr(D_LUT16) as *mut [u32; crate::q4::TABLES16]) }
@@ -2087,6 +2146,15 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     let posd = lookup("posdec").ok_or(-901)?;
     let vtb = lookup("vocabtb").ok_or(-901)?;
     let fin = lookup("final_gb.bin").ok_or(-901)?;
+    // per-layer constant bundles (images from 2026-09-05 on); an older
+    // image falls back to the individual entries
+    let bundled = lookup("dc0").is_some();
+    // the vocabulary table's string count, read once instead of per token
+    let vtb_n = {
+        let mut nb = [0u8; 4];
+        try_rc!(sd_read_bytes(vtb, 0, &mut nb), "vtb n");
+        u32::from_le_bytes(nb) as usize
+    };
 
     unsafe {
         for m in (*core::ptr::addr_of_mut!(SELF_KV)).0.iter_mut() {
@@ -2130,8 +2198,18 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         let mut sq = plan.dec_x;
         for l in 0..BLOCKS {
             let bq = plan.dec[l];
-            dec_ln(c, Name::of(&["b", DIGITS[l], "_ln1_gb.bin"]).s(),
-                   D_X16, sq, D_LN, bq.ln1)?;
+            if bundled {
+                c.asset(Name::of(&["dc", DIGITS[l]]).s(), D_DC)?;
+            } else {
+                c.asset(Name::of(&["b", DIGITS[l], "_ln1_gb.bin"]).s(), D_DC + DC_LN1)?;
+                c.asset(Name::of(&["b", DIGITS[l], "_xln_gb.bin"]).s(), D_DC + DC_XLN)?;
+                c.asset(Name::of(&["b", DIGITS[l], "_ln2_gb.bin"]).s(), D_DC + DC_LN2)?;
+                for j in 0..4usize {
+                    c.asset(Name::of(&["b", DIGITS[l], "_lut", DIGITS[j], ".bin"]).s(),
+                            D_DC + DC_LUT + j * 256)?;
+                }
+            }
+            dec_ln(D_X16, sq, D_DC + DC_LN1, D_LN, bq.ln1);
             try_rc!(c.npu(dec_blob(l, "q", 0).s(), D_LN, D_Q), "dq");
             try_rc!(c.npu(dec_blob(l, "k", 0).s(), D_LN, D_K), "dk");
             try_rc!(c.npu(dec_blob(l, "v", 0).s(), D_LN, D_V), "dv");
@@ -2165,46 +2243,46 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
             sq = bq.res1;
 
             // cross-attention
-            dec_ln(c, Name::of(&["b", DIGITS[l], "_xln_gb.bin"]).s(),
-                   D_X16, sq, D_LN, bq.xln)?;
+            dec_ln(D_X16, sq, D_DC + DC_XLN, D_LN, bq.xln);
             try_rc!(c.npu(dec_blob(l, "xq", 0).s(), D_LN, D_Q), "dxq");
             let smx = bq.xq_out.scale * bq.xk_out.scale / 8.0;
-            // each head's K and V tile blocks: one read each, K staged in
-            // the slot (idle between dxq and dxout) and V in the arena's
-            // LM-head rows, so the next read runs while the previous
-            // blocks are widened and the head computes
+            // each head's K and V tile blocks: one read each, K (key-major
+            // as cross_kv wrote it) staged in the slot, which is idle
+            // between dxq and dxout, V in the arena's LM-head rows; the
+            // kernels consume both int8 layouts directly. Head h's V
+            // read runs under head h-1's compute, head h+1's K read
+            // under head h's.
             let stage = c.tiles * HB;
             c.loaded = Entry::default();
             let kreg = S_XKV + (l as u32 * 2) * HREG_BLOCKS;
             let vreg = S_XKV + (l as u32 * 2 + 1) * HREG_BLOCKS;
-            io_start(true, c.lba(kreg, 0), slot_u8(SL_STAGE, stage), "xk rd")?;
+            // the two K stages sit where the encoder keeps its widened
+            // keys and values, unused at decode
+            const _: () = assert!(2 * STAGE_BYTES <= SL_STAGE);
+            let kbuf = |h: usize| slot_u8(SL_XK + (h % 2) * STAGE_BYTES, stage);
+            io_start(true, c.lba(kreg, 0), kbuf(0), "xk rd")?;
             io_wait("xk rd")?;
+            io_start(true, c.lba(vreg, 0), arena(D_ROWS, stage), "xv rd")?;
             for h in 0..HEADS {
-                io_start(true, c.lba(vreg, h * N_TILES * HB), arena(D_ROWS, stage), "xv rd")?;
-                let t0 = cycles();
-                prepare_kt_from(slot_i8(SL_STAGE, stage), c.ctx);
-                prof_add(P_ATTN, t0);
                 io_wait("xv rd")?;
                 if h + 1 < HEADS {
-                    io_start(true, c.lba(kreg, (h + 1) * N_TILES * HB),
-                             slot_u8(SL_STAGE, stage), "xk rd")?;
+                    io_start(true, c.lba(kreg, (h + 1) * N_TILES * HB), kbuf(h + 1), "xk rd")?;
                 }
                 let t0 = cycles();
-                prepare_v_from(as_i8(D_ROWS, stage), c.ctx);
-                let kv = kernels::AttnKv {
-                    kt: slot_i16(SL_KT, kernels::KV16_LEN),
-                    v16: slot_i16(SL_V16, kernels::KV16_LEN),
-                    tk: c.ctx,
-                };
-                kernels::attn_head_kt(
-                    &as_i8(D_Q, C * W4)[h * HD * W4..(h + 1) * HD * W4], &kv,
+                kernels::attn_head_x1_i8(
+                    &as_i8(D_Q, C * W4)[h * HD * W4..(h + 1) * HD * W4],
+                    slot_i8(SL_XK + (h % 2) * STAGE_BYTES, stage),
+                    as_i8(D_ROWS, stage), c.ctx,
                     &mut as_i8_mut(D_CTX, C * W4)[h * HD * W4..(h + 1) * HD * W4],
-                    1, W4, bq.xq_out.zp, bq.xk_out.zp, bq.xv_out.zp,
-                    smx, bq.xv_out.scale, bq.xctx, attn_scratch2(), softmax_exp,
+                    W4, bq.xq_out.zp, bq.xk_out.zp, bq.xv_out.zp,
+                    smx, bq.xv_out.scale, bq.xctx, attn_scratch2(),
+                    &kernels::ExpFn(softmax_exp),
                 );
                 prof_add(P_ATTN, t0);
                 if h + 1 < HEADS {
                     io_wait("xk rd")?;
+                    io_start(true, c.lba(vreg, (h + 1) * N_TILES * HB),
+                             arena(D_ROWS, stage), "xv rd")?;
                 }
             }
             try_rc!(c.npu(dec_blob(l, "xout", 0).s(), D_CTX, D_O), "dxout");
@@ -2212,13 +2290,10 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
             sq = bq.res2;
 
             // mlp
-            dec_ln(c, Name::of(&["b", DIGITS[l], "_ln2_gb.bin"]).s(),
-                   D_X16, sq, D_LN, bq.ln2)?;
+            dec_ln(D_X16, sq, D_DC + DC_LN2, D_LN, bq.ln2);
             for j in 0..4usize {
                 try_rc!(c.npu(dec_blob(l, "fc1", j).s(), D_LN, D_Q), "dfc1");
-                c.asset(Name::of(&["b", DIGITS[l], "_lut", DIGITS[j], ".bin"]).s(),
-                        D_LUT)?;
-                lut_apply(D_LUT, D_Q, C * W4);
+                lut_apply(D_DC + DC_LUT + j * 256, D_Q, C * W4);
                 try_rc!(c.npu(dec_blob(l, "fc2p", j).s(), D_Q, D_P + j * C * W4),
                         "dfc2p");
             }
@@ -2272,14 +2347,14 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         let out_idx = step - (plan.n_sot - 1);
         rprintln!("hid[0,1,2,383] {:.4} {:.4} {:.4} {:.4}",
                   hid[0], hid[1], hid[2], hid[C - 1]);
-        let best = lm_head(plan, embc4, embc8, &hid, out_idx == 0)?;
+        let (best, best_pos) = lm_head(plan, embc4, embc8, &hid, out_idx == 0)?;
         rprintln!("tok id {}", best);
         if best == plan.eot {
             print_detected(&transcript, tlen);
             rprintln!("=== done ({} tokens) ===", printed);
             return Ok(());
         }
-        append_token(vtb, kept_position(ids, best)?, &mut transcript, &mut tlen)?;
+        append_token(vtb, vtb_n, best_pos, &mut transcript, &mut tlen)?;
         printed += 1;
         token = best;
         if n_tok >= MAX_TOKENS {
@@ -2292,14 +2367,13 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     Ok(())
 }
 
-fn dec_ln(c: &Ctxt, gb: &str, src: usize, sq: Quant, dst: usize,
-          dq: Quant) -> Result<(), i32> {
-    c.asset(gb, D_GB)?;
+/// Layernorm of the token-rate residual with gamma/beta at arena offset
+/// `gb` (f32[C] each).
+fn dec_ln(src: usize, sq: Quant, gb: usize, dst: usize, dq: Quant) {
     kernels::ln_planar_i16_to_i8(
-        as_i16(src, C * W4), sq, as_f32(D_GB, C), as_f32(D_GB + 4 * C, C),
+        as_i16(src, C * W4), sq, as_f32(gb, C), as_f32(gb + 4 * C, C),
         as_i8_mut(dst, C * W4), dq, C, W4,
     );
-    Ok(())
 }
 
 fn dec_add(x16: usize, qa: Quant, b8: usize, qb: Quant, qd: Quant) {
@@ -2331,7 +2405,7 @@ const LM_ROWS_INT8: bool = true;
 /// LM-head cosines are so small that even the loosest row's Cauchy-Schwarz
 /// bound sits ~3x above the best logit -- 0 of 12228 rows prunable.)
 fn lm_head(plan: &Plan, embc4: Entry, embc8: Option<Entry>, hid: &[f32; C],
-           first: bool) -> Result<u32, i32> {
+           first: bool) -> Result<(u32, usize), i32> {
     const ROWS: usize = 64;
     const CH_SCL: usize = 0; // f32[64]
     const CH_IDS: usize = ROWS * 4; // u32[64]
@@ -2374,6 +2448,7 @@ fn lm_head(plan: &Plan, embc4: Entry, embc8: Option<Entry>, hid: &[f32; C],
     let mut best = f32::MIN;
     let mut best2 = f32::MIN;
     let mut best_id = plan.eot;
+    let mut best_pos = 0usize; // its kept position (= row index)
     let rows16 = as_i16_mut(D_ROWS, ROWS * C);
     let n_chunks = plan.vocab_n.div_ceil(ROWS);
     io_start(true, embc.lba, interlayer_at(0, ch_bytes), "embc rd")?;
@@ -2421,6 +2496,7 @@ fn lm_head(plan: &Plan, embc4: Entry, embc8: Option<Entry>, hid: &[f32; C],
                     best2 = best;
                     best = logit;
                     best_id = id;
+                    best_pos = chunk * ROWS + row;
                 } else if logit > best2 {
                     best2 = logit;
                 }
@@ -2430,7 +2506,7 @@ fn lm_head(plan: &Plan, embc4: Entry, embc8: Option<Entry>, hid: &[f32; C],
         prof_add(P_LM, t0);
     }
     rprintln!("lm: id {} logit {:.3} (2nd {:.3})", best_id, best, best2);
-    Ok(best_id)
+    Ok((best_id, best_pos))
 }
 
 /// Binary search the kept-id table for a token id -> kept position.
@@ -2458,9 +2534,10 @@ fn kept_position(ids: Entry, token: u32) -> Result<usize, i32> {
     Err(-906)
 }
 
-/// Append a kept token's text piece from the vocabulary table to the
-/// running transcript buffer (`buf[..len]`), truncating if it fills.
-fn append_token(vtb: Entry, kept_pos: usize, buf: &mut [u8; 256],
+/// Append a kept token's text piece from the vocabulary table (`n_off`
+/// strings) to the running transcript buffer (`buf[..len]`), truncating
+/// if it fills.
+fn append_token(vtb: Entry, n_off: usize, kept_pos: usize, buf: &mut [u8; 256],
                 len: &mut usize) -> Result<(), i32> {
     let mut offs = [0u8; 8];
     try_rc!(sd_read_bytes(vtb, 4 + kept_pos * 4, &mut offs), "vtb off");
@@ -2469,11 +2546,6 @@ fn append_token(vtb: Entry, kept_pos: usize, buf: &mut [u8; 256],
     let n = (o1 - o0).min(48);
     let mut sbuf = [0u8; 48];
     // strings start after the offset table: 4 + (n+1)*4 bytes in
-    let n_off = {
-        let mut nb = [0u8; 4];
-        try_rc!(sd_read_bytes(vtb, 0, &mut nb), "vtb n");
-        u32::from_le_bytes(nb) as usize
-    };
     let base = 4 + (n_off + 1) * 4;
     try_rc!(sd_read_bytes(vtb, base + o0, &mut sbuf[..n]), "vtb s");
     let take = n.min(buf.len() - *len);

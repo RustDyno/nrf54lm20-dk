@@ -209,6 +209,20 @@ def main():
         with open(os.path.join(plan_dir, name), "rb") as f:
             entries.append((name, f.read()))
 
+    # one entry per decoder layer with its seven small constants (ln1,
+    # xln, ln2 gamma/beta, four GELU tables): the firmware reads it once
+    # per layer per token instead of seven times
+    for l in range(common.N_LAYERS):
+        parts = [f"b{l}_ln1_gb.bin", f"b{l}_xln_gb.bin", f"b{l}_ln2_gb.bin"] + \
+            [f"b{l}_lut{j}.bin" for j in range(4)]
+        bundle = b""
+        for name in parts:
+            with open(os.path.join(plan_dir, name), "rb") as f:
+                d = f.read()
+            assert len(d) == (256 if "lut" in name else 3072), name
+            bundle += d
+        entries.append((f"dc{l}", bundle))
+
     vocab, vocab_n = build_vocab(sd, ref, suppress, tok)
     assert vocab_n <= 16384, "row scales must fit the interlayer buffer"
     entries += sorted(vocab.items())

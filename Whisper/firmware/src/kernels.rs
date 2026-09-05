@@ -390,10 +390,11 @@ pub fn attn_prepare_v16<F: Fn(usize, usize) -> i8>(get: F, tk: usize, v16: &mut 
 
 /// One attention head over prepared keys/values; q/ctx are [64, wq] with
 /// column stride `qstride` (channel-planar), exactly like `attn_head`.
-/// `exp` is the softmax exponential: `libm::expf` reproduces the golden
-/// bit for bit, `dsp::exp_neg` is the fast one (see the call sites).
+/// `exp` is the softmax exponential (see `SoftmaxExp`): `ExpFn(libm::expf)`
+/// reproduces the golden bit for bit, `ExpFn(dsp::exp_neg)` is the fast
+/// polynomial, `ExpTable` the integer-indexed table (see the call sites).
 #[allow(clippy::too_many_arguments)]
-pub fn attn_head_kt<E: Fn(f32) -> f32>(
+pub fn attn_head_kt<E: SoftmaxExp>(
     q: &[i8],
     kv: &AttnKv,
     ctx: &mut [i8],
@@ -406,7 +407,7 @@ pub fn attn_head_kt<E: Fn(f32) -> f32>(
     v_scale: f32,
     ctx_q: Quant,
     s: &mut AttnScratch2,
-    exp: E,
+    exp: &E,
 ) {
     let tk = kv.tk;
     let tkp = keys_padded(tk);
@@ -450,7 +451,7 @@ pub fn attn_head_kt<E: Fn(f32) -> f32>(
         for row in 0..(if two { 2 } else { 1 }) {
             let (acc, scores, p16) = (&s.acc[row], &mut s.scores[row], &mut s.p16[row]);
             psum[row] = softmax_row(&acc[..tk], zk * qsum[row], score_mult,
-                                    &mut scores[..tk], p16, tkp, &exp);
+                                    &mut scores[..tk], p16, tkp, exp);
         }
         prof(1, t0);
         let t0 = cyc();
@@ -475,11 +476,179 @@ pub fn attn_head_kt<E: Fn(f32) -> f32>(
     }
 }
 
+/// One query against int8 keys and values in their storage layouts, for
+/// the decode cross-attention: `k` is key-major ([key][64] int8, at
+/// least `keys_padded(tk)` rows), `v` tile-major ([tile][64 channels][64
+/// keys] int8, `tk.div_ceil(64)` tiles), `q`/`ctx` are one column of a
+/// [64, qstride] channel-planar tensor. Same sums and the same softmax as
+/// `attn_head_kt`; the kernels widen the int8 operands in registers, so
+/// nothing is transposed or widened per head.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_head_x1_i8<E: SoftmaxExp>(
+    q: &[i8],
+    k: &[i8],
+    v: &[i8],
+    tk: usize,
+    ctx: &mut [i8],
+    qstride: usize,
+    zq: i32,
+    zk: i32,
+    zv: i32,
+    score_mult: f32,
+    v_scale: f32,
+    ctx_q: Quant,
+    s: &mut AttnScratch2,
+    exp: &E,
+) {
+    let tkp = keys_padded(tk);
+    let tiles = tk.div_ceil(64);
+    assert!(tk >= 1 && tkp <= MAX_KEYS);
+    assert!(k.len() >= tkp * HD64 && v.len() >= tiles * HD64 * 64);
+    assert!(q.len() >= (HD64 - 1) * qstride + 1 && ctx.len() >= (HD64 - 1) * qstride + 1);
+    assert!(k.as_ptr() as usize % 4 == 0 && v.as_ptr() as usize % 4 == 0);
+    let ctx_mult = PROBS.scale * v_scale;
+    let mut qsum = 0i32;
+    for c in 0..HD64 {
+        let a = q[c * qstride] as i32 - zq;
+        s.q16[0][dsp::perm4(c)] = a as i16;
+        qsum += a;
+    }
+    let t0 = cyc();
+    let mut j = 0;
+    while j < tkp {
+        let r = unsafe {
+            dsp::dot64_q1k4_i8(s.q16[0].as_ptr(), k.as_ptr().add(j * HD64))
+        };
+        s.acc[0][j..j + 4].copy_from_slice(&r);
+        j += 4;
+    }
+    prof(0, t0);
+    let t0 = cyc();
+    let psum = softmax_row(&s.acc[0][..tk], zk * qsum, score_mult,
+                           &mut s.scores[0][..tk], &mut s.p16[0], tkp, exp);
+    // the PV kernel reads the probabilities in perm4 order
+    let p = &mut s.p16[0];
+    let mut j = 0;
+    while j < tkp {
+        p.swap(j + 1, j + 2);
+        j += 4;
+    }
+    prof(1, t0);
+    let t0 = cyc();
+    let vcorr = zv * psum;
+    let mut c = 0;
+    while c < HD64 {
+        let mut acc = [0i32; 4];
+        for i in 0..tiles {
+            let n8 = (tkp - i * 64).min(64) / 8;
+            acc = unsafe {
+                dsp::dot_pv_q1v4_i8(s.p16[0].as_ptr().add(i * 64),
+                                    v.as_ptr().add(i * HD64 * 64 + c * 64), n8, acc)
+            };
+        }
+        for r in 0..4 {
+            ctx[(c + r) * qstride] = ctx_q.q8((acc[r] - vcorr) as f32 * ctx_mult);
+        }
+        c += 4;
+    }
+    prof(2, t0);
+}
+
+/// The softmax exponential of `attn_head_kt`: fills `scores[j]` with
+/// exp(x_j) for x_j = (acc_j - corr) * mult - max (<= 0, where max is
+/// that expression at `amax`, the row's integer maximum) and returns the
+/// sum of the row.
+pub trait SoftmaxExp {
+    fn row(&self, acc: &[i32], amax: i32, corr: i32, mult: f32, scores: &mut [f32]) -> f32;
+}
+
+/// The exponential as a function of the float argument, evaluated the
+/// way the golden does it (two rounded products and a subtraction, then
+/// the function).
+pub struct ExpFn<F: Fn(f32) -> f32>(pub F);
+
+impl<F: Fn(f32) -> f32> SoftmaxExp for ExpFn<F> {
+    #[inline(always)]
+    fn row(&self, acc: &[i32], amax: i32, corr: i32, mult: f32, scores: &mut [f32]) -> f32 {
+        let max = (amax - corr) as f32 * mult;
+        let mut sum = 0.0f32;
+        for (s, &a) in scores.iter_mut().zip(acc) {
+            *s = (self.0)((a - corr) as f32 * mult - max);
+            sum += *s;
+        }
+        sum
+    }
+}
+
+pub const EXP_LO_BITS: u32 = 10;
+pub const EXP_LO: usize = 1 << EXP_LO_BITS;
+pub const EXP_HI: usize = 256;
+
+/// exp(-mult * d) for the integer score deficit d = amax - acc >= 0, as
+/// the product of two table entries: `lo[d mod 1024]` and `hi[d / 1024]`.
+///
+/// The deficit is an integer and the tables are built from it in f64, so
+/// each value is within ~1.5 ulp of the true exponential; the golden's
+/// float path rounds two products and a difference per key first and
+/// sits about as far from the true value in its own direction. Deficits
+/// past the `hi` table (mult * 256 * 1024 and beyond, or wherever the
+/// entry underflows) are 0, invisible next to a row sum >= 1. About 30
+/// cycles per key against ~100 for the polynomial.
+///
+/// The f64 here runs in software: the M33 has no double-precision FPU,
+/// and the build disables the `fp64` feature so this does not compile
+/// to instructions the core would fault on.
+#[repr(C)]
+pub struct ExpTable {
+    pub lo: [f32; EXP_LO],
+    pub hi: [f32; EXP_HI],
+    pub mult: f32,
+}
+
+pub const EXP_TABLE_BYTES: usize = core::mem::size_of::<ExpTable>();
+
+impl ExpTable {
+    /// (Re)build for a score multiplier. ~1300 f64 exponentials.
+    pub fn build(&mut self, mult: f32) {
+        let m = mult as f64;
+        for (i, e) in self.lo.iter_mut().enumerate() {
+            *e = libm::exp(-m * i as f64) as f32;
+        }
+        for (j, e) in self.hi.iter_mut().enumerate() {
+            let x = -m * (EXP_LO * j) as f64;
+            *e = if x < -87.0 { 0.0 } else { libm::exp(x) as f32 };
+        }
+        self.mult = mult;
+    }
+
+    #[inline(always)]
+    pub fn eval(&self, d: u32) -> f32 {
+        let hi = ((d >> EXP_LO_BITS) as usize).min(EXP_HI - 1);
+        let lo = (d & (EXP_LO as u32 - 1)) as usize;
+        // SAFETY: both indices are masked / clamped into their tables
+        unsafe { *self.hi.get_unchecked(hi) * *self.lo.get_unchecked(lo) }
+    }
+}
+
+impl SoftmaxExp for ExpTable {
+    #[inline(always)]
+    fn row(&self, acc: &[i32], amax: i32, _corr: i32, mult: f32, scores: &mut [f32]) -> f32 {
+        assert!(self.mult.to_bits() == mult.to_bits());
+        let mut sum = 0.0f32;
+        for (s, &a) in scores.iter_mut().zip(acc) {
+            let e = self.eval((amax - a) as u32);
+            *s = e;
+            sum += e;
+        }
+        sum
+    }
+}
+
 /// One softmax row: dequantize the i32 scores, exponentiate, quantize
 /// to the fixed 1/256 probability scale, stored +128-biased as int16
 /// (zero beyond `tk` up to `tkp`). Returns the biased sum for the V
 /// zero-point correction.
-fn softmax_row<E: Fn(f32) -> f32>(
+fn softmax_row<E: SoftmaxExp>(
     acc: &[i32],
     corr: i32,
     mult: f32,
@@ -498,19 +667,16 @@ fn softmax_row<E: Fn(f32) -> f32>(
             amax = a;
         }
     }
-    let max = (amax - corr) as f32 * mult;
-    let mut sum = 0.0f32;
-    for (s, &a) in scores.iter_mut().zip(acc) {
-        *s = exp((a - corr) as f32 * mult - max);
-        sum += *s;
-    }
+    let sum = exp.row(acc, amax, corr, mult, scores);
     // PROBS.q8(s * inv) + 128, with the /(1/256) as an exact *256: the
     // power-of-two scaling commutes with the rounding of s * inv, so
-    // folding it into the reciprocal quantizes identically.
+    // folding it into the reciprocal quantizes identically. The biased
+    // value clamp(r - 128, -128, 127) + 128 is clamp(r, 0, 255), one
+    // saturating instruction.
     let inv256 = (1.0 / sum) * 256.0;
     let mut psum = 0i32;
     for (p, &s) in p16[..tk].iter_mut().zip(scores.iter()) {
-        let pv = (dsp::round_i32(s * inv256) - 128).clamp(-128, 127) + 128;
+        let pv = dsp::round_i32(s * inv256).clamp(0, 255);
         *p = pv as i16;
         psum += pv;
     }
