@@ -601,9 +601,17 @@ than embc4 on the 28 MB/s stick. Also found: the rig built the dev
 profile with overflow checks on (release never had them), so earlier rig
 CPU numbers were inflated by ~5 percent against the stick's.
 
-Remaining levers, in order: the softmax passes (interleave two keys so
-the FPU chains overlap, ~99 -> ~60 cycles per key would be ~2.5 s); int8
-K/V variants of the 2x2 kernels for decode (removes the ~1.2 s of
-widening per utterance); 4x2 register blocking of QK/PV (~10 percent of
-10 s); the residual/layernorm passes (5.7 MB of synchronous writes, still
-nothing to hide them under); speculative decode positions (large).
+Tried and dropped: the exp pass computing two keys in lockstep so the
+two polynomial chains interleave (the compiler did interleave them, and
+the arithmetic per key was unchanged): softmax 6.31 -> 6.25 s. The M33
+FPU has no latency to hide; the softmax is bound by its ~99 instructions
+per key, so only a cheaper exponential (a numeric change, to be gated)
+or fewer keys would move it.
+
+Remaining levers, in order: int8 K/V variants of the 2x2 kernels for
+decode (removes the ~1.2 s of widening per utterance); 4x2 register
+blocking of QK/PV (~10 percent of 10 s); a lower-degree or table
+exponential for the softmax (gated: attncheck byte moves, transcript
+parity; up to ~3 s); the residual/layernorm passes (5.7 MB of
+synchronous writes, still nothing to hide them under); speculative
+decode positions (large).

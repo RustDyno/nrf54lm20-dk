@@ -121,9 +121,10 @@ Not measured on the stick yet (rig hides them): the pumped writes
 (~3.5 s there) and the int8 head (~0.08 s/step there). The stick image
 needs a re-dd for embc8; the firmware falls back to embc4 without it.
 
-Next levers (speedup.md 13): softmax passes interleaved two keys at a
-time (~2.5 s), int8 K/V decode kernels (~1.2 s), 4x2 blocking of QK/PV
-(~1 s), speculative decode positions (large). The blob reloads (fc1/fc2p
+Next levers (speedup.md 13): int8 K/V decode kernels (~1.2 s), 4x2
+blocking of QK/PV (~1 s), a cheaper softmax exponential (gated, up to
+~3 s; interleaving the exact one was tried and gained nothing), speculative
+decode positions (large). The blob reloads (fc1/fc2p
 alternate every tile: 53 MB of the encoder's 83 MB of reads) are
 inherent to the tile order that keeps writes small and cost ~2.5 s at
 28 MB/s.
