@@ -97,6 +97,10 @@ pub fn init() -> i32 {
 }
 
 pub fn read_blocks(lba: u32, dst: *mut u8, count: u32) -> i32 {
+    if busy() {
+        rprintln!("storage: blocking read with a transfer pending");
+        return -495;
+    }
     match backend() {
         Backend::Usb => usb::read_blocks(lba, dst, count),
         Backend::Sd => sd::read_blocks(lba, dst, count),
@@ -107,6 +111,10 @@ pub fn read_blocks(lba: u32, dst: *mut u8, count: u32) -> i32 {
 }
 
 pub fn write_blocks(lba: u32, src: *const u8, count: u32) -> i32 {
+    if busy() {
+        rprintln!("storage: blocking write with a transfer pending");
+        return -495;
+    }
     match backend() {
         Backend::Usb => usb::write_blocks(lba, src, count),
         Backend::Sd => sd::write_blocks(lba, src, count),
@@ -116,7 +124,98 @@ pub fn write_blocks(lba: u32, src: *const u8, count: u32) -> i32 {
     }
 }
 
+// --- split-phase transfers --------------------------------------------------
+//
+// `read_start`/`write_start` issue a transfer whose data phase runs on the
+// backend's DMA; `poll` advances it without blocking (call it between
+// units of CPU work); `finish` blocks for the result. One transfer in
+// flight at a time: a second start, or a blocking read/write while one
+// is pending, returns -495 rather than quietly serializing, so a missing
+// finish() shows up as an error at the call site. The SD backend has no
+// split path and completes inside start().
+
+static mut PENDING: bool = false;
+#[cfg(feature = "sd-card")]
+static mut SD_RC: i32 = 0;
+
+pub fn busy() -> bool {
+    unsafe { PENDING }
+}
+
+pub fn read_start(lba: u32, dst: *mut u8, count: u32) -> i32 {
+    if busy() {
+        return -495;
+    }
+    let rc = match backend() {
+        Backend::Usb => usb::read_start(lba, dst, count),
+        #[cfg(feature = "sd-card")]
+        Backend::Sd => {
+            unsafe { SD_RC = sd::read_blocks(lba, dst, count) };
+            0
+        }
+        #[cfg(feature = "mock-usb")]
+        Backend::Mock => mockblk::read_start(lba, dst, count),
+        _ => -490,
+    };
+    if rc == 0 {
+        unsafe { PENDING = true };
+    }
+    rc
+}
+
+pub fn write_start(lba: u32, src: *const u8, count: u32) -> i32 {
+    if busy() {
+        return -495;
+    }
+    let rc = match backend() {
+        Backend::Usb => usb::write_start(lba, src, count),
+        #[cfg(feature = "sd-card")]
+        Backend::Sd => {
+            unsafe { SD_RC = sd::write_blocks(lba, src, count) };
+            0
+        }
+        #[cfg(feature = "mock-usb")]
+        Backend::Mock => mockblk::write_start(lba, src, count),
+        _ => -490,
+    };
+    if rc == 0 {
+        unsafe { PENDING = true };
+    }
+    rc
+}
+
+/// True once the pending transfer is complete (or none is pending).
+pub fn poll() -> bool {
+    if !busy() {
+        return true;
+    }
+    match backend() {
+        Backend::Usb => usb::xfer_poll(),
+        #[cfg(feature = "mock-usb")]
+        Backend::Mock => mockblk::xfer_poll(),
+        _ => true,
+    }
+}
+
+/// Wait for the pending transfer and return its result (0 if none).
+pub fn finish() -> i32 {
+    if !busy() {
+        return 0;
+    }
+    unsafe { PENDING = false };
+    match backend() {
+        Backend::Usb => usb::xfer_finish(),
+        #[cfg(feature = "sd-card")]
+        Backend::Sd => unsafe { SD_RC },
+        #[cfg(feature = "mock-usb")]
+        Backend::Mock => mockblk::xfer_finish(),
+        _ => -490,
+    }
+}
+
 /// (read bytes, read cycles, written bytes, write cycles) since last call.
+/// Cycles are CPU time spent inside storage calls: for split-phase
+/// transfers that is only the part the overlap did not hide.
 pub fn stats_take() -> (u64, u64, u64, u64) {
     match backend() {
         Backend::Usb => usb::stats_take(),

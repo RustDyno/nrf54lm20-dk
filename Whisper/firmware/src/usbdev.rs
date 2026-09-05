@@ -485,6 +485,16 @@ impl Budget {
 /// that is not a whole number of packets ends with a short packet, which is
 /// exactly how the host learns the transfer is over.
 fn ep_in_xfer(dma: u32, len: usize, to_ms: u32) -> i32 {
+    ep_in_arm(dma, len);
+    let mut budget = Budget::new(to_ms);
+    loop {
+        if let Some(rc) = ep_in_check(&mut budget) {
+            return rc;
+        }
+    }
+}
+
+fn ep_in_arm(dma: u32, len: usize) {
     let pkts = if len == 0 { 1 } else { len.div_ceil(MPS_BULK) } as u32;
     // The endpoint DMA reads a buffer the CPU has just written; make those
     // stores visible before the transfer is armed.
@@ -499,27 +509,30 @@ fn ep_in_xfer(dma: u32, len: usize, to_ms: u32) -> i32 {
         let c = read_volatile(diep(EP_BULK, EP_CTL));
         write_volatile(diep(EP_BULK, EP_CTL), c | EPCTL_EPENA | EPCTL_CNAK);
     }
-    let mut budget = Budget::new(to_ms);
-    loop {
-        let i = unsafe { read_volatile(diep(EP_BULK, EP_INT)) };
-        if i & EPINT_XFERCOMPL != 0 {
-            unsafe { write_volatile(diep(EP_BULK, EP_INT), EPINT_XFERCOMPL) };
-            return 0;
-        }
-        if i & EPINT_AHBERR != 0 {
-            ep_abort(true);
-            return -621;
-        }
-        pump();
-        if unsafe { RESET_AFTER_CONFIG } {
-            ep_abort(true);
-            return -623;
-        }
-        if budget.expired() {
-            ep_abort(true);
-            return -620;
-        }
+}
+
+/// Non-blocking completion check for `ep_in_arm`; services the control
+/// endpoint on the way. None while the transfer is still running.
+fn ep_in_check(budget: &mut Budget) -> Option<i32> {
+    let i = unsafe { read_volatile(diep(EP_BULK, EP_INT)) };
+    if i & EPINT_XFERCOMPL != 0 {
+        unsafe { write_volatile(diep(EP_BULK, EP_INT), EPINT_XFERCOMPL) };
+        return Some(0);
     }
+    if i & EPINT_AHBERR != 0 {
+        ep_abort(true);
+        return Some(-621);
+    }
+    pump();
+    if unsafe { RESET_AFTER_CONFIG } {
+        ep_abort(true);
+        return Some(-623);
+    }
+    if budget.expired() {
+        ep_abort(true);
+        return Some(-620);
+    }
+    None
 }
 
 /// One bulk OUT transfer into a word-aligned buffer with `cap` bytes of
@@ -527,6 +540,17 @@ fn ep_in_xfer(dma: u32, len: usize, to_ms: u32) -> i32 {
 /// reports the shortfall as the residual XferSize, and a short packet ends
 /// the transfer early, so callers must loop until they have what they need.
 fn ep_out_xfer(dma: u32, cap: usize, to_ms: u32) -> Result<usize, i32> {
+    let want = ep_out_arm(dma, cap);
+    let mut budget = Budget::new(to_ms);
+    loop {
+        if let Some(r) = ep_out_check(want, &mut budget) {
+            return r;
+        }
+    }
+}
+
+/// Returns the number of bytes the transfer was programmed for.
+fn ep_out_arm(dma: u32, cap: usize) -> usize {
     let pkts = (cap / MPS_BULK).max(1) as u32;
     let want = pkts as usize * MPS_BULK;
     unsafe {
@@ -539,28 +563,30 @@ fn ep_out_xfer(dma: u32, cap: usize, to_ms: u32) -> Result<usize, i32> {
         let c = read_volatile(doep(EP_BULK, EP_CTL));
         write_volatile(doep(EP_BULK, EP_CTL), c | EPCTL_EPENA | EPCTL_CNAK);
     }
-    let mut budget = Budget::new(to_ms);
-    loop {
-        let i = unsafe { read_volatile(doep(EP_BULK, EP_INT)) };
-        if i & EPINT_XFERCOMPL != 0 {
-            unsafe { write_volatile(doep(EP_BULK, EP_INT), EPINT_XFERCOMPL) };
-            let left = unsafe { read_volatile(doep(EP_BULK, EP_TSIZ)) } & 0x7FFFF;
-            return Ok(want - left as usize);
-        }
-        if i & EPINT_AHBERR != 0 {
-            ep_abort(false);
-            return Err(-621);
-        }
-        pump();
-        if unsafe { RESET_AFTER_CONFIG } {
-            ep_abort(false);
-            return Err(-623);
-        }
-        if budget.expired() {
-            ep_abort(false);
-            return Err(-622);
-        }
+    want
+}
+
+fn ep_out_check(want: usize, budget: &mut Budget) -> Option<Result<usize, i32>> {
+    let i = unsafe { read_volatile(doep(EP_BULK, EP_INT)) };
+    if i & EPINT_XFERCOMPL != 0 {
+        unsafe { write_volatile(doep(EP_BULK, EP_INT), EPINT_XFERCOMPL) };
+        let left = unsafe { read_volatile(doep(EP_BULK, EP_TSIZ)) } & 0x7FFFF;
+        return Some(Ok(want - left as usize));
     }
+    if i & EPINT_AHBERR != 0 {
+        ep_abort(false);
+        return Some(Err(-621));
+    }
+    pump();
+    if unsafe { RESET_AFTER_CONFIG } {
+        ep_abort(false);
+        return Some(Err(-623));
+    }
+    if budget.expired() {
+        ep_abort(false);
+        return Some(Err(-622));
+    }
+    None
 }
 
 /// Disable a bulk endpoint that is still armed, so the next transfer's
@@ -810,4 +836,89 @@ pub fn init(wait_ms: u32) -> i32 {
     unsafe { RESET_AFTER_CONFIG = false };
     rprintln!("usbdev: configured (address {})", unsafe { ADDRESS });
     0
+}
+
+// --- split-phase bulk transfers -------------------------------------------------
+//
+// mockblk.rs runs a block payload on the endpoint DMA while the CPU works:
+// `*_start` arms the first packet run, `*_check` re-arms the remainder
+// (and the terminating ZLP for a send) each time it is called, and only
+// reports once everything is through. One transfer per direction at a
+// time, which is all the block protocol ever has.
+
+pub struct Xfer {
+    dma: u32,
+    len: usize,
+    off: usize,
+    /// Bytes the running packet run was programmed for.
+    want: usize,
+    /// A send that is a whole number of packets ends with a ZLP: true
+    /// once that packet has been armed.
+    zlp_armed: bool,
+    budget: Budget,
+}
+
+pub fn send_start(dma: u32, len: usize, to_ms: u32) -> Xfer {
+    let mut x = Xfer { dma, len, off: 0, want: 0, zlp_armed: false, budget: Budget::new(to_ms) };
+    send_arm_next(&mut x);
+    x
+}
+
+fn send_arm_next(x: &mut Xfer) {
+    if x.off < x.len {
+        let n = (x.len - x.off).min(1023 * MPS_BULK);
+        ep_in_arm(x.dma + x.off as u32, n);
+        x.want = n;
+    } else {
+        ep_in_arm(x.dma, 0);
+        x.want = 0;
+        x.zlp_armed = true;
+    }
+}
+
+/// None while still sending; Some(rc) once the whole payload (and its
+/// terminating ZLP, when one is due) has gone out.
+pub fn send_check(x: &mut Xfer) -> Option<i32> {
+    let rc = ep_in_check(&mut x.budget)?;
+    if rc != 0 {
+        return Some(rc);
+    }
+    if x.zlp_armed {
+        return Some(0);
+    }
+    x.off += x.want;
+    if x.off < x.len || x.len % MPS_BULK == 0 {
+        send_arm_next(x);
+        return None;
+    }
+    Some(0)
+}
+
+pub fn recv_start(dma: u32, len: usize, to_ms: u32) -> Xfer {
+    let mut x = Xfer { dma, len, off: 0, want: 0, zlp_armed: false, budget: Budget::new(to_ms) };
+    recv_arm_next(&mut x);
+    x
+}
+
+fn recv_arm_next(x: &mut Xfer) {
+    let n = (x.len - x.off).min(1023 * MPS_BULK);
+    x.want = ep_out_arm(x.dma + x.off as u32, n);
+}
+
+/// None while still receiving; Some(rc) once `len` bytes have landed.
+pub fn recv_check(x: &mut Xfer) -> Option<i32> {
+    match ep_out_check(x.want, &mut x.budget)? {
+        Ok(got) => {
+            if got == 0 {
+                return Some(-624); // zero-length packet: host lost framing
+            }
+            x.off += got;
+            if x.off < x.len {
+                recv_arm_next(x);
+                return None;
+            }
+            Some(0)
+        }
+        Err(e) => Some(e),
+    }
 }

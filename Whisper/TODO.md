@@ -85,10 +85,31 @@ live microphone.
 Left in the queue, not part of this pass:
 - Fast USB stick (zero code, needs hardware): reads sit at a flat
   9-10 MB/s at every transfer size, so the limit is bandwidth.
-- Overlap DMA with compute (medium; only pays once 5.1-5.5 are in).
+- Overlap DMA with compute: DONE 2026-09-04 (section 6).
 - 4-bit decoder blobs (item 1 follow-ups B/D; accuracy regate first).
 - Speculative / batched decode positions (large; exact by construction
   but the draft's acceptance rate is unmeasured).
+
+## 6. DONE 2026-09-04: speed pass 5, storage overlapped with compute
+
+Split-phase transfers (storage::read_start / write_start / poll /
+finish; usb.rs runs the data phase and the CSW on the channel DMA, the
+mock rig runs the payload on the endpoint DMA) and four overlap sites:
+encoder attention (context write + next head's K/V/Q prefetch, pumped
+every 16 queries), encoder MLP tiles (partial write under fc1, input
+read under fc2p), decode cross-attention (K/V prefetch), LM head (chunk
+double buffer). Results in speedup.md section 12, design in NOTES.md.
+Rig (JFK clip): transcript and every scratch region bit-identical,
+speak-to-done 67.7 -> 63.8 s, decode 1.10 -> 0.97 s/step. The stick has
+not been re-measured; the overlapped transfers add up to ~4.3 MB of
+writes (1 MB/s there) and ~3.5 MB of reads per utterance plus ~4.2 MB
+of reads per token, so expect ~5 s off the encoder and ~0.4 s/token.
+
+Left for the stick: the q/k/v projection writes (six 4 KB head blocks
+per tile behind one NPU run; ~3 s at 1 MB/s) would need a pump from a
+timer interrupt, and the blob reloads (fc1/fc2p alternate every tile:
+53 MB of the encoder's 83 MB of reads) are inherent to the tile order
+that keeps writes small.
 
 ## 1. Application-class SD card (zero code)
 

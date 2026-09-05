@@ -170,3 +170,18 @@ rebuilt (embc4 replaces embp4; old cards need a re-dd).
   speech to the printed words, split into the recording tail after the
   last speech frame and the processing time (injected clips: processing
   from the end of the clip). SysTick now keeps a 10 ms uptime clock.
+
+## 2026-09-04: speed pass 5, storage overlapped with compute
+
+- storage.rs split-phase interface (read_start / write_start / poll /
+  finish, one transfer in flight, -495 on a blocking call while one is
+  pending); usb.rs runs the data phase and CSW on the channel DMA,
+  mockblk.rs/usbdev.rs the payload and response on the endpoint DMA.
+- Overlap sites: encoder attention (context write + next head K/V/Q
+  prefetch through a small IoQueue pumped every 16 queries), encoder
+  MLP tile pipeline (blob load split from the NPU run so the transfer
+  starts between them), decode cross-attention K/V prefetch, LM head
+  embedding-chunk double buffer.
+- Rig (JFK clip): transcript identical, 0 of 5480 scratch blocks differ
+  from a same-session baseline; speak-to-done 67.7 -> 63.8 s, decode
+  1.10 -> 0.97 s/step. Stick projection ~15 s of ~100 s (speedup.md 12).

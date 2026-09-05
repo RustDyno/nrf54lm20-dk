@@ -175,9 +175,8 @@ fn softmax_exp(x: f32) -> f32 {
 /// Tile-wise slice loops rather than the generic kernels::attn_prepare_kt
 /// closure form: at decode this runs per token and per head, where the
 /// index arithmetic was costing more than the attention itself.
-fn prepare_kv_from_stage(tk: usize) {
+fn prepare_kv_from(stage: &[i8], tk: usize) {
     let tkp = kernels::keys_padded(tk);
-    let stage = slot_i8(SL_STAGE, N_TILES * HB);
     let kt = slot_i16(SL_KT, kernels::KV16_LEN);
     let kp = kt.as_mut_ptr();
     for i in 0..tk.div_ceil(T) {
@@ -199,9 +198,8 @@ fn prepare_kv_from_stage(tk: usize) {
 
 /// Widened values for one head, same staging: int16 [64][MAX_KEYS] in
 /// SL_V16, columns tk..tkp zero.
-fn prepare_v_from_stage(tk: usize) {
+fn prepare_v_from(stage: &[i8], tk: usize) {
     let tkp = kernels::keys_padded(tk);
-    let stage = slot_i8(SL_STAGE, N_TILES * HB);
     let v16 = slot_i16(SL_V16, kernels::KV16_LEN);
     for ch in 0..HD {
         let row = &mut v16[ch * kernels::MAX_KEYS..ch * kernels::MAX_KEYS + tkp];
@@ -515,12 +513,9 @@ impl Ctxt {
     }
 
     /// Whole blocks of a scratch region into any buffer.
-    fn read_raw(&self, region: u32, byte_off: usize, dst: &mut [u8]) -> i32 {
-        storage::read_blocks(
-            self.scratch + region + (byte_off / storage::BLOCK) as u32,
-            dst.as_mut_ptr(),
-            (dst.len() / storage::BLOCK) as u32,
-        )
+    /// Block address of a byte offset inside a scratch region.
+    fn lba(&self, region: u32, byte_off: usize) -> u32 {
+        self.scratch + region + (byte_off / storage::BLOCK) as u32
     }
 
     fn write_raw(&self, region: u32, byte_off: usize, src: &[u8]) -> i32 {
@@ -542,8 +537,31 @@ impl Ctxt {
         Ok(e)
     }
 
-    /// Blob into the slot (cached, sum-verified) + one NPU inference.
+    /// Blob into the slot (cached, sum-verified) + one NPU inference on
+    /// arena offsets.
     fn npu(&mut self, blob: &str, input: usize, output: usize) -> i32 {
+        self.npu_addr(blob, arena_addr(input), arena_addr(output))
+    }
+
+    /// Same on absolute activation addresses (any RAM the tensor fits).
+    fn npu_addr(&mut self, blob: &str, input: u32, output: u32) -> i32 {
+        let rc = self.load(blob);
+        if rc != 0 {
+            return rc;
+        }
+        self.run_loaded(blob, input, output)
+    }
+
+    /// Run the blob already in the slot (after `load`); split from it so
+    /// a pipeline can start a DMA transfer between the blob read and the
+    /// NPU run.
+    fn run_loaded(&mut self, blob: &str, input: u32, output: u32) -> i32 {
+        let _wd = crate::WdogGuard::arm();
+        unsafe { slot::run(input, output, blob) }
+    }
+
+    /// Blob into the slot (cached by address, sum-verified, LAY4 expanded).
+    fn load(&mut self, blob: &str) -> i32 {
         let (e, idx) = match lookup_idx(blob) {
             Some(x) => x,
             None => {
@@ -586,9 +604,122 @@ impl Ctxt {
             }
             self.loaded = e;
         }
-        let _wd = crate::WdogGuard::arm();
-        unsafe { slot::run(arena_addr(input), arena_addr(output), blob) }
+        0
     }
+}
+
+// --- storage/compute overlap ----------------------------------------------------
+//
+// A short queue of block transfers issued one after another through the
+// split-phase storage interface. `pump` is called between units of CPU
+// work: it retires a finished transfer and starts the next, so the DMA
+// runs while the CPU computes. `drain` blocks for whatever is left. The
+// first error stops the queue and is reported by whichever call sees it.
+struct IoOp {
+    read: bool,
+    lba: u32,
+    buf: u32,
+    count: u32,
+    what: &'static str,
+}
+
+struct IoQueue {
+    ops: [IoOp; IOQ_MAX],
+    n: usize,
+    next: usize,
+    rc: i32,
+}
+
+const IOQ_MAX: usize = 4;
+
+impl IoQueue {
+    const fn new() -> IoQueue {
+        const E: IoOp = IoOp { read: true, lba: 0, buf: 0, count: 0, what: "" };
+        IoQueue { ops: [E; IOQ_MAX], n: 0, next: 0, rc: 0 }
+    }
+
+    fn push(&mut self, read: bool, lba: u32, buf: &[u8], what: &'static str) {
+        assert!(self.n < IOQ_MAX && buf.len() % storage::BLOCK == 0);
+        self.ops[self.n] = IoOp {
+            read,
+            lba,
+            buf: buf.as_ptr() as u32,
+            count: (buf.len() / storage::BLOCK) as u32,
+            what,
+        };
+        self.n += 1;
+    }
+
+    /// Retire a completed transfer and start the next one; never blocks.
+    fn pump(&mut self) -> Result<(), i32> {
+        if self.rc != 0 {
+            return Err(self.rc);
+        }
+        if storage::busy() {
+            if !storage::poll() {
+                return Ok(());
+            }
+            let rc = storage::finish();
+            if rc != 0 {
+                return self.fail(self.next - 1, rc);
+            }
+        }
+        if self.next < self.n {
+            let op = &self.ops[self.next];
+            let rc = if op.read {
+                storage::read_start(op.lba, op.buf as *mut u8, op.count)
+            } else {
+                storage::write_start(op.lba, op.buf as *const u8, op.count)
+            };
+            self.next += 1;
+            if rc != 0 {
+                return self.fail(self.next - 1, rc);
+            }
+        }
+        Ok(())
+    }
+
+    fn fail(&mut self, i: usize, rc: i32) -> Result<(), i32> {
+        rprintln!("FAIL {} rc={}", self.ops[i].what, rc);
+        self.rc = rc;
+        Err(rc)
+    }
+
+    /// Block until every queued transfer is through, then reset.
+    fn drain(&mut self) -> Result<(), i32> {
+        loop {
+            self.pump()?;
+            if self.next == self.n && !storage::busy() {
+                break;
+            }
+        }
+        self.n = 0;
+        self.next = 0;
+        Ok(())
+    }
+}
+
+/// Wait for one split-phase transfer started outside a queue.
+fn io_wait(what: &str) -> Result<(), i32> {
+    let rc = storage::finish();
+    if rc != 0 {
+        rprintln!("FAIL {} rc={}", what, rc);
+        return Err(rc);
+    }
+    Ok(())
+}
+
+fn io_start(read: bool, lba: u32, buf: &[u8], what: &str) -> Result<(), i32> {
+    let rc = if read {
+        storage::read_start(lba, buf.as_ptr() as *mut u8, (buf.len() / storage::BLOCK) as u32)
+    } else {
+        storage::write_start(lba, buf.as_ptr(), (buf.len() / storage::BLOCK) as u32)
+    };
+    if rc != 0 {
+        rprintln!("FAIL {} rc={}", what, rc);
+        return Err(rc);
+    }
+    Ok(())
 }
 
 /// Largest weight region a packable blob may carry, in 64-weight groups
@@ -818,6 +949,11 @@ fn mic_check(c: &Ctxt) -> Result<(), i32> {
 }
 
 fn utterance(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
+    // A pipeline that failed mid-flight leaves its transfer pending; every
+    // blocking storage call would then refuse with -495.
+    if storage::busy() {
+        let _ = storage::finish();
+    }
     #[cfg(feature = "mic-check")]
     {
         let _ = plan;
@@ -912,6 +1048,8 @@ fn fp(c: &Ctxt, region: u32, label: &str) {
 
 /// Per-phase SD throughput line (drains the counters). Rates well below
 /// the session's first-utterance numbers implicate the card, not code.
+/// The ms figures are CPU time spent in storage calls: split-phase
+/// transfers only count the part that was not hidden behind compute.
 fn sd_stats(phase: &str) {
     let (rb, rc, wb, wc) = storage::stats_take();
     rprintln!(
@@ -1521,41 +1659,75 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         }
         // attention: a head's K, V and Q tile blocks are contiguous in
         // their regions, so each is one read; keys/values go transposed
-        // and widened into the idle slot, every tile's context is staged
-        // in the interlayer and written with one command per head
+        // and widened into the idle slot. While head h computes, the DMA
+        // writes head h-1's context tiles and fetches head h+1's K, V
+        // and Q into the arena / KV scratch (pumped every 16 queries).
         crate::crumb(0x524 + (l as u32) * 0x10);
         let sm = bq.q_out.scale * bq.k_out.scale / 8.0;
         let stage = c.tiles * HB;
         c.loaded = Entry::default();
+        let mut ioq = IoQueue::new();
+        ioq.push(true, c.lba(S_KH, 0), arena(A_PK, stage), "k rd");
+        ioq.push(true, c.lba(S_VH, 0), arena(A_PV, stage), "v rd");
+        ioq.push(true, c.lba(S_QH, 0), kvscratch(KV_PQ, stage), "q rd");
+        ioq.drain()?;
         for h in 0..HEADS {
-            try_rc!(c.read_raw(S_KH, h * N_TILES * HB, slot_u8(SL_STAGE, stage)), "k rd");
             let t0 = cycles();
-            prepare_kv_from_stage(c.ctx);
+            prepare_kv_from(as_i8(A_PK, stage), c.ctx);
+            prepare_v_from(as_i8(A_PV, stage), c.ctx);
+            slot_u8(SL_STAGE, stage).copy_from_slice(kvscratch(KV_PQ, stage));
             prof_add(P_ATTN, t0);
-            try_rc!(c.read_raw(S_VH, h * N_TILES * HB, slot_u8(SL_STAGE, stage)), "v rd");
-            let t0 = cycles();
-            prepare_v_from_stage(c.ctx);
-            prof_add(P_ATTN, t0);
-            try_rc!(c.read_raw(S_QH, h * N_TILES * HB, slot_u8(SL_STAGE, stage)), "q rd");
+            if h > 0 {
+                let prev = if (h - 1) % 2 == 0 {
+                    interlayer_at(IL_CTX, stage)
+                } else {
+                    kvscratch(KV_CTX1, stage)
+                };
+                ioq.push(false, c.lba(S_CH, (h - 1) * N_TILES * HB), prev, "ctx wr");
+            }
+            if h + 1 < HEADS {
+                let nb = (h + 1) * N_TILES * HB;
+                ioq.push(true, c.lba(S_KH, nb), arena(A_PK, stage), "k rd");
+                ioq.push(true, c.lba(S_VH, nb), arena(A_PV, stage), "v rd");
+                ioq.push(true, c.lba(S_QH, nb), kvscratch(KV_PQ, stage), "q rd");
+            }
+            ioq.pump()?;
             let t0 = cycles();
             let kv = kernels::AttnKv {
                 kt: slot_i16(SL_KT, kernels::KV16_LEN),
                 v16: slot_i16(SL_V16, kernels::KV16_LEN),
                 tk: c.ctx,
             };
+            const QSTEP: usize = 16;
             for i in 0..c.tiles {
-                let ctx = interlayer_at(IL_CTX + i * HB, HB);
+                let ctx = if h % 2 == 0 {
+                    interlayer_at(IL_CTX + i * HB, HB)
+                } else {
+                    kvscratch(KV_CTX1 + i * HB, HB)
+                };
                 let ctx = unsafe {
                     core::slice::from_raw_parts_mut(ctx.as_mut_ptr() as *mut i8, HB)
                 };
-                kernels::attn_head_kt(
-                    &slot_i8(SL_STAGE, stage)[i * HB..(i + 1) * HB], &kv, ctx, T, T,
-                    bq.q_out.zp, bq.k_out.zp, bq.v_out.zp,
-                    sm, bq.v_out.scale, bq.ctx, attn_scratch2(), softmax_exp,
-                );
+                let q = &slot_i8(SL_STAGE, stage)[i * HB..(i + 1) * HB];
+                for q0 in (0..T).step_by(QSTEP) {
+                    kernels::attn_head_kt(
+                        &q[q0..], &kv, &mut ctx[q0..], QSTEP, T,
+                        bq.q_out.zp, bq.k_out.zp, bq.v_out.zp,
+                        sm, bq.v_out.scale, bq.ctx, attn_scratch2(), softmax_exp,
+                    );
+                    ioq.pump()?;
+                }
             }
             prof_add(P_ATTN, t0);
-            try_rc!(c.write_raw(S_CH, h * N_TILES * HB, interlayer_at(IL_CTX, stage)), "ctx wr");
+            ioq.drain()?;
+        }
+        {
+            let last = if (HEADS - 1) % 2 == 0 {
+                interlayer_at(IL_CTX, stage)
+            } else {
+                kvscratch(KV_CTX1, stage)
+            };
+            try_rc!(c.write_raw(S_CH, (HEADS - 1) * N_TILES * HB, last), "ctx wr");
         }
         // out-projection
         crate::crumb(0x525 + (l as u32) * 0x10);
@@ -1574,18 +1746,43 @@ fn encoder(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
 
         // mlp
         ln_region(c, Name::of(&["e", DIGITS[l], "ln2_gb"]).s(), bq.res1, bq.ln2)?;
+        // Tile pipeline: the previous tile's partial writes out during
+        // the fc1 NPU run, the next tile's input reads in during fc2p's
+        // (one transfer per NPU run, which is all the serial channel can
+        // overlap). The blobs alternate every tile, so each is loaded,
+        // synchronously, before its transfer starts.
         for j in 0..4usize {
             let f1 = enc_blob(l, "fc1", j);
             let p2 = enc_blob(l, "fc2p", j);
             c.asset(Name::of(&["e", DIGITS[l], "lut", DIGITS[j]]).s(), A_LUT)?;
+            let preg = S_P + j as u32 * HREG_BLOCKS;
+            try_rc!(c.read(S_LN, 0, A_X0, TILE8), "fc in");
             for i in 0..c.tiles {
-                try_rc!(c.read(S_LN, i * TILE8, A_IN, TILE8), "fc in");
-                try_rc!(c.npu(f1.s(), A_IN, A_OUT), "fc1");
+                let (x, pb) = if i % 2 == 0 { (A_X0, KV_P0) } else { (A_X1, KV_P1) };
+                try_rc!(c.load(f1.s()), "fc1 load");
+                if i > 0 {
+                    let pp = if i % 2 == 0 { KV_P1 } else { KV_P0 };
+                    io_start(false, c.lba(preg, (i - 1) * TILE8), kvscratch(pp, TILE8), "p wr")?;
+                }
+                try_rc!(c.run_loaded(f1.s(), arena_addr(x), arena_addr(A_OUT)), "fc1");
+                if i > 0 {
+                    io_wait("p wr")?;
+                }
+                try_rc!(c.load(p2.s()), "fc2p load");
+                if i + 1 < c.tiles {
+                    let xn = if i % 2 == 0 { A_X1 } else { A_X0 };
+                    io_start(true, c.lba(S_LN, (i + 1) * TILE8), arena(xn, TILE8), "fc in")?;
+                }
                 lut_apply(A_LUT, A_OUT, TILE8);
-                try_rc!(c.npu(p2.s(), A_OUT, A_IN), "fc2p");
-                try_rc!(c.write(S_P + j as u32 * HREG_BLOCKS, i * TILE8,
-                                A_IN, TILE8), "p wr");
+                try_rc!(c.run_loaded(p2.s(), arena_addr(A_OUT), kvscratch_addr(pb)), "fc2p");
+                if i + 1 < c.tiles {
+                    io_wait("fc in")?;
+                }
             }
+            let last = if (c.tiles - 1) % 2 == 0 { KV_P0 } else { KV_P1 };
+            try_rc!(storage::write_blocks(c.lba(preg, (c.tiles - 1) * TILE8),
+                                          kvscratch_addr(last) as *const u8,
+                                          (TILE8 / storage::BLOCK) as u32), "p wr");
         }
         // recombination: x16 += sum of dequantized partials
         crate::crumb(0x528 + (l as u32) * 0x10);
@@ -1658,8 +1855,44 @@ fn cross_kv(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
 // --- decode ------------------------------------------------------------------------
 
 // Self-attention KV cache: [layer][k|v] planar [384, MAX_TOKENS] int8.
-pub static mut SELF_KV: [[i8; C * MAX_TOKENS]; 2 * BLOCKS] =
-    [[0; C * MAX_TOKENS]; 2 * BLOCKS];
+// Word-aligned because the encoder borrows it as DMA scratch (KV_*).
+#[repr(C, align(4))]
+pub struct KvCache(pub [[i8; C * MAX_TOKENS]; 2 * BLOCKS]);
+pub static mut SELF_KV: KvCache = KvCache([[0; C * MAX_TOKENS]; 2 * BLOCKS]);
+pub const KV_BYTES: usize = 2 * BLOCKS * C * MAX_TOKENS; // 98304
+
+/// The KV cache as encoder-phase scratch (it is zeroed when decode starts).
+fn kvscratch(off: usize, len: usize) -> &'static mut [u8] {
+    assert!(off + len <= KV_BYTES);
+    unsafe {
+        core::slice::from_raw_parts_mut(
+            (core::ptr::addr_of_mut!(SELF_KV) as *mut u8).add(off), len)
+    }
+}
+
+fn kvscratch_addr(off: usize) -> u32 {
+    unsafe { (core::ptr::addr_of!(SELF_KV) as *const u8).add(off) as u32 }
+}
+
+// Encoder attention pipeline buffers: the next head's K/V/Q tile blocks
+// land here by DMA while the current head computes (STAGE_BYTES each),
+// and the context tiles alternate between two buffers so one head's write
+// overlaps the next head's attention. The MLP tile pipeline reuses the
+// same memory for its double-buffered input and fc2 partial.
+const STAGE_BYTES: usize = N_TILES * HB; // 40960
+const A_PK: usize = 0; // arena: next head's K blocks
+const A_PV: usize = STAGE_BYTES; // arena: next head's V blocks
+const _: () = assert!(A_PV + STAGE_BYTES <= crate::ARENA_BYTES);
+const KV_PQ: usize = 0; // kv scratch: next head's Q blocks
+const KV_CTX1: usize = STAGE_BYTES; // kv scratch: second context buffer
+const _: () = assert!(KV_CTX1 + STAGE_BYTES <= KV_BYTES);
+// MLP tile pipeline: input tiles alternate A_X0/A_X1, fc2 partials KV_P0/KV_P1.
+const A_X0: usize = 0;
+const A_X1: usize = TILE8;
+const _: () = assert!(A_X1 + TILE8 <= A_OUT);
+const KV_P0: usize = 0;
+const KV_P1: usize = TILE8;
+const _: () = assert!(KV_P1 + TILE8 <= KV_BYTES);
 
 // Token-rate arena (decode phase): [384,4] tensors.
 const W4: usize = 4;
@@ -1713,7 +1946,7 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     let fin = lookup("final_gb.bin").ok_or(-901)?;
 
     unsafe {
-        for m in (*core::ptr::addr_of_mut!(SELF_KV)).iter_mut() {
+        for m in (*core::ptr::addr_of_mut!(SELF_KV)).0.iter_mut() {
             m.fill(0);
         }
     }
@@ -1759,7 +1992,7 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
             try_rc!(c.npu(dec_blob(l, "v", 0).s(), D_LN, D_V), "dv");
             // append column n_tok to the cache (planar stride MAX_TOKENS)
             unsafe {
-                let kv = &mut *core::ptr::addr_of_mut!(SELF_KV);
+                let kv = &mut (*core::ptr::addr_of_mut!(SELF_KV)).0;
                 for ci in 0..C {
                     kv[l * 2][ci * MAX_TOKENS + n_tok] = as_i8(D_K, C * W4)[ci * W4];
                     kv[l * 2 + 1][ci * MAX_TOKENS + n_tok] =
@@ -1769,7 +2002,7 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
             let t = n_tok + 1;
             let smq = bq.q_out.scale * bq.k_out.scale / 8.0;
             unsafe {
-                let kv = &*core::ptr::addr_of!(SELF_KV);
+                let kv = &(*core::ptr::addr_of!(SELF_KV)).0;
                 for h in 0..HEADS {
                     kernels::attn_head(
                         &as_i8(D_Q, C * W4)[h * HD * W4..(h + 1) * HD * W4],
@@ -1791,20 +2024,28 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
                    D_X16, sq, D_LN, bq.xln)?;
             try_rc!(c.npu(dec_blob(l, "xq", 0).s(), D_LN, D_Q), "dxq");
             let smx = bq.xq_out.scale * bq.xk_out.scale / 8.0;
-            // each head's K and V tile blocks: one read each into the
-            // slot (idle between dxq and dxout), transposed/widened there
+            // each head's K and V tile blocks: one read each, K staged in
+            // the slot (idle between dxq and dxout) and V in the arena's
+            // LM-head rows, so the next read runs while the previous
+            // blocks are transposed/widened and the head computes
             let stage = c.tiles * HB;
             c.loaded = Entry::default();
+            let kreg = S_XKV + (l as u32 * 2) * HREG_BLOCKS;
+            let vreg = S_XKV + (l as u32 * 2 + 1) * HREG_BLOCKS;
+            io_start(true, c.lba(kreg, 0), slot_u8(SL_STAGE, stage), "xk rd")?;
+            io_wait("xk rd")?;
             for h in 0..HEADS {
-                let kreg = S_XKV + (l as u32 * 2) * HREG_BLOCKS;
-                let vreg = S_XKV + (l as u32 * 2 + 1) * HREG_BLOCKS;
-                try_rc!(c.read_raw(kreg, h * N_TILES * HB, slot_u8(SL_STAGE, stage)), "xk rd");
+                io_start(true, c.lba(vreg, h * N_TILES * HB), arena(D_ROWS, stage), "xv rd")?;
                 let t0 = cycles();
-                prepare_kv_from_stage(c.ctx);
+                prepare_kv_from(slot_i8(SL_STAGE, stage), c.ctx);
                 prof_add(P_ATTN, t0);
-                try_rc!(c.read_raw(vreg, h * N_TILES * HB, slot_u8(SL_STAGE, stage)), "xv rd");
+                io_wait("xv rd")?;
+                if h + 1 < HEADS {
+                    io_start(true, c.lba(kreg, (h + 1) * N_TILES * HB),
+                             slot_u8(SL_STAGE, stage), "xk rd")?;
+                }
                 let t0 = cycles();
-                prepare_v_from_stage(c.ctx);
+                prepare_v_from(as_i8(D_ROWS, stage), c.ctx);
                 let kv = kernels::AttnKv {
                     kt: slot_i16(SL_KT, kernels::KV16_LEN),
                     v16: slot_i16(SL_V16, kernels::KV16_LEN),
@@ -1817,6 +2058,9 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
                     smx, bq.xv_out.scale, bq.xctx, attn_scratch2(), softmax_exp,
                 );
                 prof_add(P_ATTN, t0);
+                if h + 1 < HEADS {
+                    io_wait("xk rd")?;
+                }
             }
             try_rc!(c.npu(dec_blob(l, "xout", 0).s(), D_CTX, D_O), "dxout");
             dec_add(D_X16, sq, D_O, bq.xout_out, bq.res2);
@@ -1957,13 +2201,20 @@ fn lm_head(plan: &Plan, embc: Entry, hid: &[f32; C], first: bool) -> Result<u32,
     let mut best2 = f32::MIN;
     let mut best_id = plan.eot;
     let rows16 = as_i16_mut(D_ROWS, ROWS * C);
-    for chunk in 0..plan.vocab_n.div_ceil(ROWS) {
-        // the packed chunk bounces through the interlayer buffer:
-        // transient use between NPU runs is fine (nothing persists)
-        let il = interlayer(CH_BLOCKS * storage::BLOCK);
-        try_rc!(storage::read_blocks(embc.lba + (chunk * CH_BLOCKS) as u32,
-                                     il.as_mut_ptr(), CH_BLOCKS as u32),
-                "embc rd");
+    // packed chunks alternate between two interlayer buffers (transient
+    // use between NPU runs): chunk i+1 streams in while chunk i is
+    // unpacked and dotted
+    const CH_BYTES: usize = CH_BLOCKS * storage::BLOCK;
+    const _: () = assert!(2 * CH_BYTES <= crate::INTERLAYER_BUFFER_BYTES);
+    let n_chunks = plan.vocab_n.div_ceil(ROWS);
+    io_start(true, embc.lba, interlayer_at(0, CH_BYTES), "embc rd")?;
+    for chunk in 0..n_chunks {
+        io_wait("embc rd")?;
+        if chunk + 1 < n_chunks {
+            io_start(true, embc.lba + ((chunk + 1) * CH_BLOCKS) as u32,
+                     interlayer_at(((chunk + 1) % 2) * CH_BYTES, CH_BYTES), "embc rd")?;
+        }
+        let il = interlayer_at((chunk % 2) * CH_BYTES, CH_BYTES);
         let t0 = cycles();
         crate::q4::unpack16(lut16_tables(), &il[CH_AMAX..CH_NIBS], &il[CH_NIBS..CH_USED],
                             rows16);

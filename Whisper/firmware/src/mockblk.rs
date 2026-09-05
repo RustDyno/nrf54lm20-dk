@@ -121,6 +121,11 @@ fn response(to_ms: u32) -> Result<(i32, u32, u32), i32> {
     if rc != 0 {
         return Err(rc);
     }
+    response_parse()
+}
+
+/// Check the response frame already in RSP against the request's tag.
+fn response_parse() -> Result<(i32, u32, u32), i32> {
     let f = unsafe { &(*addr_of!(RSP)).0 };
     if get32(f, 0) != RSP_MAGIC {
         rprintln!("mock: bad response magic {:#010x}", get32(f, 0));
@@ -296,4 +301,199 @@ fn rw_aligned(lba: u32, buf: u32, count: u32, read: bool) -> i32 {
             Err(e) => e,
         }
     }
+}
+
+// --- split-phase block interface (same contract as usb.rs) ---------------------
+//
+// The request/response frames are short synchronous exchanges; the block
+// payload is what runs on the endpoint DMA while the CPU works. Cycle
+// accounting counts only the time spent inside these calls (the stall the
+// overlap did not hide), like usb.rs.
+
+enum Stage {
+    Idle,
+    /// Payload in flight (READ: OUT transfer into the buffer; WRITE: IN
+    /// transfer out of it).
+    Data(usbdev::Xfer),
+    /// WRITE: the daemon's response frame in flight.
+    Resp(usbdev::Xfer),
+    /// Result ready.
+    Done,
+}
+
+struct AsyncOp {
+    stage: Stage,
+    read: bool,
+    lba: u32,
+    buf: u32,
+    count: u32,
+    sum: u32,
+    to_ms: u32,
+    rc: i32,
+}
+
+static mut ASYNC: AsyncOp = AsyncOp {
+    stage: Stage::Idle,
+    read: false,
+    lba: 0,
+    buf: 0,
+    count: 0,
+    sum: 0,
+    to_ms: 0,
+    rc: 0,
+};
+
+pub fn read_start(lba: u32, dst: *mut u8, count: u32) -> i32 {
+    async_start(lba, dst as u32, count, true)
+}
+
+pub fn write_start(lba: u32, src: *const u8, count: u32) -> i32 {
+    async_start(lba, src as u32, count, false)
+}
+
+fn account(read: bool, count: u32, t0: u32) {
+    let dt = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(t0) as u64;
+    unsafe {
+        if read {
+            RD_CYC += dt;
+            RD_BYTES += count as u64 * BLOCK as u64;
+        } else {
+            WR_CYC += dt;
+            WR_BYTES += count as u64 * BLOCK as u64;
+        }
+    }
+}
+
+fn async_start(lba: u32, buf: u32, count: u32, read: bool) -> i32 {
+    let a = unsafe { &mut *addr_of_mut!(ASYNC) };
+    if !matches!(a.stage, Stage::Idle) {
+        return -495;
+    }
+    let t0 = cortex_m::peripheral::DWT::cycle_count();
+    a.read = read;
+    a.lba = lba;
+    a.buf = buf;
+    a.count = count;
+    // Unaligned or empty requests, and a link that is not up, take the
+    // synchronous path and report through xfer_finish().
+    if buf & 3 != 0 || count == 0 || !unsafe { core::ptr::read_volatile(addr_of!(READY)) } {
+        a.rc = rw(lba, buf, count, read);
+        a.stage = Stage::Done;
+        account(read, count, t0);
+        return 0;
+    }
+    let bytes = count as usize * BLOCK;
+    a.to_ms = 3000 + (bytes >> 10) as u32 * 2;
+    let rc = if read {
+        match request(OP_READ, lba, count, 0, a.to_ms) {
+            0 => match response(a.to_ms) {
+                Ok((0, n, sum)) if n == count => {
+                    a.sum = sum;
+                    0
+                }
+                Ok((0, _, _)) => -644,
+                Ok((st, _, _)) => {
+                    rprintln!("mock: read lba {} x{} refused ({})", lba, count, st);
+                    -643
+                }
+                Err(e) => e,
+            },
+            e => e,
+        }
+    } else {
+        request(OP_WRITE, lba, count, sum32(buf, bytes), a.to_ms)
+    };
+    if rc != 0 {
+        a.rc = rc;
+        a.stage = Stage::Done;
+    } else {
+        a.stage = Stage::Data(if read {
+            usbdev::recv_start(buf, bytes, a.to_ms)
+        } else {
+            usbdev::send_start(buf, bytes, a.to_ms)
+        });
+    }
+    account(read, count, t0);
+    0
+}
+
+/// True when the transfer has run to completion (rc ready for xfer_finish()).
+pub fn xfer_poll() -> bool {
+    let read = unsafe { (*addr_of!(ASYNC)).read };
+    let t0 = cortex_m::peripheral::DWT::cycle_count();
+    let done = poll_inner();
+    account(read, 0, t0);
+    done
+}
+
+fn poll_inner() -> bool {
+    let a = unsafe { &mut *addr_of_mut!(ASYNC) };
+    let bytes = a.count as usize * BLOCK;
+    match &mut a.stage {
+        Stage::Idle | Stage::Done => true,
+        Stage::Data(x) => {
+            let rc = if a.read { usbdev::recv_check(x) } else { usbdev::send_check(x) };
+            let rc = match rc {
+                None => return false,
+                Some(rc) => rc,
+            };
+            if rc != 0 {
+                a.rc = rc;
+                a.stage = Stage::Done;
+                return true;
+            }
+            if a.read {
+                let got = sum32(a.buf, bytes);
+                a.rc = if got != a.sum {
+                    rprintln!(
+                        "mock: read lba {} x{} checksum {:#010x} != {:#010x}",
+                        a.lba, a.count, got, a.sum
+                    );
+                    -645
+                } else {
+                    0
+                };
+                a.stage = Stage::Done;
+                return true;
+            }
+            // the daemon files the blocks and answers; wait for that on
+            // the endpoint DMA too
+            a.stage = Stage::Resp(usbdev::recv_start(addr_of_mut!(RSP) as u32, BLOCK, a.to_ms));
+            false
+        }
+        Stage::Resp(x) => {
+            let rc = match usbdev::recv_check(x) {
+                None => return false,
+                Some(rc) => rc,
+            };
+            a.rc = if rc != 0 {
+                rc
+            } else {
+                match response_parse() {
+                    Ok((0, _, _)) => 0,
+                    Ok((st, _, _)) => {
+                        rprintln!("mock: write lba {} x{} refused ({})", a.lba, a.count, st);
+                        -646
+                    }
+                    Err(e) => e,
+                }
+            };
+            a.stage = Stage::Done;
+            true
+        }
+    }
+}
+
+/// Block until the in-flight transfer is done; returns its result. A call
+/// with nothing in flight returns 0.
+pub fn xfer_finish() -> i32 {
+    let a = unsafe { &mut *addr_of_mut!(ASYNC) };
+    if matches!(a.stage, Stage::Idle) {
+        return 0;
+    }
+    let t0 = cortex_m::peripheral::DWT::cycle_count();
+    while !poll_inner() {}
+    account(a.read, 0, t0);
+    a.stage = Stage::Idle;
+    a.rc
 }

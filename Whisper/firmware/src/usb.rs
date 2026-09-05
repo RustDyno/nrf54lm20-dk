@@ -249,6 +249,19 @@ fn chr(dev_addr: u32, ep: u32, dir_in: bool, eptype: u32, mps: u32) -> u32 {
 /// packet from the device completes the transfer early. Returns the next
 /// PID the endpoint expects.
 fn ch0(chr_v: u32, pid: u32, dma: u32, len: usize, mps: usize, to_ms: u32) -> Result<u32, i32> {
+    ch0_arm(chr_v, pid, dma, len, mps);
+    let start = cortex_m::peripheral::DWT::cycle_count();
+    loop {
+        if let Some(r) = ch0_check(chr_v, start, to_ms) {
+            return r;
+        }
+    }
+}
+
+/// Program and enable channel 0; the core runs the transfer on its own
+/// from here (buffer DMA), so the CPU is free until `ch0_check` says the
+/// channel halted.
+fn ch0_arm(chr_v: u32, pid: u32, dma: u32, len: usize, mps: usize) {
     let pkts = if len == 0 { 1 } else { len.div_ceil(mps) as u32 };
     unsafe {
         write_volatile(core_reg(HCINT0), 0xFFFF_FFFF);
@@ -257,20 +270,28 @@ fn ch0(chr_v: u32, pid: u32, dma: u32, len: usize, mps: usize, to_ms: u32) -> Re
         write_volatile(core_reg(HCDMA0), dma);
         write_volatile(core_reg(HCCHAR0), chr_v | CH_CHENA);
     }
-    if !poll(core_reg(HCINT0), HCI_CHHLTD, HCI_CHHLTD, to_ms) {
+}
+
+/// Non-blocking completion check for an armed channel: None while it is
+/// still running and within `to_ms` of `start` (a DWT cycle stamp).
+fn ch0_check(chr_v: u32, start: u32, to_ms: u32) -> Option<Result<u32, i32>> {
+    let ints = unsafe { read_volatile(core_reg(HCINT0)) };
+    if ints & HCI_CHHLTD == 0 {
+        if cortex_m::peripheral::DWT::cycle_count().wrapping_sub(start) < to_ms * CYC_PER_MS {
+            return None;
+        }
         // Deadline (device NAKing forever, or gone): request a halt and
         // give the core a moment to return the channel.
         unsafe {
             write_volatile(core_reg(HCCHAR0), chr_v | CH_CHENA | CH_CHDIS);
         }
         poll(core_reg(HCINT0), HCI_CHHLTD, HCI_CHHLTD, 5);
-        return Err(-650);
+        return Some(Err(-650));
     }
-    let ints = unsafe { read_volatile(core_reg(HCINT0)) };
     if ints & HCI_XFERCOMPL != 0 {
-        return Ok(unsafe { read_volatile(core_reg(HCTSIZ0)) } >> 29 & 3);
+        return Some(Ok(unsafe { read_volatile(core_reg(HCTSIZ0)) } >> 29 & 3));
     }
-    Err(if ints & HCI_STALL != 0 {
+    Some(Err(if ints & HCI_STALL != 0 {
         -651
     } else if ints & HCI_XACTERR != 0 {
         -652
@@ -284,7 +305,7 @@ fn ch0(chr_v: u32, pid: u32, dma: u32, len: usize, mps: usize, to_ms: u32) -> Re
         -656
     } else {
         -657
-    })
+    }))
 }
 
 /// Control transfer on endpoint 0. `dlen` bytes of IN data land in BOUNCE
@@ -330,29 +351,43 @@ fn control_in(sp: [u8; 8], dlen: usize) -> i32 {
 }
 
 fn bulk(dir_in: bool, dma: u32, len: usize, to_ms: u32) -> i32 {
-    let d = unsafe { &mut *core::ptr::addr_of_mut!(DEV) };
+    let chr_v = bulk_arm(dir_in, dma, len);
+    let start = cortex_m::peripheral::DWT::cycle_count();
+    loop {
+        if let Some(rc) = bulk_check(dir_in, chr_v, start, to_ms) {
+            return rc;
+        }
+    }
+}
+
+/// Arm a bulk transfer on the MSC endpoint of `dir_in`; returns the
+/// HCCHAR value `bulk_check` needs.
+fn bulk_arm(dir_in: bool, dma: u32, len: usize) -> u32 {
+    let d = unsafe { &*core::ptr::addr_of!(DEV) };
     let (ep, mps, pid) = if dir_in {
         (d.msc.ep_in, d.msc.mps_in, d.pid_in)
     } else {
         (d.msc.ep_out, d.msc.mps_out, d.pid_out)
     };
-    match ch0(
-        chr(d.addr, ep as u32, dir_in, CH_EPTYPE_BULK, mps as u32),
-        pid,
-        dma,
-        len,
-        mps as usize,
-        to_ms,
-    ) {
+    let chr_v = chr(d.addr, ep as u32, dir_in, CH_EPTYPE_BULK, mps as u32);
+    ch0_arm(chr_v, pid, dma, len, mps as usize);
+    chr_v
+}
+
+/// Completion check for `bulk_arm`; carries the data toggle forward on
+/// success. None while the transfer is still running.
+fn bulk_check(dir_in: bool, chr_v: u32, start: u32, to_ms: u32) -> Option<i32> {
+    let d = unsafe { &mut *core::ptr::addr_of_mut!(DEV) };
+    match ch0_check(chr_v, start, to_ms)? {
         Ok(next) => {
             if dir_in {
                 d.pid_in = next;
             } else {
                 d.pid_out = next;
             }
-            0
+            Some(0)
         }
-        Err(e) => e,
+        Err(e) => Some(e),
     }
 }
 
@@ -426,8 +461,13 @@ fn bot_inner(cb: &[u8], dir_in: bool, dma: u32, dlen: usize, data_to_ms: u32) ->
         }
         off += n;
     }
-    // CSW on bulk IN. One retry after a STALL (BOT 1.0, 6.7.2).
-    let mps_in = d.msc.mps_in as usize;
+    csw_phase(tag)
+}
+
+/// CSW on bulk IN, one retry after a STALL (BOT 1.0, 6.7.2), checked
+/// against the command's tag.
+fn csw_phase(tag: u32) -> i32 {
+    let mps_in = unsafe { (*core::ptr::addr_of!(DEV)).msc.mps_in } as usize;
     let csw_addr = core::ptr::addr_of_mut!(CSWBUF) as u32;
     let mut rc = bulk(true, csw_addr, mps_in, 500);
     if rc == -651 {
@@ -914,4 +954,247 @@ fn rw_aligned(lba: u32, buf: u32, count: u32, read: bool) -> i32 {
         done += n;
     }
     0
+}
+
+// --- split-phase block interface -----------------------------------------------
+//
+// One READ(10)/WRITE(10) whose data phase runs on the channel's DMA while
+// the CPU does something else: `start` sends the CBW and arms the first
+// data chunk, `poll` advances the command (next chunk, CSW) whenever the
+// caller checks in, `finish` blocks for the rest. The BOT transport is
+// strictly one command at a time, so there is at most one in flight;
+// storage.rs enforces that above this layer. Cycle accounting counts only
+// the time the CPU spent inside these calls, i.e. the storage stall that
+// the overlap failed to hide.
+
+struct AsyncOp {
+    active: bool,
+    read: bool,
+    buf: u32,
+    bytes: usize,
+    off: usize,
+    /// Bytes programmed for the running data chunk.
+    prog: usize,
+    chr_v: u32,
+    start: u32,
+    to_ms: u32,
+    tag: u32,
+    rc: i32,
+    stage: Stage,
+    /// One CSW re-read after a STALL (BOT 1.0, 6.7.2) has been used.
+    csw_retried: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Stage {
+    Data,
+    Csw,
+    Done,
+}
+
+static mut ASYNC: AsyncOp = AsyncOp {
+    active: false,
+    read: false,
+    buf: 0,
+    bytes: 0,
+    off: 0,
+    prog: 0,
+    chr_v: 0,
+    start: 0,
+    to_ms: 0,
+    tag: 0,
+    rc: 0,
+    stage: Stage::Done,
+    csw_retried: false,
+};
+
+pub fn read_start(lba: u32, dst: *mut u8, count: u32) -> i32 {
+    async_start(lba, dst as u32, count, true)
+}
+
+pub fn write_start(lba: u32, src: *const u8, count: u32) -> i32 {
+    async_start(lba, src as u32, count, false)
+}
+
+fn async_start(lba: u32, buf: u32, count: u32, read: bool) -> i32 {
+    let a = unsafe { &mut *core::ptr::addr_of_mut!(ASYNC) };
+    if a.active {
+        return -495;
+    }
+    let t0 = cortex_m::peripheral::DWT::cycle_count();
+    // Cases the split path does not cover run synchronously and report
+    // through the same finish(): unaligned buffers, empty and oversized
+    // requests, and a stick that is not there.
+    if buf & 3 != 0 || count == 0 || count > 65_535 || !unsafe { (*core::ptr::addr_of!(DEV)).ready } {
+        a.rc = rw_blocks(lba, buf, count, read);
+        a.active = true;
+        a.stage = Stage::Done;
+        a.read = read;
+        async_account(read, count, t0);
+        return 0;
+    }
+    let bytes = count as usize * BLOCK;
+    let cdb: [u8; 10] = if read {
+        proto::cdb_read10(lba, count as u16)
+    } else {
+        proto::cdb_write10(lba, count as u16)
+    };
+    let d = unsafe { &mut *core::ptr::addr_of_mut!(DEV) };
+    d.tag = d.tag.wrapping_add(1);
+    let tag = d.tag;
+    unsafe {
+        proto::build_cbw(&mut (*core::ptr::addr_of_mut!(CBW)).0, tag, bytes as u32, read, &cdb);
+    }
+    let rc = bulk(false, core::ptr::addr_of!(CBW) as u32, proto::CBW_LEN, 500);
+    *a = AsyncOp {
+        active: true,
+        read,
+        buf,
+        bytes,
+        off: 0,
+        prog: 0,
+        chr_v: 0,
+        start: 0,
+        to_ms: if read {
+            500 + (bytes >> 10) as u32 * 2
+        } else {
+            3000 + (bytes >> 10) as u32 * 4
+        },
+        tag,
+        rc,
+        stage: Stage::Data,
+        csw_retried: false,
+    };
+    if rc != 0 {
+        bot_recover();
+        a.stage = Stage::Done; // xfer_finish() reports rc
+    } else {
+        async_arm_chunk();
+    }
+    async_account(read, count, t0);
+    0
+}
+
+fn async_account(read: bool, count: u32, t0: u32) {
+    let dt = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(t0) as u64;
+    unsafe {
+        if read {
+            RD_CYC += dt;
+            RD_BYTES += count as u64 * BLOCK as u64;
+        } else {
+            WR_CYC += dt;
+            WR_BYTES += count as u64 * BLOCK as u64;
+        }
+    }
+}
+
+fn async_arm_chunk() {
+    let a = unsafe { &mut *core::ptr::addr_of_mut!(ASYNC) };
+    let d = unsafe { &*core::ptr::addr_of!(DEV) };
+    let mps = if a.read { d.msc.mps_in } else { d.msc.mps_out } as usize;
+    let n = (a.bytes - a.off).min(chunk_bytes(mps));
+    a.prog = n;
+    a.chr_v = bulk_arm(a.read, a.buf + a.off as u32, n);
+    a.start = cortex_m::peripheral::DWT::cycle_count();
+}
+
+/// True when the command has run to completion (rc ready for xfer_finish()).
+pub fn xfer_poll() -> bool {
+    let a = unsafe { &*core::ptr::addr_of!(ASYNC) };
+    let t0 = cortex_m::peripheral::DWT::cycle_count();
+    let done = poll_inner();
+    async_account(a.read, 0, t0);
+    done
+}
+
+fn poll_inner() -> bool {
+    let a = unsafe { &mut *core::ptr::addr_of_mut!(ASYNC) };
+    if !a.active || a.stage == Stage::Done {
+        return true;
+    }
+    let rc = match bulk_check(a.stage == Stage::Csw || a.read, a.chr_v, a.start, a.to_ms) {
+        None => return false,
+        Some(rc) => rc,
+    };
+    match a.stage {
+        Stage::Data => {
+            if rc == 0 {
+                a.off += a.prog;
+                if a.off < a.bytes {
+                    async_arm_chunk();
+                    return false;
+                }
+            } else if rc == -651 {
+                // Data-phase STALL: the device truncated the transfer; the
+                // CSW still carries the status.
+                clear_halt(a.read);
+            } else {
+                return async_done(rc);
+            }
+            async_arm_csw();
+            false
+        }
+        Stage::Csw => {
+            if rc == -651 && !a.csw_retried {
+                a.csw_retried = true;
+                clear_halt(true);
+                async_arm_csw();
+                return false;
+            }
+            if rc != 0 {
+                return async_done(rc);
+            }
+            let csw = unsafe { &(&(*core::ptr::addr_of!(CSWBUF)).0)[..proto::CSW_LEN] };
+            let rc = match proto::check_csw(csw, a.tag) {
+                Ok(0) => 0,
+                Ok(1) => {
+                    request_sense();
+                    if a.read { -661 } else { -662 }
+                }
+                Ok(_) => -671, // phase error: device wants a reset
+                Err(e) => e,
+            };
+            if rc != 0 && rc != -661 && rc != -662 {
+                bot_recover();
+            }
+            a.rc = rc;
+            a.stage = Stage::Done;
+            true
+        }
+        Stage::Done => true,
+    }
+}
+
+/// CSW on bulk IN: the command's status, read on the channel's DMA like
+/// the data so a slow device's completion wait is not a CPU stall.
+fn async_arm_csw() {
+    let a = unsafe { &mut *core::ptr::addr_of_mut!(ASYNC) };
+    let mps_in = unsafe { (*core::ptr::addr_of!(DEV)).msc.mps_in } as usize;
+    a.chr_v = bulk_arm(true, core::ptr::addr_of_mut!(CSWBUF) as u32, mps_in);
+    a.start = cortex_m::peripheral::DWT::cycle_count();
+    a.to_ms = 500;
+    a.stage = Stage::Csw;
+}
+
+/// Transport error: realign the device's BOT state machine and report.
+fn async_done(rc: i32) -> bool {
+    let a = unsafe { &mut *core::ptr::addr_of_mut!(ASYNC) };
+    a.rc = rc;
+    a.stage = Stage::Done;
+    bot_recover();
+    true
+}
+
+/// Block until the in-flight command is done; returns its result. A call
+/// with nothing in flight returns 0.
+pub fn xfer_finish() -> i32 {
+    let a = unsafe { &mut *core::ptr::addr_of_mut!(ASYNC) };
+    if !a.active {
+        return 0;
+    }
+    let t0 = cortex_m::peripheral::DWT::cycle_count();
+    while !poll_inner() {}
+    async_account(a.read, 0, t0);
+    a.active = false;
+    a.rc
 }

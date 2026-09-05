@@ -425,3 +425,101 @@ Remaining decode step on the rig: storage 0.52, unpack 0.16, attention
 byte-sums 0.05, NPU/LN/misc ~0.12. On the stick the storage term is
 ~1.3 s, so the stick is now the decode floor: levers 7 (faster stick)
 and 8 (IO overlap) are next; 10 (batched positions) divides everything.
+
+## 11. 2026-09-04: would a different model be faster?
+
+Candidates: Moonshine Tiny, Vosk small (Kaldi TDNN-F), Sherpa-ONNX
+Zipformer transducer (~20M), NeMo Conformer/FastConformer-CTC small.
+
+The decode floor after section 10 is the ~9.3 MB of decoder weights
+streamed per token (1.3 s on the stick). That floor belongs to every
+encoder-decoder model whose decoder does not fit in 510 KB RAM; no
+kernel lever removes it, levers 7-10 only shrink it. A model with no
+autoregressive decoder deletes it: ~47 s of a 25-token utterance.
+
+| model | decode per token | encoder attention vs Whisper | verdict |
+|---|---|---|---|
+| Moonshine Tiny | ~10 MB stream (6 dec layers, d=288, 32k vocab) | ~20 pct cheaper, variable length | no gain |
+| Vosk small | WFST beam search, ~30 MB graph, random access | linear time, no attention | poor fit for RAM and stick |
+| Zipformer transducer | predictor + joiner, ~100s of KB, resident | 4-16x cheaper (25 Hz, downsampled stacks) | yes, largest win, hardest port |
+| Conformer-CTC small (13M) | none, argmax per frame, 128 vocab | 2x at 4x subsampling, ~8x for FastConformer | yes, cleanest port |
+
+- Moonshine: raw-audio conv stem, no 30 s padding, but full-rate
+  attention and the same weight-stream decoder. Dynamic ctx already
+  gives the short-utterance benefit. RoPE + SwiGLU are new CPU glue.
+- Vosk: the acoustic model maps to Axon convs, but its outputs are
+  context-dependent phone states; there is no greedy path without the
+  graph, and Viterbi over a 30 MB graph at 10 MB/s is hopeless.
+- Zipformer: streaming variant runs chunk by chunk during capture, so
+  post-speech latency approaches one chunk. SwooshR, BiasNorm,
+  non-linear attention and bypass modules are all new glue with no
+  Axon op; int8 quantization needs its own gate.
+- Conformer-CTC: depthwise + pointwise convs land on the NPU like the
+  current projections. Rel-pos attention doubles the CPU dot work per
+  layer but at 150-300 frames instead of 600 it is net cheaper. Swish
+  and GLU need LUTs like GELU. A public "FastConformer-CTC Tiny" EN
+  checkpoint is unconfirmed; Conformer-CTC small (13M) is the known
+  size at that scale.
+
+Outlook on the stick, 25-token utterance: Whisper + fast stick + IO
+overlap ~50-60 s; CTC at 4x subsampling ~20-30 s (encoder NPU passes
+and scratch writes remain); streaming hides most of that behind the
+recording.
+
+Cost: export, Axon compile, blob link, firmware glue and the accuracy
+gates are all Whisper-specific, so a port is weeks against days for
+levers 7-10. Accuracy: the small CTC/Zipformer models report
+LibriSpeech WER at or below tiny.en but are LibriSpeech-trained and
+lose more on noisy/far-field audio than Whisper's 680k-hour training.
+
+Decision 2026-09-04: finish the Whisper levers first (7-10); revisit
+CTC if speak-to-done must go under ~30 s.
+
+## 12. 2026-09-04: storage overlapped with compute (speed pass 5)
+
+Split-phase transfers (storage.rs read_start / write_start / poll /
+finish; the data phase and the CSW run on the DWC2 channel DMA, the
+mock rig's payload and response on the endpoint DMA) under four
+compute windows: encoder attention (context write + next head's K/V/Q
+prefetch, pumped every 16 queries), encoder MLP tiles (partial write
+under the fc1 run, next input under fc2p), decode cross-attention (K/V
+prefetch), LM head (chunk double buffer). Design in NOTES.md.
+
+Mock rig, JFK clip, ctx 600, same-session baseline (HEAD firmware):
+
+| phase | before | after |
+|---|---|---|
+| encoder | 38.2 s (storage stall rd 3.29 + wr 0.80 s) | 37.6 s (rd 3.03 + wr 0.63 s) |
+| cross K/V | 2.2 s | 2.3 s |
+| decode per step (24 steps) | 1.10 s (storage 0.55 s) | 0.97 s (storage 0.42 s) |
+| speak-to-done | 67.7 s | 63.8 s |
+
+Accuracy: transcript identical; mock_diff.py 0 of 5480 scratch blocks
+differ (mel, residual, encoder output, cross K/V). The sd[phase] ms
+figures now count CPU time inside storage calls, i.e. the unhidden
+stall, which is what the table compares.
+
+Why the rig moves so little: its writes run at ~20 MB/s, so the 4.3 MB
+of writes now hidden (context tiles 0.96 MB, fc2 partials 3.5 MB) cost
+it 0.2 s. On the stick they cost ~4.3 s, plus ~0.35 s for the 3.5 MB of
+hidden encoder reads and ~0.4 s/token for the 4.2 MB/token of decode
+reads (cross K/V 1.9 MB, embedding 2.35 MB): roughly 5 s off the
+encoder and 10 s off a 24-token decode, ~15 s of ~100 s. Unmeasured
+until a stick run.
+
+What stays synchronous on the stick, and why (from the 15.8 MB of
+encoder writes): q/k/v projection head blocks 2.9 MB (six 4 KB writes
+behind one NPU run; only one transfer can straddle a blocking
+infer_sync, a queue would need a timer-interrupt pump), residual /
+layernorm / recombination passes 5.7 MB (IO-bound loops with
+milliseconds of CPU between read and write: nothing to hide under),
+out-projection and conv stem 1.7 MB, last tile / last head 0.6 MB.
+Reads: the fc1/fc2p blobs alternate every tile, 53 MB of the encoder's
+83 MB of reads; the alternative (all fc1 tiles first, spilling 240 KB
+per pass) trades them for writes, the wrong way on this stick.
+
+Ranking after this pass: lever 7 (a stick with 10+ MB/s writes) is now
+worth ~11 s of synchronous writes plus the 9.3 MB/token blob floor at
+whatever its read speed is; lever 10 (batched positions) still divides
+the decode floor; the projection-write queue is ~3 s for a medium
+change.

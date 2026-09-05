@@ -65,8 +65,9 @@ DWC2 forced-host, ch0,
 or a PC over USBHS
 forced-device, CDC-ACM)]
     EXEC -->|transcript| OLED
-    EXEC <-->|512 B blocks
-storage.rs dispatch| STOR
+    EXEC <-->|512 B blocks, storage.rs:
+blocking or split-phase
+start/poll/finish DMA| STOR
     subgraph axon [Axon NPU]
       DRV[Nordic driver blob]
       ENG[cmd-buffer engine]
