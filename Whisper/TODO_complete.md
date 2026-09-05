@@ -185,3 +185,7 @@ rebuilt (embc4 replaces embp4; old cards need a re-dd).
 - Rig (JFK clip): transcript identical, 0 of 5480 scratch blocks differ
   from a same-session baseline; speak-to-done 67.7 -> 63.8 s, decode
   1.10 -> 0.97 s/step. Stick projection ~15 s of ~100 s (speedup.md 12).
+- Stick (new PNY USB 3.0, clip played into the mic, ctx 531): encoder
+  37.5 s, decode 0.80 s/step, end of speech to transcript 62.6 s; the
+  silence stop worked live (2.0 s tail). First-read budget raised to
+  2 s and the index read retried (the stick timed out its first read).

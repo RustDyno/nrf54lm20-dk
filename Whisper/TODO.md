@@ -100,16 +100,19 @@ every 16 queries), encoder MLP tiles (partial write under fc1, input
 read under fc2p), decode cross-attention (K/V prefetch), LM head (chunk
 double buffer). Results in speedup.md section 12, design in NOTES.md.
 Rig (JFK clip): transcript and every scratch region bit-identical,
-speak-to-done 67.7 -> 63.8 s, decode 1.10 -> 0.97 s/step. The stick has
-not been re-measured; the overlapped transfers add up to ~4.3 MB of
-writes (1 MB/s there) and ~3.5 MB of reads per utterance plus ~4.2 MB
-of reads per token, so expect ~5 s off the encoder and ~0.4 s/token.
+speak-to-done 67.7 -> 63.8 s, decode 1.10 -> 0.97 s/step. New stick
+(PNY USB 3.0, 28 MB/s reads, ~2 MB/s writes), clip played into the
+mic, ctx 531: encoder 37.5 s (8.4 s of write-dominated stall), decode
+0.80 s/step (0.26 s stall), end of speech to transcript 62.6 s. The
+silence stop worked live (recording tail 2.0 s). Decode is CPU-bound
+again; the encoder's remaining storage term is the synchronous writes.
 
-Left for the stick: the q/k/v projection writes (six 4 KB head blocks
-per tile behind one NPU run; ~3 s at 1 MB/s) would need a pump from a
-timer interrupt, and the blob reloads (fc1/fc2p alternate every tile:
-53 MB of the encoder's 83 MB of reads) are inherent to the tile order
-that keeps writes small.
+Next on this stick: a timer-interrupt pump so several small writes can
+queue behind one NPU run (projection and cross K/V head blocks, ~4 s);
+decode kernels (4-bit unpack 0.165 s/step, cross-attention transposition
+0.14 s/step); batched positions. The blob reloads (fc1/fc2p alternate
+every tile: 53 MB of the encoder's 83 MB of reads) are inherent to the
+tile order that keeps writes small and cost ~2.5 s at 28 MB/s.
 
 ## 1. Application-class SD card (zero code)
 

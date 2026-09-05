@@ -937,9 +937,12 @@ fn rw_aligned(lba: u32, buf: u32, count: u32, read: bool) -> i32 {
         // Budgets differ by direction: reads stream at bus speed, but
         // cheap flash controllers stall for SECONDS on a write burst
         // (mapping-table rebuilds, GC; hardware-observed >340 ms on the
-        // very first write). All waits stay DWT-bounded.
+        // very first write), and a large stick can take over half a
+        // second to serve its very first read after enumeration
+        // (hardware-observed: a 128 GB stick timed out the 8 KB index
+        // read at 516 ms). All waits stay DWT-bounded.
         let to_ms = if read {
-            500 + (bytes >> 10) as u32 * 2
+            2000 + (bytes >> 10) as u32 * 2
         } else {
             3000 + (bytes >> 10) as u32 * 4
         };
@@ -1056,7 +1059,7 @@ fn async_start(lba: u32, buf: u32, count: u32, read: bool) -> i32 {
         chr_v: 0,
         start: 0,
         to_ms: if read {
-            500 + (bytes >> 10) as u32 * 2
+            2000 + (bytes >> 10) as u32 * 2
         } else {
             3000 + (bytes >> 10) as u32 * 4
         },

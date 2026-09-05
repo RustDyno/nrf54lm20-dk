@@ -523,3 +523,34 @@ worth ~11 s of synchronous writes plus the 9.3 MB/token blob floor at
 whatever its read speed is; lever 10 (batched positions) still divides
 the decode floor; the projection-write queue is ~3 s for a medium
 change.
+
+### Stick run, 2026-09-04 (new stick: PNY USB 3.0 FD 154b:00ed, 128 GB)
+
+JFK clip played through the laptop speakers into the board's microphone
+(mel level correction +28.7 dB; the transcript has two acoustic errors
+but the rig proves the arithmetic), VAD ctx 531 (9 tiles), 22 tokens:
+
+| phase | wall | storage stall (unhidden) |
+|---|---|---|
+| encoder | 37.5 s | rd 75 MB / 2.6 s, wr 14.3 MB / 5.8 s |
+| cross K/V | 3.9 s | wr 1.7 MB / 2.0 s |
+| decode per step (23) | 0.80 s | 0.26 s |
+| end of speech to transcript | 62.6 s | recording tail 2.0 s (silence stop, first live exercise) + 60.6 s |
+
+The new stick reads at ~28 MB/s and writes at ~2 MB/s, against the old
+one's 9-10 / 1. With the overlap in, decode on the stick (0.80 s/step)
+is now FASTER than on the rig (0.97): the remaining decode step is
+CPU (unpack 0.165, attention 0.14, LM dots 0.08, sums 0.05, NPU/LN
+~0.1) plus 0.26 s of blob-read stall. The encoder is attention 17 s +
+~12 s NPU/LN/IO + 8.4 s of write-dominated stall (the synchronous
+passes listed above). The stick's first read after enumeration took
+over 516 ms, so the read budget floor is now 2 s and the index read is
+retried (app.rs run()).
+
+Ranking on this stick: the synchronous encoder/cross writes (~7.8 s
+of stall: projection head blocks, residual/LN/recombination passes,
+cross K/V head blocks) are the largest storage term left; a queue
+pumped from a timer interrupt would hide the projection and cross K/V
+head-block writes (~4 s). Decode is CPU-bound again: the 4-bit unpack
+(0.165 s) and the cross-attention transposition (0.14 s) are the next
+kernels, then batched positions.

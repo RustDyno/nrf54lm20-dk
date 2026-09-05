@@ -834,7 +834,17 @@ pub fn run() -> ! {
     }
     rprintln!("standalone: model source: {}", storage::name());
     unsafe {
-        let rc = storage::read_blocks(0, core::ptr::addr_of_mut!(INDEX) as *mut u8, 16);
+        // The first read after enumeration is the one a stick may still
+        // be waking up for; give it a few tries before giving up.
+        let mut rc = -650;
+        for attempt in 0..3 {
+            rc = storage::read_blocks(0, core::ptr::addr_of_mut!(INDEX) as *mut u8, 16);
+            if rc == 0 {
+                break;
+            }
+            rprintln!("standalone: index read {}/3 failed rc={}", attempt + 1, rc);
+            cortex_m::asm::delay(64_000_000); // 0.5 s
+        }
         let idx = &*core::ptr::addr_of!(INDEX);
         if rc != 0 || &idx[..8] != IMG_MAGIC {
             rprintln!("standalone: no image (rc={}), staying in mailbox mode", rc);
