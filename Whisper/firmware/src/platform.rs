@@ -10,6 +10,8 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
+use embassy_nrf::pac::common::{Reg, RW};
+
 use crate::bindings;
 
 /// Base address of the AXONS peripheral (secure alias).
@@ -38,6 +40,12 @@ unsafe impl cortex_m::interrupt::InterruptNumber for AxonsIrq {
 const AXON_ENABLE_OFFSET: usize = 0x400;
 const AXON_ENABLE_EN_BIT: u32 = 1; // AXONS_ENABLE_EN_Msk
 
+/// The AXONS block is absent from the public SVD, so the PAC has no
+/// peripheral for it: this is the one register handle built by hand, on the
+/// PAC's own register type so it reads and writes like every other one.
+const AXON_ENABLE: Reg<u32, RW> =
+    unsafe { Reg::from_ptr((AXON_BASE_ADDR + AXON_ENABLE_OFFSET) as *mut u32) };
+
 static USER_EVENT: AtomicBool = AtomicBool::new(false);
 
 /// Power votes, mirroring Zephyr's onoff manager: the block is enabled while
@@ -46,11 +54,6 @@ static USER_EVENT: AtomicBool = AtomicBool::new(false);
 /// (e.g. when a debug session killed the firmware mid-inference) -- relying on
 /// a single cycle at boot proved insufficient on hardware.
 static POWER_VOTES: AtomicU32 = AtomicU32::new(0);
-
-#[inline]
-fn enable_reg() -> *mut u32 {
-    (AXON_BASE_ADDR + AXON_ENABLE_OFFSET) as *mut u32
-}
 
 /// Hold the Axon powered for a whole standalone session: the per-
 /// inference power cycling (Zephyr parity) opens an ENABLE=0 window
@@ -64,8 +67,8 @@ pub fn hold_axon() {
 
 fn power_vote_on() {
     if POWER_VOTES.fetch_add(1, Ordering::SeqCst) == 0 {
+        AXON_ENABLE.write_value(AXON_ENABLE_EN_BIT);
         unsafe {
-            core::ptr::write_volatile(enable_reg(), AXON_ENABLE_EN_BIT);
             bindings::nrf_axon_driver_power_on();
             // Clear any interrupt that went pending while the block was
             // off, then reopen the NVIC path masked in power_vote_off.
@@ -82,8 +85,8 @@ fn power_vote_off() {
         cortex_m::peripheral::NVIC::mask(AxonsIrq);
         unsafe {
             bindings::nrf_axon_driver_power_off();
-            core::ptr::write_volatile(enable_reg(), 0);
         }
+        AXON_ENABLE.write_value(0);
         cortex_m::peripheral::NVIC::unpend(AxonsIrq);
     }
 }
@@ -106,9 +109,9 @@ pub fn init() -> i32 {
         // state (the sibling projects use 64 cycles): host-driven development
         // kills sessions mid-inference far more often, and the longer dwell
         // is cheap insurance.
-        core::ptr::write_volatile(enable_reg(), 0);
+        AXON_ENABLE.write_value(0);
         cortex_m::asm::delay(128_000);
-        core::ptr::write_volatile(enable_reg(), AXON_ENABLE_EN_BIT);
+        AXON_ENABLE.write_value(AXON_ENABLE_EN_BIT);
 
         let r = bindings::nrf_axon_driver_init(AXON_BASE_ADDR as *mut c_void);
         if r.0 != 0 {
@@ -124,7 +127,7 @@ pub fn init() -> i32 {
         USER_EVENT.store(false, Ordering::SeqCst);
 
         // Like Zephyr: leave the block off until the first reservation.
-        core::ptr::write_volatile(enable_reg(), 0);
+        AXON_ENABLE.write_value(0);
     }
     0
 }

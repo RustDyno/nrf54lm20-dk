@@ -5,34 +5,22 @@
 //! RAM via EasyDMA. Polled ping-pong double buffering; here each buffer is one
 //! MFCC hop (320 samples = 20 ms) and is returned as samples, not bytes.
 //!
-//! Register offsets, the byte-counted MAXCNT, the PRESCALER/RATIO clock model
-//! and the PSEL encoding all come from the nRF54LM20 SVD / MDK.
+//! Registers are reached through the PAC (`embassy_nrf::pac`), which carries
+//! the byte-counted MAXCNT, the PRESCALER/RATIO clock model and the PSEL
+//! encoding. The HAL's own PDM driver is async only, and this capture loop
+//! has to stay polled: the hop-level overrun accounting below relies on
+//! seeing EVENTS_STARTED itself.
 
-use core::ptr::{read_volatile, write_volatile};
+use embassy_nrf::pac;
+use pac::gpio::vals::{Dir, Input, Pull};
+use pac::pdm::vals::{Edge, Gain, Operation, Ratio, Src};
+use pac::shared::vals::Connect;
 
-// PDM20, secure alias (the core boots secure). PDM21 lives at 0x500D1000.
-const PDM_BASE: usize = 0x500D_0000;
+// PDM20 (secure alias, the core boots secure). PDM21 is the other instance.
+const PDM: pac::pdm::Pdm = pac::PDM20;
 
-const TASKS_START: usize = 0x000;
-const TASKS_STOP: usize = 0x004;
-const EVENTS_STARTED: usize = 0x100;
-const EVENTS_STOPPED: usize = 0x104;
-const EVENTS_END: usize = 0x108;
-const ENABLE: usize = 0x500;
-const MODE: usize = 0x508;
-const GAINL: usize = 0x518;
-const GAINR: usize = 0x51C;
-const RATIO: usize = 0x520;
-const PSEL_CLK: usize = 0x540;
-const PSEL_DIN: usize = 0x544;
-const CLKSELECT: usize = 0x54C;
-const SAMPLE_PTR: usize = 0x560;
-const SAMPLE_MAXCNT: usize = 0x564;
-const PRESCALER: usize = 0x580;
-
-const ENABLE_ENABLED: u32 = 1;
-const MODE_OPERATION_MONO: u32 = 1 << 0;
-const MODE_EDGE_LEFTRISING: u32 = 0 << 1; // board-validated for this mic
+// The mic pins live on port 1.
+const PORT1: pac::gpio::Gpio = pac::P1;
 
 // Digital gain, 0.5 dB per step around 0x28 = 0 dB (0x00 = -20 dB,
 // 0x50 = +20 dB). Applied inside the peripheral ahead of the 16-bit
@@ -47,22 +35,12 @@ const MODE_EDGE_LEFTRISING: u32 = 0 << 1; // board-validated for this mic
 // harmless. The rest of the shortfall against the calibration clip is
 // taken out per-utterance in the log-mel domain, where it cannot clip at
 // all (app.rs mel_lift).
-const GAIN: u32 = 0x28 + 24;
+const GAIN: Gain = Gain::from_bits(0x28 + 24);
 
 // Clocking: PDM_CLK = 32 MHz / 25 = 1.28 MHz, / RATIO 80 = 16000 Hz exactly.
-const RATIO_80: u32 = 0x4;
-const CLKSELECT_PCLK32M: u32 = 0x0;
-const PRESCALER_DIV: u32 = 25;
+const PRESCALER_DIV: u8 = 25;
 #[allow(dead_code)]
 pub const SAMPLE_RATE_HZ: u32 = 16_000;
-
-// --- GPIO (port 1, secure alias). Used to pre-configure the CLK/DIN pins. ---
-const P1_BASE: usize = 0x500D_8200;
-const GPIO_IN: usize = 0x00C;
-const GPIO_OUTCLR: usize = 0x008;
-const GPIO_PIN_CNF: usize = 0x080; // PIN_CNF[n] = 0x080 + 4*n
-const PIN_CNF_DIR_OUTPUT: u32 = 1 << 0;
-const PIN_CNF_INPUT_DISCONNECT: u32 = 1 << 1;
 
 /// Poll the live level of a port-1 pin `samples` times. With PDM running, a
 /// working mic makes DIN toggle (both counts > 0); a dead line stays stuck.
@@ -70,8 +48,7 @@ pub fn probe_pin_activity(pin: Pin, samples: u32) -> (u32, u32) {
     let mut high = 0;
     let mut low = 0;
     for _ in 0..samples {
-        let level = unsafe { read_volatile((P1_BASE + GPIO_IN) as *const u32) };
-        if (level >> pin.pin) & 1 != 0 {
+        if PORT1.in_().read().pin(pin.pin as usize) {
             high += 1;
         } else {
             low += 1;
@@ -87,74 +64,77 @@ pub struct Pin {
 }
 
 impl Pin {
-    /// Nordic PSEL encoding: PIN in bits [4:0], PORT in [6:5], CONNECT=0 in [31].
-    const fn psel(self) -> u32 {
-        ((self.port as u32) << 5) | (self.pin as u32)
+    /// PSEL value: PIN in bits [4:0], PORT in [6:5], CONNECT (bit 31) clear.
+    fn psel(self) -> pac::shared::regs::Psel {
+        let mut v = pac::shared::regs::Psel(0);
+        v.set_pin(self.pin);
+        v.set_port(self.port);
+        v.set_connect(Connect::Connected);
+        v
     }
 }
 
-#[inline(always)]
-unsafe fn wr(base: usize, off: usize, val: u32) {
-    write_volatile((base + off) as *mut u32, val);
-}
-
-#[inline(always)]
-unsafe fn rd(base: usize, off: usize) -> u32 {
-    read_volatile((base + off) as *const u32)
-}
-
-unsafe fn configure_gpio(clk: Pin, din: Pin) {
+fn configure_gpio(clk: Pin, din: Pin) {
     // CLK: output, input buffer disconnected, start low.
-    wr(P1_BASE, GPIO_OUTCLR, 1 << clk.pin);
-    wr(
-        P1_BASE,
-        GPIO_PIN_CNF + 4 * clk.pin as usize,
-        PIN_CNF_DIR_OUTPUT | PIN_CNF_INPUT_DISCONNECT,
-    );
-    // DIN: input, input buffer connected, no pull (PIN_CNF = 0).
-    wr(P1_BASE, GPIO_PIN_CNF + 4 * din.pin as usize, 0);
+    PORT1.outclr().write(|w| w.set_pin(clk.pin as usize, true));
+    PORT1.pin_cnf(clk.pin as usize).write(|w| {
+        w.set_dir(Dir::Output);
+        w.set_input(Input::Disconnect);
+    });
+    // DIN: input, input buffer connected, no pull.
+    PORT1.pin_cnf(din.pin as usize).write(|w| {
+        w.set_dir(Dir::Input);
+        w.set_input(Input::Connect);
+        w.set_pull(Pull::Disabled);
+    });
 }
 
 pub struct Pdm;
 
 impl Pdm {
+    /// Configure the peripheral and its pins. Unsafe because the caller
+    /// hands the EasyDMA engine RAM through [`Pdm::start`]: nothing else may
+    /// touch those buffers while a capture runs.
     pub unsafe fn init(clk: Pin, din: Pin) -> Self {
         configure_gpio(clk, din);
 
-        wr(PDM_BASE, PSEL_CLK, clk.psel());
-        wr(PDM_BASE, PSEL_DIN, din.psel());
+        PDM.psel().clk().write_value(clk.psel());
+        PDM.psel().din().write_value(din.psel());
 
-        wr(PDM_BASE, CLKSELECT, CLKSELECT_PCLK32M);
-        wr(PDM_BASE, PRESCALER, PRESCALER_DIV);
-        wr(PDM_BASE, RATIO, RATIO_80);
-        wr(PDM_BASE, MODE, MODE_OPERATION_MONO | MODE_EDGE_LEFTRISING);
-        wr(PDM_BASE, GAINL, GAIN);
-        wr(PDM_BASE, GAINR, GAIN);
+        PDM.clkselect().write(|w| w.set_src(Src::Pclk32m));
+        PDM.prescaler().write(|w| w.set_divisor(PRESCALER_DIV));
+        PDM.ratio().write(|w| w.set_ratio(Ratio::Ratio80));
+        PDM.mode().write(|w| {
+            w.set_operation(Operation::Mono);
+            w.set_edge(Edge::LeftRising); // board-validated for this mic
+        });
+        PDM.gainl().write(|w| w.set_gainl(GAIN));
+        PDM.gainr().write(|w| w.set_gainr(GAIN));
 
-        wr(PDM_BASE, ENABLE, ENABLE_ENABLED);
+        PDM.enable().write(|w| w.set_enable(true));
         Pdm
     }
 
     /// MAXCNT on PDM v2 is a *byte* count, so it is `len * 2`.
     #[inline(always)]
-    unsafe fn set_buffer(&self, buf: *const i16, len: usize) {
-        wr(PDM_BASE, SAMPLE_PTR, buf as u32);
-        wr(PDM_BASE, SAMPLE_MAXCNT, (len * 2) as u32);
+    fn set_buffer(&self, buf: *const i16, len: usize) {
+        PDM.sample().ptr().write_value(buf as u32);
+        PDM.sample().maxcnt().write(|w| w.set_buffsize((len * 2) as u16));
     }
 
     #[inline(always)]
-    unsafe fn clear_started(&self) {
-        wr(PDM_BASE, EVENTS_STARTED, 0);
+    fn clear_started(&self) {
+        PDM.events_started().write_value(0);
     }
 
     #[inline(always)]
-    unsafe fn started_pending(&self) -> bool {
-        rd(PDM_BASE, EVENTS_STARTED) != 0
+    fn started_pending(&self) -> bool {
+        PDM.events_started().read() != 0
     }
 
     #[inline(always)]
-    unsafe fn wait_started(&self) {
-        while rd(PDM_BASE, EVENTS_STARTED) == 0 {
+    fn wait_started(&self) {
+        while PDM.events_started().read() == 0 {
             cortex_m::asm::nop();
         }
     }
@@ -163,12 +143,12 @@ impl Pdm {
     /// between `buf0` and `buf1`. Equal length, both in RAM.
     pub unsafe fn start<'b>(self, buf0: &'b mut [i16], buf1: &'b mut [i16]) -> Stream<'b> {
         let len = buf0.len();
-        wr(PDM_BASE, EVENTS_STARTED, 0);
-        wr(PDM_BASE, EVENTS_END, 0);
-        wr(PDM_BASE, EVENTS_STOPPED, 0);
+        PDM.events_started().write_value(0);
+        PDM.events_end().write_value(0);
+        PDM.events_stopped().write_value(0);
 
         self.set_buffer(buf0.as_ptr(), len);
-        wr(PDM_BASE, TASKS_START, 1);
+        PDM.tasks_start().write_value(1);
         // First STARTED: buf0 is now being filled.
         self.wait_started();
         self.clear_started();
@@ -199,18 +179,16 @@ pub struct Stream<'b> {
 impl<'b> Stream<'b> {
     pub fn next_buffer(&mut self) -> &[i16] {
         let next = self.filling ^ 1;
-        unsafe {
-            // If STARTED is already pending we arrived after the in-flight
-            // buffer completed: its successor pointer was stale -> overrun.
-            if self.pdm.started_pending() {
-                self.overruns += 1;
-            }
-            // Queue the other buffer before the current one finishes.
-            self.pdm.set_buffer(self.bufs[next].as_ptr(), self.len);
-            // Wait for the hardware to latch it and swap; `filling` is now full.
-            self.pdm.wait_started();
-            self.pdm.clear_started();
+        // If STARTED is already pending we arrived after the in-flight
+        // buffer completed: its successor pointer was stale -> overrun.
+        if self.pdm.started_pending() {
+            self.overruns += 1;
         }
+        // Queue the other buffer before the current one finishes.
+        self.pdm.set_buffer(self.bufs[next].as_ptr(), self.len);
+        // Wait for the hardware to latch it and swap; `filling` is now full.
+        self.pdm.wait_started();
+        self.pdm.clear_started();
         let done = self.filling;
         self.filling = next;
         &self.bufs[done][..]
@@ -218,12 +196,10 @@ impl<'b> Stream<'b> {
 
     #[allow(dead_code)]
     pub fn stop(self) {
-        unsafe {
-            wr(PDM_BASE, TASKS_STOP, 1);
-            while rd(PDM_BASE, EVENTS_STOPPED) == 0 {
-                cortex_m::asm::nop();
-            }
-            wr(PDM_BASE, ENABLE, 0);
+        PDM.tasks_stop().write_value(1);
+        while PDM.events_stopped().read() == 0 {
+            cortex_m::asm::nop();
         }
+        PDM.enable().write(|w| w.set_enable(false));
     }
 }

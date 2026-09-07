@@ -16,130 +16,56 @@
 //! same 5 V. If VBUS is absent, init() fails in ~100 ms with -600 and the
 //! storage layer falls back to the SD card.
 //!
-//! Driver shape mirrors sd.rs: polled, no interrupts (NVIC line stays
-//! disabled; we read HCINT/HPRT directly), DWT-timed deadlines, cumulative
-//! transfer stats. Every transfer runs on HOST CHANNEL 0 ONLY: bulk-only
-//! transport is strictly sequential, one channel reprogrammed per transfer
-//! is enough, and it sidesteps the HC[n] address-stride ambiguity in the
-//! datasheet (0x18 per entry where Synopsys hardware canonically decodes
-//! 0x20). The core retries NAKs in hardware (buffer DMA mode), so a
-//! transfer either completes, errors, or hits our deadline.
+//! Registers go through the PAC (`embassy_nrf::pac`): the wrapper
+//! (USBHS), the PHY rail (VREGUSB), the 24 MHz reference (CLOCK) and the
+//! DWC2 core (USBHSCORE, whose SVD carries the host channel block as
+//! `hc(n)`). The HAL has a device-mode driver for this core but no host
+//! mode, and this driver's shape mirrors sd.rs anyway: polled, no
+//! interrupts (NVIC line stays disabled; we read HCINT/HPRT directly),
+//! DWT-timed deadlines, cumulative transfer stats. Every transfer runs on
+//! HOST CHANNEL 0 ONLY: bulk-only transport is strictly sequential, one
+//! channel reprogrammed per transfer is enough, and it sidesteps the HC[n]
+//! address-stride ambiguity in the datasheet (0x18 per entry where
+//! Synopsys hardware canonically decodes 0x20; the SVD says 0x1C -- only
+//! channel 0's base of 0x500 is beyond doubt). The core retries NAKs in
+//! hardware (buffer DMA mode), so a transfer either completes, errors, or
+//! hits our deadline.
 
-use core::ptr::{read_volatile, write_volatile};
+use embassy_nrf::pac;
+use pac::usbhscore::regs;
+use pac::usbhscore::vals::{
+    Avalidovval, CharEptype, Dmaen, Ec, Epdir, Epnum, Fslspclksel, Fslssupp, GintstsCurmod,
+    GrstctlTxfnum, Hbstlen, Pid, Vbvalidovval,
+};
 
 use crate::usbproto as proto;
 use rtt_target::rprintln;
 
-// --- register bases (secure aliases, datasheet v1.0-3) -----------------------
+// --- peripherals (secure aliases) --------------------------------------------
 
-const CLOCK_BASE: usize = 0x5010_E000;
-const CLK_TASKS_XO24MSTART: usize = 0x024;
-const CLK_EVENTS_XO24MSTARTED: usize = 0x11C;
+const CLOCK: pac::clock::Clock = pac::CLOCK;
+const VREG: pac::vregusb::Vregusb = pac::VREGUSB;
+const WRAP: pac::usbhs::Usbhs = pac::USBHS;
+/// The DWC2 core. Shared with usbdev.rs, which drives the same core in the
+/// opposite role.
+pub(crate) const CORE: pac::usbhscore::Usbhscore = pac::USBHSCORE;
+// The wrapper's STATUS register is deliberately unused: its CORE ready
+// bit never asserts on this part (hardware-observed) even with the core
+// alive; GSNPSID readback is the working readiness check.
 
-const VREG_BASE: usize = 0x5012_1000; // VREGUSB
-const VREG_TASKS_START: usize = 0x000;
-const VREG_TASKS_STOP: usize = 0x004;
-const VREG_EVENTS_VBUSDETECTED: usize = 0x104;
-
-const WRAP_BASE: usize = 0x5005_A000; // USBHS wrapper
-const WRAP_TASKS_START: usize = 0x000;
-const WRAP_TASKS_STOP: usize = 0x004;
-const WRAP_ENABLE: usize = 0x400; // bit0 CORE, bit1 PHY
-// The wrapper's STATUS register (0x408) is deliberately unused: its CORE
-// ready bit never asserts on this part (hardware-observed) even with the
-// core alive; GSNPSID readback is the working readiness check.
-
-const CORE_BASE: usize = 0x5002_0000; // USBHSCORE (DWC2)
-const GOTGCTL: usize = 0x000;
-pub(crate) const GAHBCFG: usize = 0x008;
-pub(crate) const GUSBCFG: usize = 0x00C;
-pub(crate) const GRSTCTL: usize = 0x010;
-pub(crate) const GINTSTS: usize = 0x014;
-pub(crate) const GRXFSIZ: usize = 0x024;
-pub(crate) const GNPTXFSIZ: usize = 0x028;
-pub(crate) const GSNPSID: usize = 0x040;
-pub(crate) const GHWCFG2: usize = 0x048;
-const HPTXFSIZ: usize = 0x100;
-const HCFG: usize = 0x400;
-const HPRT: usize = 0x440;
-const HCCHAR0: usize = 0x500;
-const HCINT0: usize = 0x508;
-const HCINTMSK0: usize = 0x50C;
-const HCTSIZ0: usize = 0x510;
-const HCDMA0: usize = 0x514;
-
-// GOTGCTL session overrides: the host state machine wants A-session/VBUS
-// valid from the PHY; force both so port power does not depend on how the
-// wrapper routes the VBUS comparator in host mode.
-const OTG_VBVALID_OV: u32 = (1 << 2) | (1 << 3);
-const OTG_AVALID_OV: u32 = (1 << 4) | (1 << 5);
-
-pub(crate) const GRSTCTL_CSFTRST: u32 = 1 << 0;
-pub(crate) const GRSTCTL_RXFFLSH: u32 = 1 << 4;
-pub(crate) const GRSTCTL_TXFFLSH: u32 = 1 << 5;
 // HARDWARE-CONFIRMED: this core is DWC2 v5.00b (GSNPSID 0x4F54500B), and
 // since v4.20a soft reset is a handshake -- CSftRst does NOT self-clear.
-// The core sets CSftRstDone (bit 29, absent from the SVD/datasheet) and
-// software must then write both bits back to 0. Polling for self-clear
-// hangs forever with the reset long since finished.
-pub(crate) const GRSTCTL_CSFTRSTDONE: u32 = 1 << 29;
-pub(crate) const GRSTCTL_AHBIDLE: u32 = 1 << 31;
-const GUSBCFG_FRCHSTMODE: u32 = 1 << 29;
-pub(crate) const GAHBCFG_DMAEN: u32 = 1 << 5;
-pub(crate) const GAHBCFG_BURST_INCR4: u32 = 3 << 1;
-const GINTSTS_CURMOD_HOST: u32 = 1 << 0;
+// The core sets CSftRstDone (bit 29, absent from the datasheet but present
+// in the SVD) and software must then write both bits back to 0. Polling
+// for self-clear hangs forever with the reset long since finished.
 
-const HPRT_CONNSTS: u32 = 1 << 0;
-const HPRT_CONNDET: u32 = 1 << 1;
-const HPRT_ENA: u32 = 1 << 2;
-const HPRT_ENCHNG: u32 = 1 << 3;
-const HPRT_OCCHNG: u32 = 1 << 5;
-const HPRT_RST: u32 = 1 << 8;
-const HPRT_PWR: u32 = 1 << 12;
-// Write-1-to-clear bits (PRTENA included: writing 1 DISABLES the port);
-// every read-modify-write must mask these out.
-const HPRT_W1C: u32 = HPRT_CONNDET | HPRT_ENA | HPRT_ENCHNG | HPRT_OCCHNG;
-
-const CH_EPTYPE_CTRL: u32 = 0 << 18;
-const CH_EPTYPE_BULK: u32 = 2 << 18;
-const CH_CHDIS: u32 = 1 << 30;
-const CH_CHENA: u32 = 1 << 31;
-
-const HCI_XFERCOMPL: u32 = 1 << 0;
-const HCI_CHHLTD: u32 = 1 << 1;
-const HCI_AHBERR: u32 = 1 << 2;
-const HCI_STALL: u32 = 1 << 3;
-const HCI_XACTERR: u32 = 1 << 7;
-const HCI_BBLERR: u32 = 1 << 8;
-const HCI_FRMOVRUN: u32 = 1 << 9;
-const HCI_DTGLERR: u32 = 1 << 10;
-
-// HCTSIZ.Pid encoding.
+// HCTSIZ.Pid encoding (host side: 3 is SETUP, which the SVD's device-flavored
+// enum names MDATA).
 const PID_DATA0: u32 = 0;
 const PID_DATA1: u32 = 2;
 const PID_SETUP: u32 = 3;
 
 pub const BLOCK: usize = 512;
-
-#[inline]
-fn clk(off: usize) -> *mut u32 {
-    (CLOCK_BASE + off) as *mut u32
-}
-
-#[inline]
-fn vreg(off: usize) -> *mut u32 {
-    (VREG_BASE + off) as *mut u32
-}
-
-#[inline]
-fn wrap(off: usize) -> *mut u32 {
-    (WRAP_BASE + off) as *mut u32
-}
-
-#[inline]
-pub(crate) fn core_reg(off: usize) -> *mut u32 {
-    (CORE_BASE + off) as *mut u32
-}
 
 const CYC_PER_MS: u32 = 128_000; // DWT at the 128 MHz core clock
 
@@ -148,17 +74,22 @@ pub(crate) fn ms_wait(ms: u32) {
     while cortex_m::peripheral::DWT::cycle_count().wrapping_sub(start) < ms * CYC_PER_MS {}
 }
 
-/// Poll `reg` until `(read & mask) == want` or `ms` elapses.
-pub(crate) fn poll(reg: *mut u32, mask: u32, want: u32, ms: u32) -> bool {
+/// Poll `cond` until it holds or `ms` elapses.
+pub(crate) fn poll(cond: impl Fn() -> bool, ms: u32) -> bool {
     let start = cortex_m::peripheral::DWT::cycle_count();
     loop {
-        if unsafe { read_volatile(reg) } & mask == want {
+        if cond() {
             return true;
         }
         if cortex_m::peripheral::DWT::cycle_count().wrapping_sub(start) >= ms * CYC_PER_MS {
             return false;
         }
     }
+}
+
+#[inline]
+fn hc0() -> pac::usbhscore::Hc {
+    CORE.hc(0)
 }
 
 // --- state -------------------------------------------------------------------
@@ -240,15 +171,23 @@ fn bounce_addr() -> u32 {
 
 // --- channel 0 transfer engine -----------------------------------------------
 
-fn chr(dev_addr: u32, ep: u32, dir_in: bool, eptype: u32, mps: u32) -> u32 {
-    mps | ep << 11 | (dir_in as u32) << 15 | eptype | 1 << 20 | dev_addr << 22
+/// HCCHAR value for one endpoint: multi-count 1, channel not yet enabled.
+fn chr(dev_addr: u32, ep: u32, dir_in: bool, eptype: CharEptype, mps: u32) -> regs::Char {
+    let mut c = regs::Char(0);
+    c.set_mps(mps as u16);
+    c.set_epnum(Epnum::from_bits(ep as u8));
+    c.set_epdir(if dir_in { Epdir::In } else { Epdir::Out });
+    c.set_eptype(eptype);
+    c.set_ec(Ec::Transone);
+    c.set_devaddr(dev_addr as u8);
+    c
 }
 
 /// One transfer on host channel 0 (buffer DMA). For IN, `len` must be a
 /// multiple of `mps` and the buffer must have room for all of it; a short
 /// packet from the device completes the transfer early. Returns the next
 /// PID the endpoint expects.
-fn ch0(chr_v: u32, pid: u32, dma: u32, len: usize, mps: usize, to_ms: u32) -> Result<u32, i32> {
+fn ch0(chr_v: regs::Char, pid: u32, dma: u32, len: usize, mps: usize, to_ms: u32) -> Result<u32, i32> {
     ch0_arm(chr_v, pid, dma, len, mps);
     let start = cortex_m::peripheral::DWT::cycle_count();
     loop {
@@ -261,47 +200,54 @@ fn ch0(chr_v: u32, pid: u32, dma: u32, len: usize, mps: usize, to_ms: u32) -> Re
 /// Program and enable channel 0; the core runs the transfer on its own
 /// from here (buffer DMA), so the CPU is free until `ch0_check` says the
 /// channel halted.
-fn ch0_arm(chr_v: u32, pid: u32, dma: u32, len: usize, mps: usize) {
+fn ch0_arm(chr_v: regs::Char, pid: u32, dma: u32, len: usize, mps: usize) {
     let pkts = if len == 0 { 1 } else { len.div_ceil(mps) as u32 };
-    unsafe {
-        write_volatile(core_reg(HCINT0), 0xFFFF_FFFF);
-        write_volatile(core_reg(HCINTMSK0), 0); // polled: no propagation
-        write_volatile(core_reg(HCTSIZ0), len as u32 | pkts << 19 | pid << 29);
-        write_volatile(core_reg(HCDMA0), dma);
-        write_volatile(core_reg(HCCHAR0), chr_v | CH_CHENA);
-    }
+    let hc = hc0();
+    hc.int().write(|w| w.0 = 0xFFFF_FFFF);
+    hc.intmsk().write_value(regs::Intmsk(0)); // polled: no propagation
+    hc.tsiz().write(|w| {
+        w.set_xfersize(len as u32);
+        w.set_pktcnt(pkts as u16);
+        w.set_pid(Pid::from_bits(pid as u8));
+    });
+    hc.dma().write_value(dma);
+    let mut c = chr_v;
+    c.set_chena(true);
+    hc.char().write_value(c);
 }
 
 /// Non-blocking completion check for an armed channel: None while it is
 /// still running and within `to_ms` of `start` (a DWT cycle stamp).
-fn ch0_check(chr_v: u32, start: u32, to_ms: u32) -> Option<Result<u32, i32>> {
-    let ints = unsafe { read_volatile(core_reg(HCINT0)) };
-    if ints & HCI_CHHLTD == 0 {
+fn ch0_check(chr_v: regs::Char, start: u32, to_ms: u32) -> Option<Result<u32, i32>> {
+    let hc = hc0();
+    let ints = hc.int().read();
+    if !ints.chhltd() {
         if cortex_m::peripheral::DWT::cycle_count().wrapping_sub(start) < to_ms * CYC_PER_MS {
             return None;
         }
         // Deadline (device NAKing forever, or gone): request a halt and
         // give the core a moment to return the channel.
-        unsafe {
-            write_volatile(core_reg(HCCHAR0), chr_v | CH_CHENA | CH_CHDIS);
-        }
-        poll(core_reg(HCINT0), HCI_CHHLTD, HCI_CHHLTD, 5);
+        let mut c = chr_v;
+        c.set_chena(true);
+        c.set_chdis(true);
+        hc.char().write_value(c);
+        poll(|| hc.int().read().chhltd(), 5);
         return Some(Err(-650));
     }
-    if ints & HCI_XFERCOMPL != 0 {
-        return Some(Ok(unsafe { read_volatile(core_reg(HCTSIZ0)) } >> 29 & 3));
+    if ints.xfercompl() {
+        return Some(Ok(hc.tsiz().read().pid().to_bits() as u32));
     }
-    Some(Err(if ints & HCI_STALL != 0 {
+    Some(Err(if ints.stall() {
         -651
-    } else if ints & HCI_XACTERR != 0 {
+    } else if ints.xacterr() {
         -652
-    } else if ints & HCI_BBLERR != 0 {
+    } else if ints.bblerr() {
         -653
-    } else if ints & HCI_DTGLERR != 0 {
+    } else if ints.datatglerr() {
         -654
-    } else if ints & HCI_AHBERR != 0 {
+    } else if ints.ahberr() {
         -655
-    } else if ints & HCI_FRMOVRUN != 0 {
+    } else if ints.frmovrun() {
         -656
     } else {
         -657
@@ -317,14 +263,14 @@ fn control_in(sp: [u8; 8], dlen: usize) -> i32 {
         (*core::ptr::addr_of_mut!(SETUP)).0 = sp;
     }
     let sp_addr = core::ptr::addr_of!(SETUP) as u32;
-    if let Err(e) = ch0(chr(addr, 0, false, CH_EPTYPE_CTRL, mps), PID_SETUP, sp_addr, 8, mpsu, 200) {
+    if let Err(e) = ch0(chr(addr, 0, false, CharEptype::Ctrl, mps), PID_SETUP, sp_addr, 8, mpsu, 200) {
         return e;
     }
     if dlen > 0 {
         debug_assert!(dlen.div_ceil(mpsu) * mpsu <= BLOCK);
         let rounded = dlen.div_ceil(mpsu) * mpsu;
         if let Err(e) = ch0(
-            chr(addr, 0, true, CH_EPTYPE_CTRL, mps),
+            chr(addr, 0, true, CharEptype::Ctrl, mps),
             PID_DATA1,
             bounce_addr(),
             rounded,
@@ -338,7 +284,7 @@ fn control_in(sp: [u8; 8], dlen: usize) -> i32 {
     // for a no-data request. Zero length, always DATA1.
     let status_in = dlen == 0;
     match ch0(
-        chr(addr, 0, status_in, CH_EPTYPE_CTRL, mps),
+        chr(addr, 0, status_in, CharEptype::Ctrl, mps),
         PID_DATA1,
         bounce_addr(),
         0,
@@ -362,21 +308,21 @@ fn bulk(dir_in: bool, dma: u32, len: usize, to_ms: u32) -> i32 {
 
 /// Arm a bulk transfer on the MSC endpoint of `dir_in`; returns the
 /// HCCHAR value `bulk_check` needs.
-fn bulk_arm(dir_in: bool, dma: u32, len: usize) -> u32 {
+fn bulk_arm(dir_in: bool, dma: u32, len: usize) -> regs::Char {
     let d = unsafe { &*core::ptr::addr_of!(DEV) };
     let (ep, mps, pid) = if dir_in {
         (d.msc.ep_in, d.msc.mps_in, d.pid_in)
     } else {
         (d.msc.ep_out, d.msc.mps_out, d.pid_out)
     };
-    let chr_v = chr(d.addr, ep as u32, dir_in, CH_EPTYPE_BULK, mps as u32);
+    let chr_v = chr(d.addr, ep as u32, dir_in, CharEptype::Bulk, mps as u32);
     ch0_arm(chr_v, pid, dma, len, mps as usize);
     chr_v
 }
 
 /// Completion check for `bulk_arm`; carries the data toggle forward on
 /// success. None while the transfer is still running.
-fn bulk_check(dir_in: bool, chr_v: u32, start: u32, to_ms: u32) -> Option<i32> {
+fn bulk_check(dir_in: bool, chr_v: regs::Char, start: u32, to_ms: u32) -> Option<i32> {
     let d = unsafe { &mut *core::ptr::addr_of_mut!(DEV) };
     match ch0_check(chr_v, start, to_ms)? {
         Ok(next) => {
@@ -510,19 +456,25 @@ fn request_sense() -> i32 {
 
 // --- bring-up ----------------------------------------------------------------
 
-fn hprt_set(bits: u32) {
-    unsafe {
-        let v = read_volatile(core_reg(HPRT));
-        write_volatile(core_reg(HPRT), (v & !HPRT_W1C) | bits);
-    }
+/// Read-modify-write HPRT with its write-1-to-clear bits masked out
+/// (PRTENA included: writing 1 DISABLES the port), then apply `f`.
+fn hprt_rmw(f: impl FnOnce(&mut regs::Hprt)) {
+    let mut v = CORE.hprt().read();
+    v.set_prtconndet(false);
+    v.set_prtena(false);
+    v.set_prtenchng(false);
+    v.set_prtovrcurrchng(false);
+    f(&mut v);
+    CORE.hprt().write_value(v);
 }
 
 pub(crate) fn power_down() {
-    unsafe {
-        write_volatile(wrap(WRAP_TASKS_STOP), 1);
-        write_volatile(wrap(WRAP_ENABLE), 0);
-        write_volatile(vreg(VREG_TASKS_STOP), 1);
-    }
+    WRAP.tasks_stop().write_value(1);
+    WRAP.enable().write(|w| {
+        w.set_core(false);
+        w.set_phy(false);
+    });
+    VREG.tasks_stop().write_value(1);
 }
 
 /// Power and clock bring-up shared by both roles: 24 MHz PHY reference,
@@ -535,10 +487,8 @@ pub(crate) fn platform_up() -> i32 {
     // The USB PHY reference is the 24 MHz PLL off HFXO (PHY.CLOCK reset
     // FSEL already selects 24 MHz); nothing else in this firmware starts
     // the crystal.
-    unsafe {
-        write_volatile(clk(CLK_TASKS_XO24MSTART), 1);
-    }
-    if !poll(clk(CLK_EVENTS_XO24MSTARTED), 1, 1, 100) {
+    CLOCK.tasks_xo24mstart().write_value(1);
+    if !poll(|| CLOCK.events_xo24mstarted().read() != 0, 100) {
         return -601;
     }
 
@@ -549,53 +499,44 @@ pub(crate) fn platform_up() -> i32 {
     // [63]) a bare re-START never re-fires it -- hardware-observed as a
     // silent -600 with VBUS present. Stop first to force a fresh
     // detection cycle.
-    unsafe {
-        write_volatile(vreg(VREG_TASKS_STOP), 1);
-    }
+    VREG.tasks_stop().write_value(1);
     ms_wait(2);
-    unsafe {
-        write_volatile(vreg(VREG_EVENTS_VBUSDETECTED), 0);
-        write_volatile(vreg(VREG_TASKS_START), 1);
-    }
-    if !poll(vreg(VREG_EVENTS_VBUSDETECTED), 1, 1, 100) {
+    VREG.events_vbusdetected().write_value(0);
+    VREG.tasks_start().write_value(1);
+    if !poll(|| VREG.events_vbusdetected().read() != 0, 100) {
         power_down();
         return -600;
     }
 
-    unsafe {
-        write_volatile(wrap(WRAP_ENABLE), 3); // CORE + PHY
-    }
+    WRAP.enable().write(|w| {
+        w.set_core(true);
+        w.set_phy(true);
+    });
     ms_wait(1); // PHY clock start (the H20 quirk waits 45 us here)
-    unsafe {
-        write_volatile(wrap(WRAP_TASKS_START), 1);
-    }
+    WRAP.tasks_start().write_value(1);
     // HARDWARE-CONFIRMED: the wrapper's STATUS.CORE bit never asserts on
     // this part even with the core fully alive and register access
     // working, so it cannot be the readiness gate. GSNPSID answering
     // with the Synopsys signature ("OT" in the top bytes) is.
-    if !poll(core_reg(GSNPSID), 0xFFFF_0000, 0x4F54_0000, 50) {
+    if !poll(|| CORE.gsnpsid().read() & 0xFFFF_0000 == 0x4F54_0000, 50) {
         power_down();
         return -602;
     }
 
     // Core soft reset, then force host mode (the force bit survives the
     // reset per the datasheet, but ordering this way needs no such trust).
-    if !poll(core_reg(GRSTCTL), GRSTCTL_AHBIDLE, GRSTCTL_AHBIDLE, 50) {
+    if !poll(|| CORE.grstctl().read().ahbidle(), 50) {
         power_down();
         return -603;
     }
-    unsafe {
-        write_volatile(core_reg(GRSTCTL), GRSTCTL_CSFTRST);
-    }
+    CORE.grstctl().write(|w| w.set_csftrst(true));
     // v4.20a+ handshake: wait for CSftRstDone, then clear both bits.
-    if !poll(core_reg(GRSTCTL), GRSTCTL_CSFTRSTDONE, GRSTCTL_CSFTRSTDONE, 50) {
+    if !poll(|| CORE.grstctl().read().csftrstdone(), 50) {
         power_down();
         return -604;
     }
-    unsafe {
-        write_volatile(core_reg(GRSTCTL), 0);
-    }
-    if !poll(core_reg(GRSTCTL), GRSTCTL_AHBIDLE, GRSTCTL_AHBIDLE, 50) {
+    CORE.grstctl().write_value(regs::Grstctl(0));
+    if !poll(|| CORE.grstctl().read().ahbidle(), 50) {
         power_down();
         return -604;
     }
@@ -620,69 +561,80 @@ pub fn init() -> i32 {
         return rc;
     }
 
-    unsafe {
-        let cfg = read_volatile(core_reg(GUSBCFG));
-        write_volatile(core_reg(GUSBCFG), cfg | GUSBCFG_FRCHSTMODE);
-        let otg = read_volatile(core_reg(GOTGCTL));
-        write_volatile(core_reg(GOTGCTL), otg | OTG_VBVALID_OV | OTG_AVALID_OV);
-    }
+    CORE.gusbcfg().modify(|w| w.set_forcehstmode(true));
+    // GOTGCTL session overrides: the host state machine wants A-session
+    // and VBUS valid from the PHY; force both so port power does not
+    // depend on how the wrapper routes the VBUS comparator in host mode.
+    CORE.gotgctl().modify(|w| {
+        w.set_vbvalidoven(true);
+        w.set_vbvalidovval(Vbvalidovval::Set1);
+        w.set_avalidoven(true);
+        w.set_avalidovval(Avalidovval::Value1);
+    });
     // The mode change is specified to take up to 25 ms.
-    if !poll(core_reg(GINTSTS), GINTSTS_CURMOD_HOST, GINTSTS_CURMOD_HOST, 60) {
-        let hw = unsafe { read_volatile(core_reg(GHWCFG2)) };
-        rprintln!("usb: host mode refused (GHWCFG2={:#010x} OTGMODE={})", hw, hw & 7);
+    if !poll(|| CORE.gintsts().read().curmod() == GintstsCurmod::Host, 60) {
+        let hw = CORE.ghwcfg2().read();
+        rprintln!(
+            "usb: host mode refused (GHWCFG2={:#010x} OTGMODE={})",
+            hw.0,
+            hw.otgmode().to_bits()
+        );
         power_down();
         return -605;
     }
 
-    unsafe {
-        // Buffer DMA, INCR4 bursts; global interrupt output stays masked.
-        write_volatile(core_reg(GAHBCFG), GAHBCFG_DMAEN | GAHBCFG_BURST_INCR4);
-        // FIFO carve-up in 32-bit words (12160 available): RX 1024,
-        // non-periodic TX 512, periodic TX 256 (unused, must still fit).
-        write_volatile(core_reg(GRXFSIZ), 0x400);
-        write_volatile(core_reg(GNPTXFSIZ), 0x200 << 16 | 0x400);
-        write_volatile(core_reg(HPTXFSIZ), 0x100 << 16 | 0x600);
-        write_volatile(core_reg(GRSTCTL), GRSTCTL_TXFFLSH | 0x10 << 6);
-    }
-    poll(core_reg(GRSTCTL), GRSTCTL_TXFFLSH, 0, 10);
-    unsafe {
-        write_volatile(core_reg(GRSTCTL), GRSTCTL_RXFFLSH);
-    }
-    poll(core_reg(GRSTCTL), GRSTCTL_RXFFLSH, 0, 10);
-    unsafe {
-        // HCFG reset state is right for the internal UTMI HS PHY
-        // (FSLSPclkSel = 30/60 MHz, FS/LS-only support off, buffer DMA).
-        write_volatile(core_reg(HCFG), read_volatile(core_reg(HCFG)) & !0x7);
-    }
+    // Buffer DMA, INCR4 bursts; global interrupt output stays masked.
+    CORE.gahbcfg().write(|w| {
+        w.set_dmaen(Dmaen::Dmamode);
+        w.set_hbstlen(Hbstlen::Word16orincr4);
+    });
+    // FIFO carve-up in 32-bit words (12160 available): RX 1024,
+    // non-periodic TX 512, periodic TX 256 (unused, must still fit).
+    // Written as whole words (depth in the high half, start address in
+    // the low): the SVD declares these size and start fields as 10 bits,
+    // so the typed setters silently turn 1024 into 0, while the core
+    // takes 1024-word values (hardware-observed: this carve-up runs).
+    CORE.grxfsiz().write_value(regs::Grxfsiz(0x400));
+    CORE.gnptxfsiz().write_value(regs::Gnptxfsiz(0x200 << 16 | 0x400));
+    CORE.hptxfsiz().write_value(regs::Hptxfsiz(0x100 << 16 | 0x600));
+    CORE.grstctl().write(|w| {
+        w.set_txfflsh(true);
+        w.set_txfnum(GrstctlTxfnum::Txf16); // all TX FIFOs
+    });
+    poll(|| !CORE.grstctl().read().txfflsh(), 10);
+    CORE.grstctl().write(|w| w.set_rxfflsh(true));
+    poll(|| !CORE.grstctl().read().rxfflsh(), 10);
+    // HCFG reset state is right for the internal UTMI HS PHY
+    // (FSLSPclkSel = 30/60 MHz, FS/LS-only support off, buffer DMA).
+    CORE.hcfg().modify(|w| {
+        w.set_fslspclksel(Fslspclksel::Clk3060);
+        w.set_fslssupp(Fslssupp::Hsfsls);
+    });
 
-    hprt_set(HPRT_PWR);
+    hprt_rmw(|w| w.set_prtpwr(true));
     // Connect detection: the stick is expected to be attached already, so
     // a short window is enough (and keeps a wedge-free mailbox budget).
-    if !poll(core_reg(HPRT), HPRT_CONNSTS, HPRT_CONNSTS, 400) {
+    if !poll(|| CORE.hprt().read().prtconnsts(), 400) {
         rprintln!("usb: VBUS present but no device on the port");
         power_down();
         return -610;
     }
-    unsafe {
-        write_volatile(core_reg(HPRT), (read_volatile(core_reg(HPRT)) & !HPRT_W1C) | HPRT_CONNDET);
-    }
+    hprt_rmw(|w| w.set_prtconndet(true)); // clear the connect event
     ms_wait(100); // attach debounce (USB 2.0, 7.1.7.3)
 
-    hprt_set(HPRT_RST);
+    hprt_rmw(|w| w.set_prtrst(true));
     ms_wait(60);
-    unsafe {
-        let v = read_volatile(core_reg(HPRT));
-        write_volatile(core_reg(HPRT), v & !(HPRT_W1C | HPRT_RST));
-    }
-    if !poll(core_reg(HPRT), HPRT_ENA, HPRT_ENA, 100) {
+    hprt_rmw(|w| w.set_prtrst(false));
+    if !poll(|| CORE.hprt().read().prtena(), 100) {
         power_down();
         return -611;
     }
-    let hprt = unsafe { read_volatile(core_reg(HPRT)) };
-    unsafe {
-        write_volatile(core_reg(HPRT), (hprt & !HPRT_W1C) | HPRT_ENCHNG | HPRT_CONNDET);
-    }
-    let speed = hprt >> 17 & 3;
+    let hprt = CORE.hprt().read();
+    hprt_rmw(|w| {
+        w.set_prtenchng(true);
+        w.set_prtconndet(true);
+    });
+    let speed = hprt.prtspd().to_bits() as u32;
     rprintln!("usb: port enabled, speed {} (0=HS 1=FS)", speed);
     if speed == 2 {
         rprintln!("usb: low-speed device is not a stick");
@@ -978,7 +930,7 @@ struct AsyncOp {
     off: usize,
     /// Bytes programmed for the running data chunk.
     prog: usize,
-    chr_v: u32,
+    chr_v: regs::Char,
     start: u32,
     to_ms: u32,
     tag: u32,
@@ -1002,7 +954,7 @@ static mut ASYNC: AsyncOp = AsyncOp {
     bytes: 0,
     off: 0,
     prog: 0,
-    chr_v: 0,
+    chr_v: regs::Char(0),
     start: 0,
     to_ms: 0,
     tag: 0,
@@ -1056,7 +1008,7 @@ fn async_start(lba: u32, buf: u32, count: u32, read: bool) -> i32 {
         bytes,
         off: 0,
         prog: 0,
-        chr_v: 0,
+        chr_v: regs::Char(0),
         start: 0,
         to_ms: if read {
             2000 + (bytes >> 10) as u32 * 2
@@ -1113,7 +1065,7 @@ pub fn xfer_landed() -> usize {
     }
     match a.stage {
         Stage::Data if a.read => {
-            let left = unsafe { read_volatile(core_reg(HCTSIZ0)) } as usize & 0x7FFFF;
+            let left = hc0().tsiz().read().xfersize() as usize;
             let mps = unsafe { (*core::ptr::addr_of!(DEV)).msc.mps_in } as usize;
             (a.off + a.prog.saturating_sub(left)).saturating_sub(2 * mps).min(a.bytes)
         }

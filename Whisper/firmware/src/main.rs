@@ -16,6 +16,7 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use cortex_m_rt::{entry, exception, ExceptionFrame};
+use embassy_nrf::pac;
 use rtt_target::{rprintln, rtt_init, ChannelMode};
 
 // A silent panic loop cost a debugging session (an out-of-bounds index in
@@ -81,12 +82,17 @@ pub const ARENA_BYTES: usize = 100 * 1024;
 pub static mut ARENA: [u8; ARENA_BYTES] = [0; ARENA_BYTES];
 
 // --- Device interrupt vector table (AXONS IRQ 86; see ../../npu/src/main.rs).
+//
+// Hand-built rather than the PAC's: the AXONS block is absent from the
+// public SVD, so the PAC's table (its `rt` feature) has no AXONS handler
+// and vectors IRQ 86 to a null slot. The PAC's `rt` feature therefore
+// stays off, and this table is the only one in the image.
 
 const AXONS_IRQN: usize = 86;
-// Cover every possible IRQ slot (the LM20's highest IRQ numbers exceed
-// 86): a stray unmasked interrupt then lands in default_irq_handler's
-// bkpt loop instead of executing whatever .text follows the table.
-const VECTOR_SLOTS: usize = 271;
+// Cover every IRQ slot the LM20 has (VREGUSB, the highest, is 289): a
+// stray unmasked interrupt then lands in default_irq_handler's bkpt loop
+// instead of executing whatever .text follows the table.
+const VECTOR_SLOTS: usize = 290;
 
 unsafe extern "C" fn default_irq_handler() {
     loop {
@@ -98,9 +104,22 @@ unsafe extern "C" fn axons_irq_handler() {
     bindings::nrf_axon_handle_interrupt();
 }
 
+// HAL drivers bind their interrupt handlers as exported symbols named
+// after the IRQ (display.rs binds TWIM22's SERIAL22). The handlers never
+// fire in blocking use, but the constructors unmask the NVIC lines, so
+// the table routes them properly instead of into the bkpt loop.
+#[cfg(not(feature = "sd-spim22"))]
+extern "C" {
+    fn SERIAL22();
+}
+
 const fn vector_table() -> [unsafe extern "C" fn(); VECTOR_SLOTS] {
     let mut t = [default_irq_handler as unsafe extern "C" fn(); VECTOR_SLOTS];
     t[AXONS_IRQN] = axons_irq_handler;
+    #[cfg(not(feature = "sd-spim22"))]
+    {
+        t[pac::Interrupt::SERIAL22 as usize] = SERIAL22;
+    }
     t
 }
 
@@ -563,42 +582,54 @@ unsafe fn record(dst: *mut i16, n: usize) -> i32 {
     overruns as i32
 }
 
-// OSCILLATORS.PLL.FREQ selects the MCU-domain (CPU) clock: the device
-// BOOTS AT 64 MHz (datasheet 5.5.3) and must be switched to 128 MHz when
-// the CPU starts, before any high-frequency peripheral is enabled. Found
-// the hard way: the 3 s host-grace window took 48 s on hardware.
-const OSC_PLL_FREQ: *mut u32 = 0x5012_0800 as *mut u32;
-const OSC_PLL_CURRENTFREQ: *const u32 = 0x5012_0804 as *const u32;
-const PLL_CK128M: u32 = 1;
-
-// The instruction cache (ICACHE, PPB region) is DISABLED at reset; without
-// it every taken branch refetches from RRAM through fixed wait states.
-// Measured on this loop-heavy firmware: ~16 CPU cycles per 2-instruction
-// delay iteration, i.e. code ran ~5x slower than the core clock suggests.
-const ICACHE_TASKS_INVALIDATE: *mut u32 = 0xE008_2008 as *mut u32;
-const ICACHE_ENABLE: *mut u32 = 0xE008_2404 as *mut u32;
-
 #[entry]
 fn main() -> ! {
-    unsafe {
-        core::ptr::write_volatile(OSC_PLL_FREQ, PLL_CK128M);
-        for _ in 0..1_000_000 {
-            if core::ptr::read_volatile(OSC_PLL_CURRENTFREQ) == PLL_CK128M {
-                break;
-            }
+    // HAL bring-up. OSCILLATORS.PLL.FREQ selects the MCU-domain (CPU)
+    // clock: the device BOOTS AT 64 MHz (datasheet 5.5.3) and must be
+    // switched to 128 MHz when the CPU starts, before any high-frequency
+    // peripheral is enabled. Found the hard way: the 3 s host-grace window
+    // took 48 s on hardware. init() requests it (CK128) and also applies
+    // the FICR trim values, unlocks the debug port, disables the glitch
+    // detectors, enables the DC/DC regulator and starts the RC LFCLK --
+    // the system bring-up Zephyr does on this part. The FLPR coprocessor
+    // is left alone: nothing here loads it.
+    let mut config = embassy_nrf::config::Config::default();
+    config.clock_speed = embassy_nrf::config::ClockSpeed::CK128;
+    config.flpr_reset = embassy_nrf::config::FlprReset::Leave;
+    let p = embassy_nrf::init(config);
+    // The switch takes a moment: wait for it before enabling anything
+    // clocked from it.
+    for _ in 0..1_000_000 {
+        if pac::OSCILLATORS.pll().currentfreq().read().currentfreq()
+            == pac::oscillators::vals::Currentfreq::Ck128m
+        {
+            break;
         }
-        core::ptr::write_volatile(ICACHE_TASKS_INVALIDATE, 1);
-        cortex_m::asm::delay(64);
-        core::ptr::write_volatile(ICACHE_ENABLE, 1);
-        cortex_m::asm::isb();
+    }
+    // The instruction cache (ICACHE, PPB region) is DISABLED at reset;
+    // without it every taken branch refetches from RRAM through fixed
+    // wait states. Measured on this loop-heavy firmware: ~16 CPU cycles
+    // per 2-instruction delay iteration, i.e. code ran ~5x slower than
+    // the core clock suggests.
+    pac::ICACHE.tasks_invalidatecache().write_value(1);
+    cortex_m::asm::delay(64);
+    pac::ICACHE.enable().write(|w| w.set_enable(true));
+    cortex_m::asm::isb();
+
+    // Park the display's serial instance and pins; the standalone app
+    // builds the driver when it probes the panel.
+    display::attach(p.SERIAL22, p.P3_02, p.P3_03);
+
+    let mut cp = cortex_m::Peripherals::take();
+    unsafe {
         // An attached debugger arms DEMCR vector catch (VC_HARDERR etc.),
         // which halts the core at exception ENTRY -- our HardFault handler
         // never runs and no fault dump is printed. Clear the catch bits
         // (0: VC_CORERESET, 4..10: VC_MMERR..VC_HARDERR) so faults vector
         // into the handler; TRCENA and the rest are preserved.
-        const DEMCR: *mut u32 = 0xE000_EDFC as *mut u32;
-        let demcr = core::ptr::read_volatile(DEMCR);
-        core::ptr::write_volatile(DEMCR, demcr & !0x0000_07F1);
+        if let Some(cp) = cp.as_mut() {
+            cp.DCB.demcr.modify(|v| v & !0x0000_07F1);
+        }
         // Hardware stack-limit guard (ARMv8-M MSPLIM): the stack shares
         // its 132 K with .bss and the margin is tight -- a deep frame
         // once dipped past _stack_end and silently corrupted the Axon
@@ -651,7 +682,7 @@ fn main() -> ! {
     }
 
     // Cycle counter for timing; SysTick for the hang watchdog.
-    if let Some(mut cp) = cortex_m::Peripherals::take() {
+    if let Some(cp) = cp.as_mut() {
         cp.DCB.enable_trace();
         cp.DWT.enable_cycle_counter();
         cp.SYST

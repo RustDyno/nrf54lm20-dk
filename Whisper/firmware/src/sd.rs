@@ -15,14 +15,23 @@
 //! addressed by the image's index. Reads are the hot path (weights); writes
 //! back activation spill during standalone encoding.
 //!
-//! Register map from the nRF54LM20A SVD (nrf-pac 0.4.0); the B variant on
-//! this DK shares it. SPIM00 is a 128 MHz-domain instance: SCK = 128 MHz /
-//! PRESCALER.DIVISOR with DIVISOR in 4..126, so 32 MHz at DIVISOR=4. The
+//! Registers go through the PAC (`embassy_nrf::pac`). The HAL's SPIM driver
+//! is not used: its transfers wait on EVENTS_END, which never fires on this
+//! part while CSN is disconnected (hardware-observed, see xfer), it cannot
+//! keep CS asserted across a multi-transfer SD command, and it has no
+//! erratum [8] handling. SPIM00 is a 128 MHz-domain instance: SCK = 128 MHz
+//! / PRESCALER.DIVISOR with DIVISOR in 4..126, so 32 MHz at DIVISOR=4. The
 //! minimum divided clock (~1.02 MHz) is above the 400 kHz SD initialization
 //! cap, so card init is bit-banged on the same pins at ~250 kHz and the
 //! peripheral takes over for the data phase.
 
-use core::ptr::{read_volatile, write_volatile};
+use embassy_nrf::pac;
+use pac::common::{Reg, RW};
+#[cfg(not(feature = "sd-spim22"))]
+use pac::gpio::vals::Drive;
+use pac::gpio::vals::{Dir, Input, Pull};
+use pac::shared::vals::Connect;
+use pac::spim::vals::{Cpha, Cpol, Enable, Order};
 
 // Default bus: SPIM00 at 32 MHz on the dedicated P2 pins (through the
 // DK's analog switches). The `sd-spim22` feature instead uses SPIM22 at
@@ -31,91 +40,57 @@ use core::ptr::{read_volatile, write_volatile};
 // the path, standard pads. Diagnostic fallback; the OLED (same serial
 // box and pins) is disabled under it.
 #[cfg(not(feature = "sd-spim22"))]
-const SPIM_BASE: usize = 0x5004_D000; // SPIM00, secure alias
+const SPIM: pac::spim::Spim = pac::SPIM00;
 #[cfg(not(feature = "sd-spim22"))]
-const GPIO_BASE: usize = 0x5005_0400; // GPIO port 2 (fast pads), secure alias
-#[cfg(not(feature = "sd-spim22"))]
-const HSPAD_BASE: usize = 0x5005_0400; // GPIOHSPADCTRL overlays the P2 block
+const GPIO: pac::gpio::Gpio = pac::P2; // fast pads
 
 #[cfg(feature = "sd-spim22")]
-const SPIM_BASE: usize = 0x500C_8000; // SPIM22, secure alias
+const SPIM: pac::spim::Spim = pac::SPIM22;
 #[cfg(feature = "sd-spim22")]
-const GPIO_BASE: usize = 0x500D_8600; // GPIO port 3, secure alias
+const GPIO: pac::gpio::Gpio = pac::P3_S; // port 3 has no unsuffixed alias
 
-// SPIM register offsets (SVD: GLOBAL_SPIM00, all instances share the map).
-const TASKS_START: usize = 0x000;
-const TASKS_STOP: usize = 0x004;
-const EVENTS_STARTED: usize = 0x100;
-const EVENTS_STOPPED: usize = 0x104;
-const EVENTS_END: usize = 0x108;
-const EVENTS_DMA_RX_END: usize = 0x14C;
-const EVENTS_DMA_TX_END: usize = 0x168;
-const ENABLE: usize = 0x500;
-const PRESCALER: usize = 0x52C;
-const CONFIG: usize = 0x554;
-const IFTIMING_CSNDUR: usize = 0x5B0;
-const ORC: usize = 0x5C0;
 // Erratum [8] "SPIM: Wrong data is transmitted on MOSI" (Engineering B):
 // with CPHA=0 and PRESCALER > 2 (always true on SPIM00, minimum 4), a
 // first transmitted bit of 1 corrupts the data. Workaround per the errata
 // doc: CSNDUR >= PRESCALER/2 + 1, write 0x82 to offset 0xC84 before each
-// START, and 0x00 back once STARTED has fired.
-const ERRATA8_REG: usize = 0xC84;
-const PSEL_SCK: usize = 0x600;
-const PSEL_MOSI: usize = 0x604;
-const PSEL_MISO: usize = 0x608;
-const PSEL_CSN: usize = 0x610;
-const RX_PTR: usize = 0x704;
-const RX_MAXCNT: usize = 0x708;
-const TX_PTR: usize = 0x73C;
-const TX_MAXCNT: usize = 0x740;
+// START, and 0x00 back once STARTED has fired. The register is not in the
+// SVD, so it is the one raw offset in this driver.
+const ERRATA8_OFFSET: usize = 0xC84;
 
-// GPIO port offsets.
-const IN: usize = 0x00C;
-const OUTSET: usize = 0x004;
-const OUTCLR: usize = 0x008;
-const DIRSET: usize = 0x014;
-const PIN_CNF: usize = 0x080;
+fn errata8_reg() -> Reg<u32, RW> {
+    unsafe { Reg::from_ptr((SPIM.as_ptr() as *mut u8).add(ERRATA8_OFFSET) as *mut u32) }
+}
 
 // GPIOHSPADCTRL.BIAS: slew control for P2 pads in E0E1 drive. HSBIAS is the
 // two low bits; the datasheet says to always use the highest slew (3).
 #[cfg(not(feature = "sd-spim22"))]
-const HSPAD_BIAS: usize = 0x030;
-#[cfg(not(feature = "sd-spim22"))]
-const HSBIAS_MAX: u32 = 0x3;
-
-// PIN_CNF: DIR[0], INPUT[1], PULL[3:2], DRIVE0[9:8], DRIVE1[11:10].
-// Fast switching on P2 requires extra-high drive on both halves (E0=E1=3).
-#[cfg(not(feature = "sd-spim22"))]
-const CNF_E0E1: u32 = (3 << 8) | (3 << 10);
-const CNF_OUT: u32 = 0x3; // output, input buffer disconnected
-const CNF_IN_PULLUP: u32 = 0xC; // input buffer connected, pull-up
+const HSBIAS_MAX: u8 = 0x3;
 
 #[cfg(not(feature = "sd-spim22"))]
-const PIN_SCK: u32 = 1;
+const PIN_SCK: usize = 1;
 #[cfg(not(feature = "sd-spim22"))]
-const PIN_MOSI: u32 = 2;
+const PIN_MOSI: usize = 2;
 #[cfg(not(feature = "sd-spim22"))]
-const PIN_MISO: u32 = 4;
+const PIN_MISO: usize = 4;
 #[cfg(not(feature = "sd-spim22"))]
-const PIN_CS: u32 = 5;
+const PIN_CS: usize = 5;
 #[cfg(not(feature = "sd-spim22"))]
-const PORT: u32 = 2;
+const PORT: u8 = 2;
 #[cfg(not(feature = "sd-spim22"))]
-const DIV_FAST: u32 = 4; // 128 MHz / 4 = 32 MHz
+const DIV_FAST: u8 = 4; // 128 MHz / 4 = 32 MHz
 
 #[cfg(feature = "sd-spim22")]
-const PIN_SCK: u32 = 3;
+const PIN_SCK: usize = 3;
 #[cfg(feature = "sd-spim22")]
-const PIN_MOSI: u32 = 0;
+const PIN_MOSI: usize = 0;
 #[cfg(feature = "sd-spim22")]
-const PIN_MISO: u32 = 1;
+const PIN_MISO: usize = 1;
 #[cfg(feature = "sd-spim22")]
-const PIN_CS: u32 = 2;
+const PIN_CS: usize = 2;
 #[cfg(feature = "sd-spim22")]
-const PORT: u32 = 3;
+const PORT: u8 = 3;
 #[cfg(feature = "sd-spim22")]
-const DIV_FAST: u32 = 2; // 16 MHz / 2 = 8 MHz
+const DIV_FAST: u8 = 2; // 16 MHz / 2 = 8 MHz
 
 // Bit-bang half period for card init: 256 cycles at 128 MHz = 2 us ->
 // 250 kHz, timed with the DWT cycle counter (asm::delay pacing varies
@@ -139,35 +114,73 @@ static mut BITBANG: bool = true;
 static mut SWAP_DATA: bool = false;
 
 #[inline]
-fn data_out_pin() -> u32 {
+fn data_out_pin() -> usize {
     if unsafe { SWAP_DATA } { PIN_MISO } else { PIN_MOSI }
 }
 
 #[inline]
-fn data_in_pin() -> u32 {
+fn data_in_pin() -> usize {
     if unsafe { SWAP_DATA } { PIN_MOSI } else { PIN_MISO }
 }
 
+// --- GPIO helpers (port register level: the pins change role between the
+// bit-banged init phase and the SPIM data phase, and the diagnostics
+// drive them by hand).
+
+#[inline]
+fn pin_high(pin: usize) {
+    GPIO.outset().write(|w| w.set_pin(pin, true));
+}
+
+#[inline]
+fn pin_low(pin: usize) {
+    GPIO.outclr().write(|w| w.set_pin(pin, true));
+}
+
+#[inline]
+fn pin_read(pin: usize) -> bool {
+    GPIO.in_().read().pin(pin)
+}
+
+/// Output, input buffer disconnected, standard drive.
+fn cnf_out(pin: usize) {
+    GPIO.pin_cnf(pin).write(|w| {
+        w.set_dir(Dir::Output);
+        w.set_input(Input::Disconnect);
+    });
+}
+
+/// Output with extra-high drive on both halves (E0E1): fast switching on
+/// the P2 pads needs it.
+#[cfg(not(feature = "sd-spim22"))]
+fn cnf_out_e0e1(pin: usize) {
+    GPIO.pin_cnf(pin).write(|w| {
+        w.set_dir(Dir::Output);
+        w.set_input(Input::Disconnect);
+        w.set_drive0(Drive::E);
+        w.set_drive1(Drive::E);
+    });
+}
+
+/// Input buffer connected, pull-up.
+fn cnf_in_pullup(pin: usize) {
+    GPIO.pin_cnf(pin).write(|w| {
+        w.set_dir(Dir::Input);
+        w.set_input(Input::Connect);
+        w.set_pull(Pull::Pullup);
+    });
+}
+
 /// (Re)configure the data pins for the current role assignment.
-unsafe fn config_data_pins() {
+fn config_data_pins() {
     let o = data_out_pin();
     let i = data_in_pin();
-    write_volatile(gpio(OUTSET), 1 << o);
-    write_volatile(gpio(PIN_CNF + 4 * o as usize), CNF_OUT);
-    write_volatile(gpio(DIRSET), 1 << o);
+    pin_high(o);
+    cnf_out(o);
+    GPIO.dirset().write(|w| w.set_pin(o, true));
     // PIN_CNF.DIR is the same physical register as DIR: this also turns
     // the former output back into an input.
-    write_volatile(gpio(PIN_CNF + 4 * i as usize), CNF_IN_PULLUP);
-}
-
-#[inline]
-fn spim(off: usize) -> *mut u32 {
-    (SPIM_BASE + off) as *mut u32
-}
-
-#[inline]
-fn gpio(off: usize) -> *mut u32 {
-    (GPIO_BASE + off) as *mut u32
+    cnf_in_pullup(i);
 }
 
 // ROOT CAUSE of the long -455 hunt lived here: the old helper was
@@ -179,16 +192,12 @@ fn gpio(off: usize) -> *mut u32 {
 
 /// Assert chip select (drive CS LOW: card listens).
 fn cs_assert() {
-    unsafe {
-        write_volatile(gpio(OUTCLR), 1 << PIN_CS);
-    }
+    pin_low(PIN_CS);
 }
 
 /// Release chip select (drive CS HIGH: card deselected).
 fn cs_release() {
-    unsafe {
-        write_volatile(gpio(OUTSET), 1 << PIN_CS);
-    }
+    pin_high(PIN_CS);
 }
 
 fn bb_byte(tx: u8) -> u8 {
@@ -196,21 +205,20 @@ fn bb_byte(tx: u8) -> u8 {
     let miso = data_in_pin();
     let mut rx = 0u8;
     for bit in (0..8).rev() {
-        unsafe {
-            // Mode 0: MOSI changes on the falling edge, both sides sample on
-            // the rising edge.
-            write_volatile(
-                gpio(if tx & (1 << bit) != 0 { OUTSET } else { OUTCLR }),
-                1 << mosi,
-            );
-            dwt_delay(BB_HALF_CYCLES);
-            write_volatile(gpio(OUTSET), 1 << PIN_SCK);
-            if read_volatile(gpio(IN)) & (1 << miso) != 0 {
-                rx |= 1 << bit;
-            }
-            dwt_delay(BB_HALF_CYCLES);
-            write_volatile(gpio(OUTCLR), 1 << PIN_SCK);
+        // Mode 0: MOSI changes on the falling edge, both sides sample on
+        // the rising edge.
+        if tx & (1 << bit) != 0 {
+            pin_high(mosi);
+        } else {
+            pin_low(mosi);
         }
+        dwt_delay(BB_HALF_CYCLES);
+        pin_high(PIN_SCK);
+        if pin_read(miso) {
+            rx |= 1 << bit;
+        }
+        dwt_delay(BB_HALF_CYCLES);
+        pin_low(PIN_SCK);
     }
     rx
 }
@@ -244,23 +252,23 @@ fn xfer(tx: &[u8], rx: &mut [u8]) {
         let dummy = core::ptr::addr_of_mut!(DMA_DUMMY) as u32;
         let txp = if tx.is_empty() { dummy } else { tx.as_ptr() as u32 };
         let rxp = if rx.is_empty() { dummy } else { rx.as_mut_ptr() as u32 };
-        write_volatile(spim(TX_PTR), txp);
-        write_volatile(spim(TX_MAXCNT), tx.len() as u32);
-        write_volatile(spim(RX_PTR), rxp);
-        write_volatile(spim(RX_MAXCNT), rx.len() as u32);
-        write_volatile(spim(EVENTS_STARTED), 0);
-        write_volatile(spim(EVENTS_END), 0);
+        SPIM.dma().tx().ptr().write_value(txp);
+        SPIM.dma().tx().maxcnt().write(|w| w.set_maxcnt(tx.len() as u16));
+        SPIM.dma().rx().ptr().write_value(rxp);
+        SPIM.dma().rx().maxcnt().write(|w| w.set_maxcnt(rx.len() as u16));
+        SPIM.events_started().write_value(0);
+        SPIM.events_end().write_value(0);
         if DIV_FAST > 2 {
             // erratum [8] applies only above PRESCALER 2
-            write_volatile(spim(ERRATA8_REG), 0x82);
+            errata8_reg().write_value(0x82);
         }
-        write_volatile(spim(EVENTS_DMA_RX_END), 0);
-        write_volatile(spim(EVENTS_DMA_TX_END), 0);
-        write_volatile(spim(EVENTS_STOPPED), 0);
-        write_volatile(spim(TASKS_START), 1);
-        let ok_started = spim_wait(EVENTS_STARTED);
+        SPIM.events_dma().rx().end().write_value(0);
+        SPIM.events_dma().tx().end().write_value(0);
+        SPIM.events_stopped().write_value(0);
+        SPIM.tasks_start().write_value(1);
+        let ok_started = spim_wait(SPIM.events_started());
         if DIV_FAST > 2 {
-            write_volatile(spim(ERRATA8_REG), 0x00);
+            errata8_reg().write_value(0x00);
         }
         // The nRF54 SPIM's EVENTS_END is tied to the hardware-CSN
         // transaction framing, and our CSN is disconnected (the SD
@@ -269,24 +277,24 @@ fn xfer(tx: &[u8], rx: &mut [u8]) {
         // set, EVENTS_END stuck 0). Completion = both DMA directions
         // done; then STOP closes the engine's transaction state.
         let ok_end = ok_started
-            && spim_wait(EVENTS_DMA_RX_END)
-            && spim_wait(EVENTS_DMA_TX_END);
+            && spim_wait(SPIM.events_dma().rx().end())
+            && spim_wait(SPIM.events_dma().tx().end());
         if !ok_end {
             spim_fault_dump(if ok_started { "DMA END" } else { "STARTED" });
             return;
         }
-        write_volatile(spim(TASKS_STOP), 1);
+        SPIM.tasks_stop().write_value(1);
         // Best-effort: erratum [69] says STOPPED can fail to assert in
         // corner cases; a bounded wait keeps that from wedging us.
         let stop_start = cortex_m::peripheral::DWT::cycle_count();
         while cortex_m::peripheral::DWT::cycle_count().wrapping_sub(stop_start)
             < 128_000
         {
-            if read_volatile(spim(EVENTS_STOPPED)) != 0 {
+            if SPIM.events_stopped().read() != 0 {
                 break;
             }
         }
-        write_volatile(spim(EVENTS_STOPPED), 0);
+        SPIM.events_stopped().write_value(0);
     }
 }
 
@@ -295,10 +303,10 @@ fn xfer(tx: &[u8], rx: &mut [u8]) {
 static mut SPIM_FAULT: bool = false;
 
 /// Wait up to 20 ms (DWT-timed) for an event register.
-unsafe fn spim_wait(event: usize) -> bool {
+fn spim_wait(event: Reg<u32, RW>) -> bool {
     let start = cortex_m::peripheral::DWT::cycle_count();
     while cortex_m::peripheral::DWT::cycle_count().wrapping_sub(start) < 2_560_000 {
-        if read_volatile(spim(event)) != 0 {
+        if event.read() != 0 {
             return true;
         }
     }
@@ -312,23 +320,29 @@ unsafe fn spim_fault_dump(which: &str) {
     rprintln!("sd: SPIM transfer timed out waiting for {}", which);
     rprintln!(
         "sd: STARTED={} END={} ENABLE={:#x} PRESC={} CONFIG={:#x}",
-        read_volatile(spim(EVENTS_STARTED)),
-        read_volatile(spim(EVENTS_END)),
-        read_volatile(spim(ENABLE)),
-        read_volatile(spim(PRESCALER)),
-        read_volatile(spim(CONFIG)),
+        SPIM.events_started().read(),
+        SPIM.events_end().read(),
+        SPIM.enable().read().0,
+        SPIM.prescaler().read().0,
+        SPIM.config().read().0,
     );
-    rprint!("sd: EVENTS_DMA 0x14C..0x170:");
-    let mut off = 0x14C;
-    while off <= 0x170 {
-        rprint!(" {:x}", read_volatile(spim(off)));
-        off += 4;
+    let rx = SPIM.events_dma().rx();
+    let tx = SPIM.events_dma().tx();
+    rprint!("sd: EVENTS_DMA rx end/ready/buserr/match0-3:");
+    rprint!(" {:x} {:x} {:x}", rx.end().read(), rx.ready().read(), rx.buserror().read());
+    for i in 0..4 {
+        rprint!(" {:x}", rx.match_(i).read());
     }
-    rprintln!();
+    rprintln!(
+        " tx end/ready/buserr: {:x} {:x} {:x}",
+        tx.end().read(),
+        tx.ready().read(),
+        tx.buserror().read()
+    );
     rprintln!(
         "sd: RX buserr @{:#010x} TX buserr @{:#010x}",
-        read_volatile(spim(0x720)),
-        read_volatile(spim(0x758)),
+        SPIM.dma().rx().buserroraddress().read(),
+        SPIM.dma().tx().buserroraddress().read(),
     );
 }
 
@@ -415,6 +429,14 @@ fn cmd0_probe() -> u8 {
     r
 }
 
+fn psel(pin: usize) -> pac::shared::regs::Psel {
+    let mut v = pac::shared::regs::Psel(0);
+    v.set_pin(pin as u8);
+    v.set_port(PORT);
+    v.set_connect(Connect::Connected);
+    v
+}
+
 /// Bring up the card (bit-banged SPI-mode entry + v2 negotiation), then hand
 /// the pins to SPIM00 at 32 MHz. Returns 0, or a negative stage-tagged error
 /// (-2xx = stage xx, -460 = data wires crossed).
@@ -423,24 +445,31 @@ pub fn init() -> i32 {
         BITBANG = true;
         SWAP_DATA = false;
         SPIM_FAULT = false;
-        write_volatile(spim(ENABLE), 0);
-
-        // SCK/MOSI/CS as outputs (SCK idle low, MOSI/CS idle high), MISO
-        // input with pull-up. STANDARD drive for the init phase: E0E1's
-        // nanosecond edges ring hard on jumper wiring, and a ring on SCK
-        // re-crossing the card's threshold is a phantom clock -- the C3
-        // line monitor showed the card receiving a bit-perfect CMD0
-        // (3342/3392 expected SCK edges, 81/80 MOSI, 16/16 CS) and
-        // staying mute; a softer driver (ESP32-C3) talked to the same
-        // card at the same speed without issue.
-        write_volatile(gpio(OUTCLR), 1 << PIN_SCK);
-        write_volatile(gpio(OUTSET), (1 << PIN_MOSI) | (1 << PIN_CS));
-        for pin in [PIN_SCK, PIN_MOSI, PIN_CS] {
-            write_volatile(gpio(PIN_CNF + 4 * pin as usize), CNF_OUT);
-        }
-        write_volatile(gpio(DIRSET), (1 << PIN_SCK) | (1 << PIN_MOSI) | (1 << PIN_CS));
-        write_volatile(gpio(PIN_CNF + 4 * PIN_MISO as usize), CNF_IN_PULLUP);
     }
+    SPIM.enable().write(|w| w.set_enable(Enable::Disabled));
+
+    // SCK/MOSI/CS as outputs (SCK idle low, MOSI/CS idle high), MISO
+    // input with pull-up. STANDARD drive for the init phase: E0E1's
+    // nanosecond edges ring hard on jumper wiring, and a ring on SCK
+    // re-crossing the card's threshold is a phantom clock -- the C3
+    // line monitor showed the card receiving a bit-perfect CMD0
+    // (3342/3392 expected SCK edges, 81/80 MOSI, 16/16 CS) and
+    // staying mute; a softer driver (ESP32-C3) talked to the same
+    // card at the same speed without issue.
+    pin_low(PIN_SCK);
+    GPIO.outset().write(|w| {
+        w.set_pin(PIN_MOSI, true);
+        w.set_pin(PIN_CS, true);
+    });
+    for pin in [PIN_SCK, PIN_MOSI, PIN_CS] {
+        cnf_out(pin);
+    }
+    GPIO.dirset().write(|w| {
+        w.set_pin(PIN_SCK, true);
+        w.set_pin(PIN_MOSI, true);
+        w.set_pin(PIN_CS, true);
+    });
+    cnf_in_pullup(PIN_MISO);
 
     // >= 74 clocks with CS high puts the card in SPI-command mode; send
     // 160 (some cards want extra right after power-up).
@@ -472,15 +501,11 @@ pub fn init() -> i32 {
         // Total silence: probe with the data-pin roles exchanged. The
         // card itself is the one witness that cannot be mis-tapped -- if
         // it answers like this, the two data wires are crossed.
-        unsafe {
-            SWAP_DATA = true;
-            config_data_pins();
-        }
+        unsafe { SWAP_DATA = true };
+        config_data_pins();
         let r_swapped = cmd0_probe();
-        unsafe {
-            SWAP_DATA = false;
-            config_data_pins();
-        }
+        unsafe { SWAP_DATA = false };
+        config_data_pins();
         cs_release();
         if r_swapped != 0xFF {
             use rtt_target::rprintln;
@@ -543,25 +568,29 @@ pub fn init() -> i32 {
     // now raise SCK/MOSI to extra-high drive with the fast pad slew --
     // 32 MHz needs it; CS switches once per transaction and stays soft.
     // (P2 fast pads only; the SPIM22 fallback runs standard pads at 8 MHz.)
-    unsafe {
-        #[cfg(not(feature = "sd-spim22"))]
-        {
-            write_volatile((HSPAD_BASE + HSPAD_BIAS) as *mut u32, HSBIAS_MAX);
-            for pin in [PIN_SCK, PIN_MOSI] {
-                write_volatile(gpio(PIN_CNF + 4 * pin as usize), CNF_OUT | CNF_E0E1);
-            }
+    #[cfg(not(feature = "sd-spim22"))]
+    {
+        pac::GPIOHSPADCTRL_S.bias().write(|w| w.set_hsbias(HSBIAS_MAX));
+        for pin in [PIN_SCK, PIN_MOSI] {
+            cnf_out_e0e1(pin);
         }
-        write_volatile(spim(PSEL_SCK), (PORT << 5) | PIN_SCK);
-        write_volatile(spim(PSEL_MOSI), (PORT << 5) | PIN_MOSI);
-        write_volatile(spim(PSEL_MISO), (PORT << 5) | PIN_MISO);
-        write_volatile(spim(PSEL_CSN), 1 << 31); // CS is ours, disconnect
-        write_volatile(spim(CONFIG), 0); // mode 0, MSB first
-        write_volatile(spim(ORC), 0xFF);
-        write_volatile(spim(PRESCALER), DIV_FAST);
-        write_volatile(spim(IFTIMING_CSNDUR), DIV_FAST / 2 + 1); // erratum [8]
-        write_volatile(spim(ENABLE), 7);
-        BITBANG = false;
     }
+    SPIM.psel().sck().write_value(psel(PIN_SCK));
+    SPIM.psel().mosi().write_value(psel(PIN_MOSI));
+    SPIM.psel().miso().write_value(psel(PIN_MISO));
+    // CS is ours: leave CSN disconnected.
+    SPIM.psel().csn().write(|w| w.set_connect(Connect::Disconnected));
+    SPIM.config().write(|w| {
+        // mode 0, MSB first
+        w.set_order(Order::MsbFirst);
+        w.set_cpha(Cpha::Leading);
+        w.set_cpol(Cpol::ActiveHigh);
+    });
+    SPIM.orc().write(|w| w.set_orc(0xFF));
+    SPIM.prescaler().write(|w| w.set_divisor(DIV_FAST));
+    SPIM.iftiming().csndur().write(|w| w.set_csndur(DIV_FAST / 2 + 1)); // erratum [8]
+    SPIM.enable().write(|w| w.set_enable(Enable::Enabled));
+    unsafe { BITBANG = false };
     0
 }
 
@@ -569,10 +598,12 @@ pub fn init() -> i32 {
 /// after a failed init so an external master (the C3 tester) can drive
 /// the shared wires while the DK stays powered and attached.
 pub fn release_pins() {
-    unsafe {
-        for pin in [PIN_SCK, PIN_MOSI, PIN_MISO, PIN_CS] {
-            write_volatile(gpio(PIN_CNF + 4 * pin as usize), 1 << 1); // input, disconnected
-        }
+    for pin in [PIN_SCK, PIN_MOSI, PIN_MISO, PIN_CS] {
+        GPIO.pin_cnf(pin).write(|w| {
+            w.set_dir(Dir::Input);
+            w.set_input(Input::Disconnect);
+            w.set_pull(Pull::Disabled);
+        });
     }
 }
 
@@ -594,27 +625,27 @@ pub fn diag(cycles: u32) {
             ("CS   P2.05", PIN_CS, true),
         ] {
             rprintln!("  {} LOW for 3 s...", name);
-            unsafe { write_volatile(gpio(OUTCLR), 1 << pin) };
+            pin_low(pin);
             dwt_delay(3 * SEC);
             rprintln!("  {} HIGH for 3 s...", name);
-            unsafe { write_volatile(gpio(OUTSET), 1 << pin) };
+            pin_high(pin);
             dwt_delay(3 * SEC);
             if !idle_high {
-                unsafe { write_volatile(gpio(OUTCLR), 1 << pin) };
+                pin_low(pin);
             }
         }
         rprintln!("  MISO P2.04 pull-DOWN for 3 s (a breakout pull-up may hold");
         rprintln!("  the node mid-rail; the read below shows the SoC's view)...");
-        unsafe {
-            write_volatile(gpio(PIN_CNF + 4 * PIN_MISO as usize), 0x4);
-        }
+        GPIO.pin_cnf(PIN_MISO).write(|w| {
+            w.set_dir(Dir::Input);
+            w.set_input(Input::Connect);
+            w.set_pull(Pull::Pulldown);
+        });
         dwt_delay(3 * SEC);
-        let down = unsafe { read_volatile(gpio(IN)) >> PIN_MISO } & 1;
-        unsafe {
-            write_volatile(gpio(PIN_CNF + 4 * PIN_MISO as usize), CNF_IN_PULLUP);
-        }
+        let down = pin_read(PIN_MISO) as u32;
+        cnf_in_pullup(PIN_MISO);
         dwt_delay(SEC / 100);
-        let up = unsafe { read_volatile(gpio(IN)) >> PIN_MISO } & 1;
+        let up = pin_read(PIN_MISO) as u32;
         rprintln!("  MISO input reads: pulled-down={} pulled-up={}", down, up);
         let mut ok = 0;
         for &b in &[0xA5u8, 0x3C, 0x0F, 0x81] {

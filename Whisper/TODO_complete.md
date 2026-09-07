@@ -275,3 +275,17 @@ rebuilt (embc4 replaces embp4; old cards need a re-dd).
   against their raw sums at USB speed and at 28 MB/s. Paced to 28 MB/s
   (stick-like): 52.6 -> 47.8 s, decode 0.858 -> 0.671 s/step
   (speedup.md 15).
+
+## embassy-nrf HAL / PAC migration (2026-09-06)
+
+- All hand-rolled register maps replaced: embassy-nrf 0.11 HAL for the
+  OLED's TWIM22 (blocking write), its nrf-pac re-export for PDM20,
+  SPIM00/SPIM22, GPIO/GPIOHSPADCTRL, USBHS/USBHSCORE/VREGUSB/CLOCK,
+  OSCILLATORS and ICACHE. Polled architecture unchanged, no executor.
+- main(): embassy_nrf::init() (CK128, FLPR left alone) replaces the raw
+  PLL/ICACHE/DEMCR pokes; hand-built vector table kept (PAC has no
+  AXONS), PAC `rt` off, SERIAL22 routed to the HAL's TWIM handler.
+- AXONS ENABLE is the one hand-built register (not in the SVD); the SD
+  erratum [8] register (0xC84) the one raw offset.
+- Six feature builds pass; mock-usb release build verified on the rig
+  (see NOTES.md "embassy-nrf HAL / PAC migration").

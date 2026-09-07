@@ -99,7 +99,10 @@ activations| ORCH
                          writes the requantized tflites compile_q4l.sh compiles
         make_sd_image.py the storage image (blobs, tables, plan, vocabulary)
     firmware/   bare-metal Rust step executor: mailbox protocol, CPU glue
-                kernels, runtime slot loader; reuses ../npu platform layer
+                kernels, runtime slot loader; reuses ../npu platform layer.
+                Peripherals through embassy-nrf (HAL drivers where a
+                blocking API fits, its nrf-pac re-export elsewhere); no
+                executor, the firmware stays a polled step machine
         tools/make-blob.sh   Axon header -> runtime-loadable slot blob
     host/       probe-rs driver: flashes, streams blobs/activations over SWD,
                 runs the golden-vector selftest (seed of the tape orchestrator)

@@ -13,101 +13,32 @@
 //! vendor interface would need both. The class costs one notification
 //! endpoint this code never sends on, and three class requests.
 //!
-//! Polled, buffer DMA, no interrupts -- the shape of usb.rs and sd.rs. The
-//! NVIC line stays disabled; GINTSTS and the per-endpoint DOEPINT/DIEPINT
-//! registers are read directly.
+//! Polled, buffer DMA, no interrupts -- the shape of usb.rs and sd.rs, on
+//! the PAC's USBHSCORE register block. The HAL's device driver for this
+//! core is not used: it is interrupt driven and async, and mockblk.rs
+//! chases landing transfers by reading DOEPTSIZ directly. The NVIC line
+//! stays disabled; GINTSTS and the per-endpoint DOEPINT/DIEPINT registers
+//! are read directly.
 
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 
+use embassy_nrf::pac::usbhscore::regs;
+use embassy_nrf::pac::usbhscore::vals::{
+    Devspd, Diepctl0Mps, Diepctl1Eptype, Diepctl1Txfnum, Diepctl2Eptype, Diepctl2Txfnum,
+    Dmaen, Doepctl1Eptype, GintstsCurmod, GrstctlTxfnum, Hbstlen, Supcnt,
+};
 use rtt_target::rprintln;
 
-use crate::usb::{
-    core_reg, ms_wait, platform_up, poll, power_down, GAHBCFG, GAHBCFG_BURST_INCR4,
-    GAHBCFG_DMAEN, GINTSTS, GNPTXFSIZ, GRSTCTL, GRSTCTL_RXFFLSH, GRSTCTL_TXFFLSH, GRXFSIZ,
-    GUSBCFG,
-};
-
-// --- device-mode registers (datasheet v1.0-3 USBHSCORE map) ------------------
-
-const GHWCFG3: usize = 0x04C;
-const GDFIFOCFG: usize = 0x05C;
-const DIEPTXF1: usize = 0x104; // DIEPTXF[n] = 0x104 + (n-1)*4
-const PCGCCTL: usize = 0xE00;
-const DTXFSTS: usize = 0x18;
-const DCFG: usize = 0x800;
-const DCTL: usize = 0x804;
-const DSTS: usize = 0x808;
-const DIEPMSK: usize = 0x810;
-const DOEPMSK: usize = 0x814;
-const DAINTMSK: usize = 0x81C;
-
-// Endpoint register files: IN at 0x900, OUT at 0xB00, stride 0x20 per
-// endpoint (the datasheet map lists DIEPCTL1 = 0x920, DOEPCTL1 = 0xB20 --
-// unlike the host channel block, whose stride the datasheet gives as 0x18).
-const EP_CTL: usize = 0x00;
-const EP_INT: usize = 0x08;
-const EP_TSIZ: usize = 0x10;
-const EP_DMA: usize = 0x14;
-
-#[inline]
-fn diep(n: usize, off: usize) -> *mut u32 {
-    core_reg(0x900 + n * 0x20 + off)
-}
-
-#[inline]
-fn doep(n: usize, off: usize) -> *mut u32 {
-    core_reg(0xB00 + n * 0x20 + off)
-}
-
-const GUSBCFG_FRCDEVMODE: u32 = 1 << 30;
-const GUSBCFG_FRCHSTMODE: u32 = 1 << 29;
-const GINTSTS_CURMOD_HOST: u32 = 1 << 0;
-const GINTSTS_GINNAKEFF: u32 = 1 << 6;
-const GINTSTS_GOUTNAKEFF: u32 = 1 << 7;
-const GINTSTS_USBRST: u32 = 1 << 12;
-const GINTSTS_ENUMDONE: u32 = 1 << 13;
-
-const DCFG_DEVSPD_HS: u32 = 0;
-const DCFG_DEVADDR_SHIFT: u32 = 4;
-const DCFG_DEVADDR_MASK: u32 = 0x7F << DCFG_DEVADDR_SHIFT;
-
-const DCTL_SFTDISCON: u32 = 1 << 1;
-const DCTL_SGNPINNAK: u32 = 1 << 7;
-const DCTL_CGNPINNAK: u32 = 1 << 8;
-const DCTL_SGOUTNAK: u32 = 1 << 9;
-const DCTL_CGOUTNAK: u32 = 1 << 10;
-const DCTL_PWRONPRGDONE: u32 = 1 << 11;
-
-const DSTS_ENUMSPD_SHIFT: u32 = 1;
-const DSTS_ENUMSPD_MASK: u32 = 3 << DSTS_ENUMSPD_SHIFT;
-
-const EPCTL_USBACTEP: u32 = 1 << 15;
-const EPCTL_EPTYPE_BULK: u32 = 2 << 18;
-const EPCTL_EPTYPE_INTR: u32 = 3 << 18;
-const EPCTL_STALL: u32 = 1 << 21;
-const EPCTL_TXFNUM_SHIFT: u32 = 22;
-const EPCTL_CNAK: u32 = 1 << 26;
-const EPCTL_SNAK: u32 = 1 << 27;
-const EPCTL_SETD0PID: u32 = 1 << 28;
-const EPCTL_EPDIS: u32 = 1 << 30;
-const EPCTL_EPENA: u32 = 1 << 31;
-
-const EPINT_XFERCOMPL: u32 = 1 << 0;
-const EPINT_EPDISBLD: u32 = 1 << 1;
-const EPINT_AHBERR: u32 = 1 << 2;
-const EPINT_SETUP: u32 = 1 << 3; // OUT endpoints only
-
-// Transfer-size encodings differ between endpoint 0 and the rest:
-// EP0 has XferSize[6:0] and a 2-bit (IN) / 1-bit (OUT) PktCnt, EPn has
-// XferSize[18:0] and PktCnt[28:19].
-const TSIZ0_PKTCNT_SHIFT: u32 = 19;
-const TSIZ0_SUPCNT_SHIFT: u32 = 29;
-const TSIZN_PKTCNT_SHIFT: u32 = 19;
+use crate::usb::{ms_wait, platform_up, poll, power_down, CORE};
 
 pub const MPS0: usize = 64;
 pub const MPS_BULK: usize = 512;
-const EP_BULK: usize = 1; // EP1 IN and EP1 OUT
-const EP_NOTIFY: usize = 2; // EP2 IN, CDC notifications (never sent)
+// Endpoint 1 IN and 1 OUT carry the block protocol; endpoint 2 IN is the
+// CDC notification pipe (never written to). The register accessors below
+// are per endpoint (diepctl1, doepctl1, diepctl2...), so the numbers are
+// fixed here rather than indexed.
+const EP_BULK: usize = 1;
+const EP_NOTIFY: usize = 2;
 
 // --- descriptors --------------------------------------------------------------
 // VID 0x1209 / PID 0x0001 is pid.codes' explicitly allocated prototyping
@@ -206,25 +137,29 @@ pub fn configured() -> bool {
 // --- endpoint plumbing ---------------------------------------------------------
 
 fn ep0_arm_setup() {
-    unsafe {
-        write_volatile(doep(0, EP_DMA), addr_of_mut!(SETUP) as u32);
-        write_volatile(
-            doep(0, EP_TSIZ),
-            (3 << TSIZ0_SUPCNT_SHIFT) | (1 << TSIZ0_PKTCNT_SHIFT) | 24,
-        );
-        let c = read_volatile(doep(0, EP_CTL));
-        write_volatile(doep(0, EP_CTL), c | EPCTL_EPENA | EPCTL_CNAK);
-    }
+    CORE.doepdma0().write_value(addr_of_mut!(SETUP) as u32);
+    CORE.doeptsiz0().write(|w| {
+        w.set_supcnt(Supcnt::Threepacket);
+        w.set_pktcnt(true);
+        w.set_xfersize(24);
+    });
+    CORE.doepctl0().modify(|w| {
+        w.set_epena(true);
+        w.set_cnak(true);
+    });
 }
 
 /// Arm EP0 OUT for a data or status stage of at most one packet.
 fn ep0_arm_out(len: u32) {
-    unsafe {
-        write_volatile(doep(0, EP_DMA), addr_of_mut!(EP0OUT) as u32);
-        write_volatile(doep(0, EP_TSIZ), (1 << TSIZ0_PKTCNT_SHIFT) | len);
-        let c = read_volatile(doep(0, EP_CTL));
-        write_volatile(doep(0, EP_CTL), c | EPCTL_EPENA | EPCTL_CNAK);
-    }
+    CORE.doepdma0().write_value(addr_of_mut!(EP0OUT) as u32);
+    CORE.doeptsiz0().write(|w| {
+        w.set_pktcnt(true);
+        w.set_xfersize(len as u8);
+    });
+    CORE.doepctl0().modify(|w| {
+        w.set_epena(true);
+        w.set_cnak(true);
+    });
 }
 
 /// Send up to 3 packets on EP0 IN (PktCnt is 2 bits there) and wait for the
@@ -234,65 +169,66 @@ fn ep0_in(data: &[u8], req_len: usize) {
     unsafe {
         let buf = &mut (*addr_of_mut!(EP0IN)).0;
         buf[..n].copy_from_slice(&data[..n]);
-        let pkts = if n == 0 { 1 } else { n.div_ceil(MPS0) } as u32;
-        write_volatile(diep(0, EP_DMA), addr_of_mut!(EP0IN) as u32);
-        write_volatile(diep(0, EP_TSIZ), (pkts << TSIZ0_PKTCNT_SHIFT) | n as u32);
-        let c = read_volatile(diep(0, EP_CTL));
-        write_volatile(diep(0, EP_CTL), c | EPCTL_EPENA | EPCTL_CNAK);
     }
+    let pkts = if n == 0 { 1 } else { n.div_ceil(MPS0) } as u8;
+    CORE.diepdma0().write_value(addr_of_mut!(EP0IN) as u32);
+    CORE.dieptsiz0().write(|w| {
+        w.set_pktcnt(pkts);
+        w.set_xfersize(n as u8);
+    });
+    CORE.diepctl0().modify(|w| {
+        w.set_epena(true);
+        w.set_cnak(true);
+    });
     // The status stage is a zero-length OUT; arm it now so the host never
     // sees a NAK storm after a short descriptor.
-    poll(diep(0, EP_INT), EPINT_XFERCOMPL, EPINT_XFERCOMPL, 50);
-    unsafe { write_volatile(diep(0, EP_INT), EPINT_XFERCOMPL) };
+    poll(|| CORE.diepint0().read().xfercompl(), 50);
+    CORE.diepint0().write(|w| w.set_xfercompl(true));
     ep0_arm_out(0);
 }
 
 /// Zero-length IN: the status stage of a control transfer with no data.
 fn ep0_status_in() {
-    unsafe {
-        write_volatile(diep(0, EP_DMA), addr_of_mut!(EP0IN) as u32);
-        write_volatile(diep(0, EP_TSIZ), 1 << TSIZ0_PKTCNT_SHIFT);
-        let c = read_volatile(diep(0, EP_CTL));
-        write_volatile(diep(0, EP_CTL), c | EPCTL_EPENA | EPCTL_CNAK);
-    }
-    poll(diep(0, EP_INT), EPINT_XFERCOMPL, EPINT_XFERCOMPL, 50);
-    unsafe { write_volatile(diep(0, EP_INT), EPINT_XFERCOMPL) };
+    CORE.diepdma0().write_value(addr_of_mut!(EP0IN) as u32);
+    CORE.dieptsiz0().write(|w| w.set_pktcnt(1));
+    CORE.diepctl0().modify(|w| {
+        w.set_epena(true);
+        w.set_cnak(true);
+    });
+    poll(|| CORE.diepint0().read().xfercompl(), 50);
+    CORE.diepint0().write(|w| w.set_xfercompl(true));
 }
 
 fn ep0_stall() {
-    unsafe {
-        let c = read_volatile(diep(0, EP_CTL));
-        write_volatile(diep(0, EP_CTL), c | EPCTL_STALL);
-        let c = read_volatile(doep(0, EP_CTL));
-        write_volatile(doep(0, EP_CTL), c | EPCTL_STALL);
-    }
+    CORE.diepctl0().modify(|w| w.set_stall(true));
+    CORE.doepctl0().modify(|w| w.set_stall(true));
     ep0_arm_setup();
 }
 
 fn activate_data_endpoints() {
-    unsafe {
-        write_volatile(
-            diep(EP_BULK, EP_CTL),
-            MPS_BULK as u32
-                | EPCTL_USBACTEP
-                | EPCTL_EPTYPE_BULK
-                | ((EP_BULK as u32) << EPCTL_TXFNUM_SHIFT)
-                | EPCTL_SETD0PID
-                | EPCTL_SNAK,
-        );
-        write_volatile(
-            doep(EP_BULK, EP_CTL),
-            MPS_BULK as u32 | EPCTL_USBACTEP | EPCTL_EPTYPE_BULK | EPCTL_SETD0PID | EPCTL_SNAK,
-        );
-        write_volatile(
-            diep(EP_NOTIFY, EP_CTL),
-            16 | EPCTL_USBACTEP
-                | EPCTL_EPTYPE_INTR
-                | ((EP_NOTIFY as u32) << EPCTL_TXFNUM_SHIFT)
-                | EPCTL_SETD0PID
-                | EPCTL_SNAK,
-        );
-    }
+    CORE.diepctl1().write(|w| {
+        w.set_mps(MPS_BULK as u16);
+        w.set_usbactep(true);
+        w.set_eptype(Diepctl1Eptype::Bulk);
+        w.set_txfnum(Diepctl1Txfnum::Txfifo1);
+        w.set_setd0pid(true);
+        w.set_snak(true);
+    });
+    CORE.doepctl1().write(|w| {
+        w.set_mps(MPS_BULK as u16);
+        w.set_usbactep(true);
+        w.set_eptype(Doepctl1Eptype::Bulk);
+        w.set_setd0pid(true);
+        w.set_snak(true);
+    });
+    CORE.diepctl2().write(|w| {
+        w.set_mps(16);
+        w.set_usbactep(true);
+        w.set_eptype(Diepctl2Eptype::Interrup);
+        w.set_txfnum(Diepctl2Txfnum::Txfifo2);
+        w.set_setd0pid(true);
+        w.set_snak(true);
+    });
 }
 
 // --- control transfers ----------------------------------------------------------
@@ -317,8 +253,8 @@ fn handle_setup() {
             0x20 => {
                 // SET_LINE_CODING: data stage, then status IN
                 ep0_arm_out(MPS0 as u32);
-                if poll(doep(0, EP_INT), EPINT_XFERCOMPL, EPINT_XFERCOMPL, 50) {
-                    unsafe { write_volatile(doep(0, EP_INT), EPINT_XFERCOMPL) };
+                if poll(|| CORE.doepint0().read().xfercompl(), 50) {
+                    CORE.doepint0().write(|w| w.set_xfercompl(true));
                 }
                 ep0_status_in();
             }
@@ -367,11 +303,8 @@ fn handle_setup() {
         // stage goes out, not after it completes.
         (0x05, false) => {
             let addr = (val & 0x7F) as u32;
-            unsafe {
-                ADDRESS = addr;
-                let c = read_volatile(core_reg(DCFG)) & !DCFG_DEVADDR_MASK;
-                write_volatile(core_reg(DCFG), c | (addr << DCFG_DEVADDR_SHIFT));
-            }
+            unsafe { ADDRESS = addr };
+            CORE.dcfg().modify(|w| w.set_devaddr(addr as u8));
             ep0_status_in();
         }
         (0x09, false) => {
@@ -401,44 +334,44 @@ fn handle_setup() {
 /// but 0: the bulk transfer routines own DIEPINT/DOEPINT for EP1 and would
 /// lose completions to a pump() call that cleared them.
 pub fn pump() {
-    let g = unsafe { read_volatile(core_reg(GINTSTS)) };
+    let g = CORE.gintsts().read();
 
-    if g & GINTSTS_USBRST != 0 {
+    if g.usbrst() {
+        CORE.gintsts().write(|w| w.set_usbrst(true));
+        // A reset after we were configured means the host tore the link
+        // down; the caller needs to see that rather than block forever.
         unsafe {
-            write_volatile(core_reg(GINTSTS), GINTSTS_USBRST);
-            // A reset after we were configured means the host tore the link
-            // down; the caller needs to see that rather than block forever.
             if CONFIGURED {
                 RESET_AFTER_CONFIG = true;
             }
             CONFIGURED = false;
-            write_volatile(core_reg(DCTL), read_volatile(core_reg(DCTL)) | DCTL_CGOUTNAK);
-            write_volatile(core_reg(DCFG), read_volatile(core_reg(DCFG)) & !DCFG_DEVADDR_MASK);
         }
+        CORE.dctl().modify(|w| w.set_cgoutnak(true));
+        CORE.dcfg().modify(|w| w.set_devaddr(0));
         ep0_arm_setup();
     }
 
-    if g & GINTSTS_ENUMDONE != 0 {
-        unsafe { write_volatile(core_reg(GINTSTS), GINTSTS_ENUMDONE) };
-        let spd = unsafe { (read_volatile(core_reg(DSTS)) & DSTS_ENUMSPD_MASK) >> DSTS_ENUMSPD_SHIFT };
+    if g.enumdone() {
+        CORE.gintsts().write(|w| w.set_enumdone(true));
+        let spd = CORE.dsts().read().enumspd().to_bits();
         // EP0 MPS is an enum there (0 = 64 B), which is what we advertise
         // at either speed, so the reset value already suits.
-        unsafe {
-            let c = read_volatile(diep(0, EP_CTL));
-            write_volatile(diep(0, EP_CTL), c & !3);
-            write_volatile(core_reg(DCTL), read_volatile(core_reg(DCTL)) | DCTL_CGNPINNAK);
-        }
+        CORE.diepctl0().modify(|w| w.set_mps(Diepctl0Mps::Bytes64));
+        CORE.dctl().modify(|w| w.set_cgnpinnak(true));
         rprintln!("usbdev: enumerated, speed {} (0=HS 1=FS)", spd);
         ep0_arm_setup();
     }
 
     // SETUP arrival and control data completions both land on EP0 OUT.
-    let o = unsafe { read_volatile(doep(0, EP_INT)) };
-    if o & EPINT_SETUP != 0 {
-        unsafe { write_volatile(doep(0, EP_INT), EPINT_SETUP | EPINT_XFERCOMPL) };
+    let o = CORE.doepint0().read();
+    if o.setup() {
+        CORE.doepint0().write(|w| {
+            w.set_setup(true);
+            w.set_xfercompl(true);
+        });
         handle_setup();
-    } else if o & EPINT_XFERCOMPL != 0 {
-        unsafe { write_volatile(doep(0, EP_INT), EPINT_XFERCOMPL) };
+    } else if o.xfercompl() {
+        CORE.doepint0().write(|w| w.set_xfercompl(true));
     }
 }
 
@@ -495,31 +428,31 @@ fn ep_in_xfer(dma: u32, len: usize, to_ms: u32) -> i32 {
 }
 
 fn ep_in_arm(dma: u32, len: usize) {
-    let pkts = if len == 0 { 1 } else { len.div_ceil(MPS_BULK) } as u32;
+    let pkts = if len == 0 { 1 } else { len.div_ceil(MPS_BULK) } as u16;
     // The endpoint DMA reads a buffer the CPU has just written; make those
     // stores visible before the transfer is armed.
     cortex_m::asm::dmb();
-    unsafe {
-        write_volatile(diep(EP_BULK, EP_INT), !0);
-        write_volatile(diep(EP_BULK, EP_DMA), dma);
-        write_volatile(
-            diep(EP_BULK, EP_TSIZ),
-            (pkts << TSIZN_PKTCNT_SHIFT) | len as u32,
-        );
-        let c = read_volatile(diep(EP_BULK, EP_CTL));
-        write_volatile(diep(EP_BULK, EP_CTL), c | EPCTL_EPENA | EPCTL_CNAK);
-    }
+    CORE.diepint1().write(|w| w.0 = !0);
+    CORE.diepdma1().write_value(dma);
+    CORE.dieptsiz1().write(|w| {
+        w.set_pktcnt(pkts);
+        w.set_xfersize(len as u32);
+    });
+    CORE.diepctl1().modify(|w| {
+        w.set_epena(true);
+        w.set_cnak(true);
+    });
 }
 
 /// Non-blocking completion check for `ep_in_arm`; services the control
 /// endpoint on the way. None while the transfer is still running.
 fn ep_in_check(budget: &mut Budget) -> Option<i32> {
-    let i = unsafe { read_volatile(diep(EP_BULK, EP_INT)) };
-    if i & EPINT_XFERCOMPL != 0 {
-        unsafe { write_volatile(diep(EP_BULK, EP_INT), EPINT_XFERCOMPL) };
+    let i = CORE.diepint1().read();
+    if i.xfercompl() {
+        CORE.diepint1().write(|w| w.set_xfercompl(true));
         return Some(0);
     }
-    if i & EPINT_AHBERR != 0 {
+    if i.ahberr() {
         ep_abort(true);
         return Some(-621);
     }
@@ -551,29 +484,29 @@ fn ep_out_xfer(dma: u32, cap: usize, to_ms: u32) -> Result<usize, i32> {
 
 /// Returns the number of bytes the transfer was programmed for.
 fn ep_out_arm(dma: u32, cap: usize) -> usize {
-    let pkts = (cap / MPS_BULK).max(1) as u32;
+    let pkts = (cap / MPS_BULK).max(1) as u16;
     let want = pkts as usize * MPS_BULK;
-    unsafe {
-        write_volatile(doep(EP_BULK, EP_INT), !0);
-        write_volatile(doep(EP_BULK, EP_DMA), dma);
-        write_volatile(
-            doep(EP_BULK, EP_TSIZ),
-            (pkts << TSIZN_PKTCNT_SHIFT) | want as u32,
-        );
-        let c = read_volatile(doep(EP_BULK, EP_CTL));
-        write_volatile(doep(EP_BULK, EP_CTL), c | EPCTL_EPENA | EPCTL_CNAK);
-    }
+    CORE.doepint1().write(|w| w.0 = !0);
+    CORE.doepdma1().write_value(dma);
+    CORE.doeptsiz1().write(|w| {
+        w.set_pktcnt(pkts);
+        w.set_xfersize(want as u32);
+    });
+    CORE.doepctl1().modify(|w| {
+        w.set_epena(true);
+        w.set_cnak(true);
+    });
     want
 }
 
 fn ep_out_check(want: usize, budget: &mut Budget) -> Option<Result<usize, i32>> {
-    let i = unsafe { read_volatile(doep(EP_BULK, EP_INT)) };
-    if i & EPINT_XFERCOMPL != 0 {
-        unsafe { write_volatile(doep(EP_BULK, EP_INT), EPINT_XFERCOMPL) };
-        let left = unsafe { read_volatile(doep(EP_BULK, EP_TSIZ)) } & 0x7FFFF;
+    let i = CORE.doepint1().read();
+    if i.xfercompl() {
+        CORE.doepint1().write(|w| w.set_xfercompl(true));
+        let left = CORE.doeptsiz1().read().xfersize();
         return Some(Ok(want - left as usize));
     }
-    if i & EPINT_AHBERR != 0 {
+    if i.ahberr() {
         ep_abort(false);
         return Some(Err(-621));
     }
@@ -596,35 +529,39 @@ fn ep_out_check(want: usize, budget: &mut Budget) -> Option<Result<usize, i32>> 
 /// the only way back. Without this a single timeout wedges the link until
 /// the board is reset.
 fn ep_abort(is_in: bool) {
-    unsafe {
-        let ep = if is_in { diep(EP_BULK, EP_CTL) } else { doep(EP_BULK, EP_CTL) };
-        let int = if is_in { diep(EP_BULK, EP_INT) } else { doep(EP_BULK, EP_INT) };
-        if read_volatile(ep) & EPCTL_EPENA == 0 {
+    if is_in {
+        if !CORE.diepctl1().read().epena() {
             return;
         }
-        let dctl = core_reg(DCTL);
-        if is_in {
-            write_volatile(dctl, read_volatile(dctl) | DCTL_SGNPINNAK);
-            poll(core_reg(GINTSTS), GINTSTS_GINNAKEFF, GINTSTS_GINNAKEFF, 10);
-        } else {
-            write_volatile(dctl, read_volatile(dctl) | DCTL_SGOUTNAK);
-            poll(core_reg(GINTSTS), GINTSTS_GOUTNAKEFF, GINTSTS_GOUTNAKEFF, 10);
+        CORE.dctl().modify(|w| w.set_sgnpinnak(true));
+        poll(|| CORE.gintsts().read().ginnakeff(), 10);
+        CORE.diepctl1().modify(|w| {
+            w.set_epdis(true);
+            w.set_snak(true);
+        });
+        poll(|| CORE.diepint1().read().epdisbld(), 10);
+        CORE.diepint1().write(|w| w.0 = !0);
+        // Stale packets in the endpoint's TxFIFO would go out ahead of
+        // the next transfer's first packet.
+        CORE.grstctl().write(|w| {
+            w.set_txfflsh(true);
+            w.set_txfnum(GrstctlTxfnum::Txf1);
+        });
+        poll(|| !CORE.grstctl().read().txfflsh(), 10);
+        CORE.dctl().modify(|w| w.set_cgnpinnak(true));
+    } else {
+        if !CORE.doepctl1().read().epena() {
+            return;
         }
-        write_volatile(ep, read_volatile(ep) | EPCTL_EPDIS | EPCTL_SNAK);
-        poll(int, EPINT_EPDISBLD, EPINT_EPDISBLD, 10);
-        write_volatile(int, !0);
-        if is_in {
-            // Stale packets in the endpoint's TxFIFO would go out ahead of
-            // the next transfer's first packet.
-            write_volatile(
-                core_reg(GRSTCTL),
-                GRSTCTL_TXFFLSH | ((EP_BULK as u32) << 6),
-            );
-            poll(core_reg(GRSTCTL), GRSTCTL_TXFFLSH, 0, 10);
-            write_volatile(dctl, read_volatile(dctl) | DCTL_CGNPINNAK);
-        } else {
-            write_volatile(dctl, read_volatile(dctl) | DCTL_CGOUTNAK);
-        }
+        CORE.dctl().modify(|w| w.set_sgoutnak(true));
+        poll(|| CORE.gintsts().read().goutnakeff(), 10);
+        CORE.doepctl1().modify(|w| {
+            w.set_epdis(true);
+            w.set_snak(true);
+        });
+        poll(|| CORE.doepint1().read().epdisbld(), 10);
+        CORE.doepint1().write(|w| w.0 = !0);
+        CORE.dctl().modify(|w| w.set_cgoutnak(true));
     }
 }
 
@@ -680,40 +617,38 @@ pub fn recv(dma: u32, len: usize, to_ms: u32) -> i32 {
 /// actually leave: FIFO carve-up, endpoint state, and the core's view of
 /// the bus.
 pub fn diag(tag: &str) {
-    unsafe {
-        rprintln!(
-            "usbdev[{}]: GINTSTS={:#010x} DSTS={:#010x} DCTL={:#010x} GHWCFG3={:#010x} GDFIFOCFG={:#010x}",
-            tag,
-            read_volatile(core_reg(GINTSTS)),
-            read_volatile(core_reg(DSTS)),
-            read_volatile(core_reg(DCTL)),
-            read_volatile(core_reg(GHWCFG3)),
-            read_volatile(core_reg(GDFIFOCFG))
-        );
-        rprintln!(
-            "usbdev[{}]: GRXFSIZ={:#010x} GNPTXFSIZ={:#010x} TXF1={:#010x} TXF2={:#010x}",
-            tag,
-            read_volatile(core_reg(GRXFSIZ)),
-            read_volatile(core_reg(GNPTXFSIZ)),
-            read_volatile(core_reg(DIEPTXF1)),
-            read_volatile(core_reg(DIEPTXF1 + 4))
-        );
-        rprintln!(
-            "usbdev[{}]: DIEPCTL1={:#010x} DIEPTSIZ1={:#010x} DIEPINT1={:#010x} DTXFSTS1={:#010x}",
-            tag,
-            read_volatile(diep(EP_BULK, EP_CTL)),
-            read_volatile(diep(EP_BULK, EP_TSIZ)),
-            read_volatile(diep(EP_BULK, EP_INT)),
-            read_volatile(diep(EP_BULK, DTXFSTS))
-        );
-        rprintln!(
-            "usbdev[{}]: DOEPCTL1={:#010x} DOEPTSIZ1={:#010x} DOEPINT1={:#010x}",
-            tag,
-            read_volatile(doep(EP_BULK, EP_CTL)),
-            read_volatile(doep(EP_BULK, EP_TSIZ)),
-            read_volatile(doep(EP_BULK, EP_INT))
-        );
-    }
+    rprintln!(
+        "usbdev[{}]: GINTSTS={:#010x} DSTS={:#010x} DCTL={:#010x} GHWCFG3={:#010x} GDFIFOCFG={:#010x}",
+        tag,
+        CORE.gintsts().read().0,
+        CORE.dsts().read().0,
+        CORE.dctl().read().0,
+        CORE.ghwcfg3().read().0,
+        CORE.gdfifocfg().read().0
+    );
+    rprintln!(
+        "usbdev[{}]: GRXFSIZ={:#010x} GNPTXFSIZ={:#010x} TXF1={:#010x} TXF2={:#010x}",
+        tag,
+        CORE.grxfsiz().read().0,
+        CORE.gnptxfsiz().read().0,
+        CORE.dieptxf(0).read().0,
+        CORE.dieptxf(1).read().0
+    );
+    rprintln!(
+        "usbdev[{}]: DIEPCTL1={:#010x} DIEPTSIZ1={:#010x} DIEPINT1={:#010x} DTXFSTS1={:#010x}",
+        tag,
+        CORE.diepctl1().read().0,
+        CORE.dieptsiz1().read().0,
+        CORE.diepint1().read().0,
+        CORE.dtxfsts1().read().0
+    );
+    rprintln!(
+        "usbdev[{}]: DOEPCTL1={:#010x} DOEPTSIZ1={:#010x} DOEPINT1={:#010x}",
+        tag,
+        CORE.doepctl1().read().0,
+        CORE.doeptsiz1().read().0,
+        CORE.doepint1().read().0
+    );
 }
 
 /// Swallow anything the host has already queued for us.
@@ -737,7 +672,7 @@ pub fn drain() {
 /// plugged in, so the caller can fall back quietly).
 pub fn init(wait_ms: u32) -> i32 {
     unsafe {
-        CONFIGURED = false;
+        write_volatile(addr_of_mut!(CONFIGURED), false);
         ADDRESS = 0;
         RESET_AFTER_CONFIG = false;
     }
@@ -747,64 +682,68 @@ pub fn init(wait_ms: u32) -> i32 {
         return rc;
     }
 
-    unsafe {
-        let cfg = read_volatile(core_reg(GUSBCFG));
-        write_volatile(
-            core_reg(GUSBCFG),
-            (cfg & !GUSBCFG_FRCHSTMODE) | GUSBCFG_FRCDEVMODE,
-        );
-    }
+    CORE.gusbcfg().modify(|w| {
+        w.set_forcehstmode(false);
+        w.set_forcedevmode(true);
+    });
     // Mode changes are specified to take up to 25 ms; CURMOD reads 0 in
     // device mode.
-    if !poll(core_reg(GINTSTS), GINTSTS_CURMOD_HOST, 0, 60) {
+    if !poll(|| CORE.gintsts().read().curmod() == GintstsCurmod::Device, 60) {
         rprintln!("usbdev: device mode refused");
         power_down();
         return -630;
     }
 
-    unsafe {
-        // Hold the bus off until the endpoints and FIFOs are programmed, so
-        // the PC's first reset finds a device that can answer.
-        write_volatile(core_reg(DCTL), read_volatile(core_reg(DCTL)) | DCTL_SFTDISCON);
-        write_volatile(core_reg(GAHBCFG), GAHBCFG_DMAEN | GAHBCFG_BURST_INCR4);
-        write_volatile(core_reg(DCFG), DCFG_DEVSPD_HS);
+    // Hold the bus off until the endpoints and FIFOs are programmed, so
+    // the PC's first reset finds a device that can answer.
+    CORE.dctl().modify(|w| w.set_sftdiscon(true));
+    CORE.gahbcfg().write(|w| {
+        w.set_dmaen(Dmaen::Dmamode);
+        w.set_hbstlen(Hbstlen::Word16orincr4);
+    });
+    CORE.dcfg().write(|w| w.set_devspd(Devspd::Usbhs20));
 
-        // FIFO carve-up in 32-bit words. The shared RX FIFO needs
-        // (4*ctrl_eps + 6) + (MPS/4 + 1)*packets + 2*out_eps + 1; 640 words
-        // covers four 512-byte packets in flight with room to spare.
-        let rx = 640u32;
-        let np = 256u32; // EP0 IN
-        let tx1 = 1024u32; // EP1 IN bulk
-        let tx2 = 64u32; // EP2 IN notifications
-        write_volatile(core_reg(GRXFSIZ), rx);
-        write_volatile(core_reg(GNPTXFSIZ), (np << 16) | rx);
-        write_volatile(core_reg(DIEPTXF1), (tx1 << 16) | (rx + np));
-        write_volatile(core_reg(DIEPTXF1 + 4), (tx2 << 16) | (rx + np + tx1));
-        // The databook requires the endpoint-info block to sit above every
-        // FIFO. Only that base address is ours to set -- the low half is
-        // the core's own total-size value, so read-modify-write it.
-        let epinfo = rx + np + tx1 + tx2;
-        let g = read_volatile(core_reg(GDFIFOCFG)) & 0xFFFF;
-        write_volatile(core_reg(GDFIFOCFG), (epinfo << 16) | g);
-        // Clock gating off: a gated PHY/core clock silently swallows
-        // transfers.
-        write_volatile(core_reg(PCGCCTL), 0);
+    // FIFO carve-up in 32-bit words. The shared RX FIFO needs
+    // (4*ctrl_eps + 6) + (MPS/4 + 1)*packets + 2*out_eps + 1; 640 words
+    // covers four 512-byte packets in flight with room to spare.
+    // Written as whole words (depth in the high half, start address in
+    // the low): the SVD declares these size and start fields as 10 bits,
+    // so the typed setters silently turn the 1024-word EP1 FIFO into a
+    // zero-word one (hardware-observed: DTXFSTS1 = 0, every IN transfer
+    // times out), while the core takes the value.
+    let rx = 640u32;
+    let np = 256u32; // EP0 IN
+    let tx1 = 1024u32; // EP1 IN bulk
+    let tx2 = 64u32; // EP2 IN notifications
+    CORE.grxfsiz().write_value(regs::Grxfsiz(rx));
+    CORE.gnptxfsiz().write_value(regs::Gnptxfsiz((np << 16) | rx));
+    // dieptxf(0) is DIEPTXF1 (EP1 IN), dieptxf(1) is DIEPTXF2.
+    CORE.dieptxf(0).write_value(regs::Dieptxf((tx1 << 16) | (rx + np)));
+    CORE.dieptxf(1).write_value(regs::Dieptxf((tx2 << 16) | (rx + np + tx1)));
+    // The databook requires the endpoint-info block to sit above every
+    // FIFO. Only that base address is ours to set -- the low half is
+    // the core's own total-size value, so read-modify-write it.
+    let epinfo = rx + np + tx1 + tx2;
+    CORE.gdfifocfg().modify(|w| w.set_epinfobaseaddr(epinfo as u16));
+    // Clock gating off: a gated PHY/core clock silently swallows
+    // transfers.
+    CORE.pcgcctl().write_value(regs::Pcgcctl(0));
 
-        write_volatile(core_reg(GRSTCTL), GRSTCTL_TXFFLSH | (0x10 << 6));
-    }
-    poll(core_reg(GRSTCTL), GRSTCTL_TXFFLSH, 0, 10);
-    unsafe { write_volatile(core_reg(GRSTCTL), GRSTCTL_RXFFLSH) };
-    poll(core_reg(GRSTCTL), GRSTCTL_RXFFLSH, 0, 10);
+    CORE.grstctl().write(|w| {
+        w.set_txfflsh(true);
+        w.set_txfnum(GrstctlTxfnum::Txf16); // all TX FIFOs
+    });
+    poll(|| !CORE.grstctl().read().txfflsh(), 10);
+    CORE.grstctl().write(|w| w.set_rxfflsh(true));
+    poll(|| !CORE.grstctl().read().rxfflsh(), 10);
 
-    unsafe {
-        // Interrupt lines stay masked at the NVIC; these masks only gate
-        // the status bits this code polls.
-        write_volatile(core_reg(DIEPMSK), 0);
-        write_volatile(core_reg(DOEPMSK), 0);
-        write_volatile(core_reg(DAINTMSK), 0);
-        write_volatile(core_reg(GINTSTS), !0);
-        write_volatile(core_reg(DCTL), read_volatile(core_reg(DCTL)) | DCTL_PWRONPRGDONE);
-    }
+    // Interrupt lines stay masked at the NVIC; these masks only gate
+    // the status bits this code polls.
+    CORE.diepmsk().write_value(regs::Diepmsk(0));
+    CORE.doepmsk().write_value(regs::Doepmsk(0));
+    CORE.daintmsk().write_value(regs::Daintmsk(0));
+    CORE.gintsts().write(|w| w.0 = !0);
+    CORE.dctl().modify(|w| w.set_pwronprgdone(true));
     // Hold the disconnect long enough for the host to actually register a
     // detach before we re-attach. A reset that leaves VBUS up (a reflash,
     // say) can otherwise present so brief a gap that the host never
@@ -812,10 +751,8 @@ pub fn init(wait_ms: u32) -> i32 {
     // and enumeration simply never happens -- the device then sits in
     // DSTS.SuspSts with no USBRst forever. USB 2.0 debounce is 100 ms.
     ms_wait(150);
-    unsafe {
-        // Attach: the PC now sees a device and starts enumeration.
-        write_volatile(core_reg(DCTL), read_volatile(core_reg(DCTL)) & !DCTL_SFTDISCON);
-    }
+    // Attach: the PC now sees a device and starts enumeration.
+    CORE.dctl().modify(|w| w.set_sftdiscon(false));
 
     let mut budget = Budget::new(wait_ms);
     while !configured() {
@@ -824,8 +761,8 @@ pub fn init(wait_ms: u32) -> i32 {
             rprintln!(
                 "usbdev: not configured after {} ms (DSTS={:#010x} GINTSTS={:#010x})",
                 wait_ms,
-                unsafe { read_volatile(core_reg(DSTS)) },
-                unsafe { read_volatile(core_reg(GINTSTS)) }
+                CORE.dsts().read().0,
+                CORE.gintsts().read().0
             );
             power_down();
             return -631;
@@ -910,7 +847,7 @@ fn recv_arm_next(x: &mut Xfer) {
 /// run down per packet) behind a two-packet margin for a write still on
 /// its way through the bus.
 pub fn recv_landed(x: &Xfer) -> usize {
-    let left = unsafe { read_volatile(doep(EP_BULK, EP_TSIZ)) } as usize & 0x7FFFF;
+    let left = CORE.doeptsiz1().read().xfersize() as usize;
     (x.off + x.want.saturating_sub(left)).saturating_sub(2 * MPS_BULK).min(x.len)
 }
 
