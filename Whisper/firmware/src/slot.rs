@@ -62,8 +62,10 @@ pub unsafe fn run_at(base: usize, input: u32, output: u32, name: &str) -> i32 {
     let t0 = cortex_m::peripheral::DWT::cycle_count();
     let rc = bindings::nrf_axon_nn_model_validate(model);
     VALIDATE_CYCLES += cortex_m::peripheral::DWT::cycle_count().wrapping_sub(t0) as u64;
+    #[cfg(feature = "npu-log")]
     rtt_target::rprintln!("npu {}: validate rc={} infer...", name, rc.0);
     if rc.0 != 0 {
+        rtt_target::rprintln!("npu {}: validate rc={}", name, rc.0);
         return rc.0;
     }
     crate::crumb2(0x201); // entering infer_sync
@@ -79,6 +81,11 @@ pub unsafe fn run_at(base: usize, input: u32, output: u32, name: &str) -> i32 {
     };
     let rc = bindings::nrf_axon_nn_model_infer_sync(model, input, output).0;
     crate::crumb2(0x202); // infer_sync returned
-    rtt_target::rprintln!("npu: infer rc={}", rc);
+    #[cfg(feature = "npu-log")]
+    rtt_target::rprintln!("npu {}: infer rc={}", name, rc);
+    #[cfg(not(feature = "npu-log"))]
+    if rc != 0 {
+        rtt_target::rprintln!("npu {}: infer rc={}", name, rc);
+    }
     rc
 }

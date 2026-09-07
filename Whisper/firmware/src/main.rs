@@ -104,22 +104,15 @@ unsafe extern "C" fn axons_irq_handler() {
     bindings::nrf_axon_handle_interrupt();
 }
 
-// HAL drivers bind their interrupt handlers as exported symbols named
-// after the IRQ (display.rs binds TWIM22's SERIAL22). The handlers never
-// fire in blocking use, but the constructors unmask the NVIC lines, so
-// the table routes them properly instead of into the bkpt loop.
-#[cfg(not(feature = "sd-spim22"))]
-extern "C" {
-    fn SERIAL22();
-}
+// A HAL driver binds its interrupt handler as an exported symbol named
+// after the IRQ (`bind_interrupts!`); its constructor unmasks the NVIC
+// line, so such a handler must be routed here (declare it in an
+// `extern "C"` block and store it at `pac::Interrupt::NAME as usize`)
+// rather than left to the bkpt loop. No driver currently needs one.
 
 const fn vector_table() -> [unsafe extern "C" fn(); VECTOR_SLOTS] {
     let mut t = [default_irq_handler as unsafe extern "C" fn(); VECTOR_SLOTS];
     t[AXONS_IRQN] = axons_irq_handler;
-    #[cfg(not(feature = "sd-spim22"))]
-    {
-        t[pac::Interrupt::SERIAL22 as usize] = SERIAL22;
-    }
     t
 }
 
@@ -596,7 +589,11 @@ fn main() -> ! {
     let mut config = embassy_nrf::config::Config::default();
     config.clock_speed = embassy_nrf::config::ClockSpeed::CK128;
     config.flpr_reset = embassy_nrf::config::FlprReset::Leave;
-    let p = embassy_nrf::init(config);
+    // The peripheral singletons are not handed out: every driver here is
+    // polled on the PAC's registers (the HAL's port lookup has no port 3,
+    // where the display lives, and its other drivers do not fit; see the
+    // module docs).
+    let _peripherals = embassy_nrf::init(config);
     // The switch takes a moment: wait for it before enabling anything
     // clocked from it.
     for _ in 0..1_000_000 {
@@ -615,10 +612,6 @@ fn main() -> ! {
     cortex_m::asm::delay(64);
     pac::ICACHE.enable().write(|w| w.set_enable(true));
     cortex_m::asm::isb();
-
-    // Park the display's serial instance and pins; the standalone app
-    // builds the driver when it probes the panel.
-    display::attach(p.SERIAL22, p.P3_02, p.P3_03);
 
     let mut cp = cortex_m::Peripherals::take();
     unsafe {

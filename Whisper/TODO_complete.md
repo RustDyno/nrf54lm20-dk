@@ -278,14 +278,19 @@ rebuilt (embc4 replaces embp4; old cards need a re-dd).
 
 ## embassy-nrf HAL / PAC migration (2026-09-06)
 
-- All hand-rolled register maps replaced: embassy-nrf 0.11 HAL for the
-  OLED's TWIM22 (blocking write), its nrf-pac re-export for PDM20,
-  SPIM00/SPIM22, GPIO/GPIOHSPADCTRL, USBHS/USBHSCORE/VREGUSB/CLOCK,
-  OSCILLATORS and ICACHE. Polled architecture unchanged, no executor.
+- All hand-rolled register maps replaced by embassy-nrf 0.11's nrf-pac
+  re-export (typed registers) for TWIM22, PDM20, SPIM00/SPIM22,
+  GPIO/GPIOHSPADCTRL, USBHS/USBHSCORE/VREGUSB/CLOCK, OSCILLATORS and
+  ICACHE. Polled architecture unchanged, no executor. The HAL's Twim was
+  tried for the OLED and dropped: its GPIO port lookup is undefined
+  behavior for port-3 pins on this chip (skill
+  embassy-nrf-port3-unreachable).
 - main(): embassy_nrf::init() (CK128, FLPR left alone) replaces the raw
   PLL/ICACHE/DEMCR pokes; hand-built vector table kept (PAC has no
-  AXONS), PAC `rt` off, SERIAL22 routed to the HAL's TWIM handler.
+  AXONS), PAC `rt` off.
+- Per-run NPU log lines behind the `npu-log` feature (off by default).
 - AXONS ENABLE is the one hand-built register (not in the SVD); the SD
   erratum [8] register (0xC84) the one raw offset.
-- Six feature builds pass; mock-usb release build verified on the rig
-  (see NOTES.md "embassy-nrf HAL / PAC migration").
+- Seven feature builds pass; mock-usb release build verified on the rig
+  (transcript identical, 45.17 s), USB stick and OLED verified on the
+  default build (see NOTES.md "embassy-nrf HAL / PAC migration").
