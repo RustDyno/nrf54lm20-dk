@@ -10,34 +10,43 @@
 //! TWIM22 is the serial instance the SD vacated (the 16 MHz serial boxes
 //! reach ports P1/P3 only; same register map as SPIM22 at the same base).
 //!
-//! Registers go through the PAC (`embassy_nrf::pac`), not the HAL's TWIM
-//! driver: the HAL's GPIO port lookup covers ports 0-2 only and is
-//! undefined behavior for a port-3 pin on this chip (hardware-observed:
-//! the driver constructor never returned to its caller), and the polled
-//! transaction below keeps its bounded waits. The nRF54 TWIM has no
-//! STARTTX task -- a write is TASKS_DMA.TX.START, then software stops it
-//! on the LASTTX event (the datasheet's recommended non-shortcut pattern;
-//! the event fires when the last byte STARTS, and a poll loop reacts well
-//! within one 22.5 us byte time at 400 kHz).
+//! The bus is the HAL's TWIM driver (`embassy_nrf::twim`) in blocking mode:
+//! one write transaction per call, STOP shortcut on the LASTTX event, an
+//! address or data NACK reported as an error (the HAL needs the port-3
+//! GPIO fix carried in vendor/embassy-nrf for these pins). The driver is
+//! built when the standalone app probes the panel, so the mailbox executor
+//! never touches the bus, and it stays alive for the rest of the run even
+//! when nothing answers: erratum [105] wedges the peripheral if it is
+//! disabled while a target stretches the clock. Its blocking wait has no
+//! timeout: a target that holds SCL forever holds the transcriber.
 //!
 //! Console model: 21 columns x 8 rows of 5x7 glyphs in 6x8 cells,
 //! append-with-wrap, scroll-up when full, full redraw per print call
 //! (~1 KB over the bus, ~27 ms at 400 kHz -- nothing at token cadence).
 
-use embassy_nrf::pac;
-use pac::gpio::vals::{Dir, Drive, Input, Pull};
-use pac::shared::vals::Connect;
-use pac::twim::vals::{Enable, Frequency};
+#[cfg(not(feature = "sd-spim22"))]
+use embassy_nrf::bind_interrupts;
+#[cfg(not(feature = "sd-spim22"))]
+use embassy_nrf::peripherals::SERIAL22;
+#[cfg(not(feature = "sd-spim22"))]
+use embassy_nrf::twim::{self, Twim};
 
-const TWIM: pac::twim::Twim = pac::TWIM22;
-const PORT3: pac::gpio::Gpio = pac::P3_S; // port 3 has no unsuffixed alias
-
-const PIN_SCL: usize = 3;
-const PIN_SDA: usize = 2;
-const PORT: u8 = 3;
+// The handler never runs in blocking use (no INTEN bit is ever set), but
+// `Twim::new` unmasks the NVIC line, so main.rs routes SERIAL22 here.
+#[cfg(not(feature = "sd-spim22"))]
+bind_interrupts!(struct Irqs {
+    SERIAL22 => twim::InterruptHandler<SERIAL22>;
+});
 
 pub const COLS: usize = 21;
 pub const ROWS: usize = 8;
+
+#[cfg(not(feature = "sd-spim22"))]
+static mut TWIM: Option<Twim<'static>> = None;
+/// Every write here comes from a RAM buffer, so the driver's flash-copy
+/// staging buffer can be empty.
+#[cfg(not(feature = "sd-spim22"))]
+static mut NO_RAM_STAGING: [u8; 0] = [];
 
 static mut PRESENT: bool = false;
 static mut ADDR7: u8 = 0x3C;
@@ -45,55 +54,29 @@ static mut GRID: [u8; COLS * ROWS] = [b' '; COLS * ROWS];
 static mut CUR_ROW: usize = 0;
 static mut CUR_COL: usize = 0;
 
-fn psel(pin: usize) -> pac::shared::regs::Psel {
-    let mut v = pac::shared::regs::Psel(0);
-    v.set_pin(pin as u8);
-    v.set_port(PORT);
-    v.set_connect(Connect::Connected);
-    v
-}
-
-/// One I2C write transaction. Returns false on NACK/timeout (and disarms
-/// the display on timeout so a flaky wire cannot wedge the transcriber).
+/// One I2C write transaction. Returns false when the target NACKs the
+/// address or a byte (or when no driver was ever built).
 fn twi_write(addr: u8, buf: &[u8]) -> bool {
-    TWIM.address().write(|w| w.set_address(addr));
-    TWIM.events_stopped().write_value(0);
-    TWIM.events_error().write_value(0);
-    TWIM.events_lasttx().write_value(0);
-    TWIM.dma().tx().ptr().write_value(buf.as_ptr() as u32);
-    TWIM.dma().tx().maxcnt().write(|w| w.set_maxcnt(buf.len() as u16));
-    TWIM.tasks_dma().tx().start().write_value(1);
-    // Generous vs the longest frame (129 B at 400 kHz = 3.3 ms), tiny
-    // vs the boot budget when the bus is stuck.
-    let mut ok = false;
-    for _ in 0..1_000_000u32 {
-        if TWIM.events_error().read() != 0 {
-            break;
-        }
-        if TWIM.events_lasttx().read() != 0 {
-            ok = true;
-            break;
+    #[cfg(not(feature = "sd-spim22"))]
+    {
+        match unsafe { &mut *core::ptr::addr_of_mut!(TWIM) } {
+            Some(t) => match t.blocking_write(addr, buf) {
+                Ok(()) => true,
+                Err(twim::Error::AddressNack) => false,
+                Err(e) => {
+                    // Anything but the "no panel" answer is worth a line.
+                    rtt_target::rprintln!("display: twim write to {:#04x} failed: {:?}", addr, e);
+                    false
+                }
+            },
+            None => false,
         }
     }
-    TWIM.tasks_stop().write_value(1);
-    let mut stopped = false;
-    for _ in 0..1_000_000u32 {
-        if TWIM.events_stopped().read() != 0 {
-            stopped = true;
-            break;
-        }
+    #[cfg(feature = "sd-spim22")]
+    {
+        let _ = (addr, buf);
+        false
     }
-    if TWIM.events_error().read() != 0 {
-        ok = false;
-    }
-    let src = TWIM.errorsrc().read();
-    if src.0 != 0 {
-        TWIM.errorsrc().write_value(src); // write-1-to-clear
-    }
-    if !stopped {
-        unsafe { PRESENT = false }; // bus wedged: give up on the display
-    }
-    ok && stopped
 }
 
 fn cmd(bytes: &[u8]) -> bool {
@@ -102,27 +85,38 @@ fn cmd(bytes: &[u8]) -> bool {
     twi_write(unsafe { ADDR7 }, &buf[..1 + bytes.len()])
 }
 
+/// Build the TWIM driver on the board's OLED singletons: 400 kHz, internal
+/// pull-ups on both lines, standard drive with open-drain '1'.
+#[cfg(not(feature = "sd-spim22"))]
+fn open_bus() -> bool {
+    unsafe {
+        if (*core::ptr::addr_of!(TWIM)).is_some() {
+            return true;
+        }
+    }
+    let Some(oled) = crate::board::get().oled.take() else {
+        return false;
+    };
+    let mut config = twim::Config::default();
+    config.frequency = twim::Frequency::K400;
+    config.sda_pullup = true;
+    config.scl_pullup = true;
+    let staging = unsafe { &mut *core::ptr::addr_of_mut!(NO_RAM_STAGING) };
+    let twim = Twim::new(oled.twim, Irqs, oled.sda, oled.scl, config, staging);
+    unsafe { TWIM = Some(twim) };
+    true
+}
+
 /// Probe for the display and bring it up. Safe to call when absent.
 pub fn init() -> bool {
     // The sd-spim22 diagnostic build owns this serial box and these pins.
     if cfg!(feature = "sd-spim22") {
         return false;
     }
-    // Input buffer connected, pull-up, DRIVE0=S DRIVE1=D (open drain '1').
-    for pin in [PIN_SCL, PIN_SDA] {
-        PORT3.pin_cnf(pin).write(|w| {
-            w.set_dir(Dir::Input);
-            w.set_input(Input::Connect);
-            w.set_pull(Pull::Pullup);
-            w.set_drive0(Drive::S);
-            w.set_drive1(Drive::D);
-        });
+    #[cfg(not(feature = "sd-spim22"))]
+    if !open_bus() {
+        return false;
     }
-    TWIM.enable().write(|w| w.set_enable(Enable::Disabled));
-    TWIM.psel().scl().write_value(psel(PIN_SCL));
-    TWIM.psel().sda().write_value(psel(PIN_SDA));
-    TWIM.frequency().write(|w| w.set_frequency(Frequency::K400));
-    TWIM.enable().write(|w| w.set_enable(Enable::Enabled));
     unsafe {
         PRESENT = true; // provisionally, for the probe writes
 
@@ -131,8 +125,7 @@ pub fn init() -> bool {
         if !cmd(&[0xAE]) {
             ADDR7 = 0x3D;
             if !cmd(&[0xAE]) {
-                // Leave TWIM enabled: erratum [105] wedges the peripheral
-                // if it is disabled while a target stretches the clock.
+                // The driver stays built and enabled (erratum [105]).
                 PRESENT = false;
                 return false;
             }

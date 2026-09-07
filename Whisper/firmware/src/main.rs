@@ -31,15 +31,15 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 mod app;
 mod bindings;
+mod board;
 mod display;
 mod dsp;
+mod hal;
 mod kernels;
 mod libm_shims;
 mod mel;
 #[cfg(feature = "mock-usb")]
 mod mockblk;
-#[allow(dead_code)]
-mod pdm;
 mod platform;
 mod q4;
 #[cfg_attr(not(feature = "sd-card"), allow(dead_code))]
@@ -88,7 +88,7 @@ pub static mut ARENA: [u8; ARENA_BYTES] = [0; ARENA_BYTES];
 // and vectors IRQ 86 to a null slot. The PAC's `rt` feature therefore
 // stays off, and this table is the only one in the image.
 
-const AXONS_IRQN: usize = 86;
+const AXONS_IRQN: usize = hal::axons::IRQ as usize;
 // Cover every IRQ slot the LM20 has (VREGUSB, the highest, is 289): a
 // stray unmasked interrupt then lands in default_irq_handler's bkpt loop
 // instead of executing whatever .text follows the table.
@@ -105,14 +105,22 @@ unsafe extern "C" fn axons_irq_handler() {
 }
 
 // A HAL driver binds its interrupt handler as an exported symbol named
-// after the IRQ (`bind_interrupts!`); its constructor unmasks the NVIC
-// line, so such a handler must be routed here (declare it in an
-// `extern "C"` block and store it at `pac::Interrupt::NAME as usize`)
-// rather than left to the bkpt loop. No driver currently needs one.
+// after the IRQ (`bind_interrupts!`), and its constructor unmasks the
+// NVIC line, so the handler is routed here rather than left to the bkpt
+// loop. display.rs binds TWIM22's SERIAL22; in blocking use it never
+// fires (no INTEN bit is ever set).
+#[cfg(not(feature = "sd-spim22"))]
+extern "C" {
+    fn SERIAL22();
+}
 
 const fn vector_table() -> [unsafe extern "C" fn(); VECTOR_SLOTS] {
     let mut t = [default_irq_handler as unsafe extern "C" fn(); VECTOR_SLOTS];
     t[AXONS_IRQN] = axons_irq_handler;
+    #[cfg(not(feature = "sd-spim22"))]
+    {
+        t[pac::Interrupt::SERIAL22 as usize] = SERIAL22;
+    }
     t
 }
 
@@ -544,10 +552,6 @@ unsafe fn dispatch(cmd: u32, a: &[u32; 8]) -> i32 {
     }
 }
 
-// PDM mic (same pins the KWS project validated on this DK).
-pub(crate) const MIC_CLK: pdm::Pin = pdm::Pin { port: 1, pin: 23 };
-pub(crate) const MIC_DIN: pdm::Pin = pdm::Pin { port: 1, pin: 24 };
-
 // One PDM hop = 20 ms; ping-pong pair for the record command.
 #[repr(C, align(4))]
 pub(crate) struct PdmBuf(pub [i16; 320]);
@@ -558,11 +562,20 @@ pub(crate) static mut PDM_BUF1: PdmBuf = PdmBuf([0; 320]);
 unsafe fn record(dst: *mut i16, n: usize) -> i32 {
     let b0 = &mut (*core::ptr::addr_of_mut!(PDM_BUF0)).0;
     let b1 = &mut (*core::ptr::addr_of_mut!(PDM_BUF1)).0;
-    let mut stream = pdm::Pdm::init(MIC_CLK, MIC_DIN).start(b0, b1);
+    let mic = &mut board::get().mic;
+    let mut pdm = hal::pdm::Pdm::new_blocking(
+        mic.pdm.reborrow(),
+        mic.clk.reborrow(),
+        mic.din.reborrow(),
+        board::mic_config(),
+    );
+    let Ok(mut stream) = pdm.blocking_stream(b0, b1) else {
+        return -1;
+    };
     // Drop the first hop: the very first session after flashing counts one
     // startup overrun (KWS finding) and the mic's DC settle lands there too.
     stream.next_buffer();
-    stream.overruns = 0;
+    stream.clear_overruns();
     let mut written = 0usize;
     while written < n {
         let hop = stream.next_buffer();
@@ -570,8 +583,8 @@ unsafe fn record(dst: *mut i16, n: usize) -> i32 {
         core::ptr::copy_nonoverlapping(hop.as_ptr(), dst.add(written), take);
         written += take;
     }
-    let overruns = stream.overruns;
-    stream.stop();
+    let overruns = stream.overruns();
+    drop(stream); // stops sampling
     overruns as i32
 }
 
@@ -589,11 +602,7 @@ fn main() -> ! {
     let mut config = embassy_nrf::config::Config::default();
     config.clock_speed = embassy_nrf::config::ClockSpeed::CK128;
     config.flpr_reset = embassy_nrf::config::FlprReset::Leave;
-    // The peripheral singletons are not handed out: every driver here is
-    // polled on the PAC's registers (the HAL's port lookup has no port 3,
-    // where the display lives, and its other drivers do not fit; see the
-    // module docs).
-    let _peripherals = embassy_nrf::init(config);
+    let p = embassy_nrf::init(config);
     // The switch takes a moment: wait for it before enabling anything
     // clocked from it.
     for _ in 0..1_000_000 {
@@ -612,6 +621,10 @@ fn main() -> ! {
     cortex_m::asm::delay(64);
     pac::ICACHE.enable().write(|w| w.set_enable(true));
     cortex_m::asm::isb();
+
+    // The peripheral singletons: every driver is built from them, where
+    // it is needed.
+    board::init(p);
 
     let mut cp = cortex_m::Peripherals::take();
     unsafe {

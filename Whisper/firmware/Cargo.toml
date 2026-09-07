@@ -20,6 +20,15 @@ libm = "0.2"
 # stays a polled step machine on the PAC registers (the HAL drivers do not
 # fit its drivers; see the module docs).
 embassy-nrf = { version = "0.11", default-features = false, features = ["nrf54lm20-app-s", "unstable-pac"] }
+# Half-dB fixed point for the PDM gain, the type embassy-nrf's PDM API uses.
+fixed = "1.10"
+
+# embassy-nrf 0.11.0 with one fix on top, kept in-tree until it is upstream:
+# GPIO port 3 and the PDM20/PDM21 singletons (patches/embassy-nrf-0.11.0-nrf54lm20.patch). The HAL's port
+# lookup covered ports 0-2 only, so any P3 pin handed to a HAL driver was
+# undefined behavior on this chip.
+[patch.crates-io]
+embassy-nrf = { path = "vendor/embassy-nrf" }
 
 [build-dependencies]
 cc = "1"

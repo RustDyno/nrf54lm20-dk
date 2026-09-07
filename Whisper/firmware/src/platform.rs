@@ -10,22 +10,14 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use embassy_nrf::pac::common::{Reg, RW};
-
 use crate::bindings;
+use crate::hal::axons::{self, AXONS};
 
-/// Base address of the AXONS peripheral (secure alias).
-///
-/// From the nRF54LM20B MDK: `NRF_AXONS_S_BASE = 0x50056000`
-/// (non-secure alias `NRF_AXONS_NS_BASE = 0x40056000`). The CPU boots secure
-/// without TrustZone/SPU setup, so use the secure alias.
-pub const AXON_BASE_ADDR: usize = 0x5005_6000;
-
-/// AXONS interrupt line (`AXONS_IRQn`). Model inference blocks in EVENT mode
-/// (the driver hardcodes it), so the completion IRQ must be unmasked in the
-/// NVIC -- that is the platform's job (Zephyr does IRQ_CONNECT + irq_enable);
-/// the driver blob only enables the peripheral-side interrupt.
-pub const AXONS_IRQN: u16 = 86;
+/// AXONS interrupt line. Model inference blocks in EVENT mode (the driver
+/// hardcodes it), so the completion IRQ must be unmasked in the NVIC --
+/// that is the platform's job (Zephyr does IRQ_CONNECT + irq_enable); the
+/// driver blob only enables the peripheral-side interrupt.
+pub const AXONS_IRQN: u16 = axons::IRQ;
 
 #[derive(Clone, Copy)]
 struct AxonsIrq;
@@ -35,16 +27,6 @@ unsafe impl cortex_m::interrupt::InterruptNumber for AxonsIrq {
         AXONS_IRQN
     }
 }
-
-/// ENABLE register offset within the AXONS block (MDK: ENABLE @ 0x400, EN = bit 0).
-const AXON_ENABLE_OFFSET: usize = 0x400;
-const AXON_ENABLE_EN_BIT: u32 = 1; // AXONS_ENABLE_EN_Msk
-
-/// The AXONS block is absent from the public SVD, so the PAC has no
-/// peripheral for it: this is the one register handle built by hand, on the
-/// PAC's own register type so it reads and writes like every other one.
-const AXON_ENABLE: Reg<u32, RW> =
-    unsafe { Reg::from_ptr((AXON_BASE_ADDR + AXON_ENABLE_OFFSET) as *mut u32) };
 
 static USER_EVENT: AtomicBool = AtomicBool::new(false);
 
@@ -67,7 +49,7 @@ pub fn hold_axon() {
 
 fn power_vote_on() {
     if POWER_VOTES.fetch_add(1, Ordering::SeqCst) == 0 {
-        AXON_ENABLE.write_value(AXON_ENABLE_EN_BIT);
+        AXONS.enable().write(|w| w.set_en(true));
         unsafe {
             bindings::nrf_axon_driver_power_on();
             // Clear any interrupt that went pending while the block was
@@ -86,7 +68,7 @@ fn power_vote_off() {
         unsafe {
             bindings::nrf_axon_driver_power_off();
         }
-        AXON_ENABLE.write_value(0);
+        AXONS.enable().write(|w| w.set_en(false));
         cortex_m::peripheral::NVIC::unpend(AxonsIrq);
     }
 }
@@ -109,11 +91,11 @@ pub fn init() -> i32 {
         // state (the sibling projects use 64 cycles): host-driven development
         // kills sessions mid-inference far more often, and the longer dwell
         // is cheap insurance.
-        AXON_ENABLE.write_value(0);
+        AXONS.enable().write(|w| w.set_en(false));
         cortex_m::asm::delay(128_000);
-        AXON_ENABLE.write_value(AXON_ENABLE_EN_BIT);
+        AXONS.enable().write(|w| w.set_en(true));
 
-        let r = bindings::nrf_axon_driver_init(AXON_BASE_ADDR as *mut c_void);
+        let r = bindings::nrf_axon_driver_init(AXONS.as_ptr() as *mut c_void);
         if r.0 != 0 {
             return r.0;
         }
@@ -127,7 +109,7 @@ pub fn init() -> i32 {
         USER_EVENT.store(false, Ordering::SeqCst);
 
         // Like Zephyr: leave the block off until the first reservation.
-        AXON_ENABLE.write_value(0);
+        AXONS.enable().write(|w| w.set_en(false));
     }
     0
 }

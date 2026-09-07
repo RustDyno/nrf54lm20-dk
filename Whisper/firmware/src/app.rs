@@ -16,7 +16,7 @@
 use crate::kernels::{self, Quant};
 #[cfg(feature = "sd-card")]
 use crate::sd;
-use crate::{display, mel, pdm, slot, storage};
+use crate::{display, hal, mel, slot, storage};
 use rtt_target::rprintln;
 
 use crate::dsp;
@@ -1237,10 +1237,16 @@ fn record_mel(c: &Ctxt) -> Result<u32, i32> {
 
     let b0 = as_i16_mut(R_PDM0, CHUNK);
     let b1 = as_i16_mut(R_PDM1, CHUNK);
-    let mut stream =
-        unsafe { pdm::Pdm::init(crate::MIC_CLK, crate::MIC_DIN).start(b0, b1) };
+    let mic = &mut crate::board::get().mic;
+    let mut pdm = hal::pdm::Pdm::new_blocking(
+        mic.pdm.reborrow(),
+        mic.clk.reborrow(),
+        mic.din.reborrow(),
+        crate::board::mic_config(),
+    );
+    let mut stream = pdm.blocking_stream(b0, b1).map_err(|_| -1)?;
     stream.next_buffer(); // warmup chunk (startup overrun + mic DC settle)
-    stream.overruns = 0;
+    stream.clear_overruns();
 
     let mut have = 0usize; // valid samples in the sliding window
     let mut n_chunks = N_CHUNKS;
@@ -1272,8 +1278,8 @@ fn record_mel(c: &Ctxt) -> Result<u32, i32> {
         win[1280..1280 + CHUNK].copy_from_slice(hop);
         have = 1280 + CHUNK;
     }
-    let ov = stream.overruns;
-    stream.stop();
+    let ov = stream.overruns();
+    drop(stream); // stops sampling
     capture_done(true);
     if n_chunks == N_CHUNKS {
         // final chunk (48 frames) needs no further input from the mic: the
@@ -1353,10 +1359,16 @@ fn record(c: &Ctxt) -> Result<(), i32> {
     let ring = arena(0, 16 * HOP * 2);
     let b0 = unsafe { &mut (*core::ptr::addr_of_mut!(crate::PDM_BUF0)).0 };
     let b1 = unsafe { &mut (*core::ptr::addr_of_mut!(crate::PDM_BUF1)).0 };
-    let mut stream =
-        unsafe { pdm::Pdm::init(crate::MIC_CLK, crate::MIC_DIN).start(b0, b1) };
+    let mic = &mut crate::board::get().mic;
+    let mut pdm = hal::pdm::Pdm::new_blocking(
+        mic.pdm.reborrow(),
+        mic.clk.reborrow(),
+        mic.din.reborrow(),
+        crate::board::mic_config(),
+    );
+    let mut stream = pdm.blocking_stream(b0, b1).map_err(|_| -1)?;
     stream.next_buffer(); // warmup hop
-    stream.overruns = 0;
+    stream.clear_overruns();
     let total = N_SAMPLES * 2;
     let mut filled = 0usize;
     let mut written = 0usize;
@@ -1372,8 +1384,8 @@ fn record(c: &Ctxt) -> Result<(), i32> {
             filled = 0;
         }
     }
-    let ov = stream.overruns;
-    stream.stop();
+    let ov = stream.overruns();
+    drop(stream); // stops sampling
     capture_done(true);
     if ov > 0 {
         rprintln!("warning: {} recording overruns", ov);

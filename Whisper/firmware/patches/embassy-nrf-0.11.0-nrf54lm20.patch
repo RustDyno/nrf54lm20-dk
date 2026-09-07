@@ -1,0 +1,81 @@
+diff -ruN '--exclude=Cargo.toml.orig' '--exclude=.cargo_vcs_info.json' '--exclude=Cargo.lock' ./Cargo.toml /home/tmpk/nrf54LM20-DK/Whisper/firmware/vendor/embassy-nrf/Cargo.toml
+--- a/embassy-nrf/Cargo.toml	2006-07-23 18:21:28.000000000 -0700
++++ b/embassy-nrf/Cargo.toml	2026-09-06 23:33:32.341447285 -0700
+@@ -455,6 +455,7 @@
+ _dppi = []
+ _gpio-p1 = []
+ _gpio-p2 = []
++_gpio-p3 = []
+ _grtc = []
+ _multi_wdt = []
+ _net-driver = ["dep:embassy-net-driver-channel"]
+@@ -512,6 +513,7 @@
+     "_nrf54l",
+     "_gpio-p1",
+     "_gpio-p2",
++    "_gpio-p3",
+     "dep:embassy-usb-synopsys-otg",
+ ]
+ _nrf54lm20-app = [
+diff -ruN '--exclude=Cargo.toml.orig' '--exclude=.cargo_vcs_info.json' '--exclude=Cargo.lock' ./src/chips/nrf54lm20_app.rs /home/tmpk/nrf54LM20-DK/Whisper/firmware/vendor/embassy-nrf/src/chips/nrf54lm20_app.rs
+--- a/embassy-nrf/src/chips/nrf54lm20_app.rs	2006-07-23 18:21:28.000000000 -0700
++++ b/embassy-nrf/src/chips/nrf54lm20_app.rs	2026-09-06 23:38:56.338589666 -0700
+@@ -19,6 +19,7 @@
+         UARTE00_NS as UARTE00,
+         VPR00_NS as VPR00,
+         P2_NS as P2,
++        P3_NS as P3,
+         CTRLAP_NS as CTRLAP,
+         TAD_NS as TAD,
+         TIMER00_NS as TIMER00,
+@@ -120,6 +121,7 @@
+         RRAMC_S as RRAMC,
+         VPR00_S as VPR00,
+         P2_S as P2,
++        P3_S as P3,
+         CTRLAP_S as CTRLAP,
+         TAD_S as TAD,
+         TIMER00_S as TIMER00,
+@@ -211,6 +213,10 @@
+     // USB
+     USBHS,
+ 
++    // PDM
++    PDM20,
++    PDM21,
++
+     // PPI
+     PPI00_CH0,
+     PPI00_CH1,
+diff -ruN '--exclude=Cargo.toml.orig' '--exclude=.cargo_vcs_info.json' '--exclude=Cargo.lock' ./src/gpio.rs /home/tmpk/nrf54LM20-DK/Whisper/firmware/vendor/embassy-nrf/src/gpio.rs
+--- a/embassy-nrf/src/gpio.rs	2006-07-23 18:21:28.000000000 -0700
++++ b/embassy-nrf/src/gpio.rs	2026-09-06 23:33:32.341557517 -0700
+@@ -27,6 +27,10 @@
+     /// Port 2, only available on some MCUs.
+     #[cfg(feature = "_gpio-p2")]
+     Port2,
++
++    /// Port 3, only available on some MCUs.
++    #[cfg(feature = "_gpio-p3")]
++    Port3,
+ }
+ 
+ /// Pull setting for an input.
+@@ -505,6 +509,8 @@
+             1 => pac::P1,
+             #[cfg(feature = "_gpio-p2")]
+             2 => pac::P2,
++            #[cfg(feature = "_gpio-p3")]
++            3 => pac::P3,
+             _ => unsafe { unreachable_unchecked() },
+         }
+     }
+@@ -545,6 +551,8 @@
+             1 => Port::Port1,
+             #[cfg(feature = "_gpio-p2")]
+             2 => Port::Port2,
++            #[cfg(feature = "_gpio-p3")]
++            3 => Port::Port3,
+             _ => unsafe { unreachable_unchecked() },
+         }
+     }
