@@ -417,6 +417,17 @@ fn async_start(lba: u32, buf: u32, count: u32, read: bool) -> i32 {
     0
 }
 
+/// Bytes of the pending read known to be in memory (usbdev::recv_landed);
+/// meaningful while xfer_poll() is false.
+pub fn xfer_landed() -> usize {
+    let a = unsafe { &*addr_of!(ASYNC) };
+    match &a.stage {
+        Stage::Data(x) if a.read => usbdev::recv_landed(x),
+        Stage::Idle => 0,
+        _ => a.count as usize * BLOCK,
+    }
+}
+
 /// True when the transfer has run to completion (rc ready for xfer_finish()).
 pub fn xfer_poll() -> bool {
     let read = unsafe { (*addr_of!(ASYNC)).read };

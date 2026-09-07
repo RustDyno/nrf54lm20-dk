@@ -290,8 +290,11 @@ struct Stats {
 /// a reflash or a board reset), so the caller can wait for the device to
 /// come back instead of making the operator restart the daemon on every
 /// firmware iteration.
-fn serve(port: &Path, work: &Path, total_blocks: u64) -> Result<()> {
+fn serve(port: &Path, work: &Path, total_blocks: u64, throttle_mbs: f64) -> Result<()> {
     let mut link = tty::Tty::open(port)?;
+    if throttle_mbs > 0.0 {
+        println!("mockusb: read payloads paced at {throttle_mbs} MB/s");
+    }
     let mut img = OpenOptions::new().read(true).write(true).open(work)?;
     println!("mockusb: serving {} on {}", work.display(), port.display());
 
@@ -352,7 +355,22 @@ fn serve(port: &Path, work: &Path, total_blocks: u64) -> Result<()> {
                 put32(&mut rsp, 8, count as u32);
                 put32(&mut rsp, 12, sum32(&payload));
                 link.write_all(&rsp)?;
-                link.write_all(&payload)?;
+                if throttle_mbs > 0.0 {
+                    // pace the payload like a slower stick's data phase, in
+                    // 8 KB pieces against absolute deadlines
+                    let t0 = Instant::now();
+                    let per_byte = 1.0 / (throttle_mbs * 1e6);
+                    for (i, piece) in payload.chunks(8192).enumerate() {
+                        let due = t0 + std::time::Duration::from_secs_f64(i as f64 * 8192.0 * per_byte);
+                        let now = Instant::now();
+                        if due > now {
+                            std::thread::sleep(due - now);
+                        }
+                        link.write_all(piece)?;
+                    }
+                } else {
+                    link.write_all(&payload)?;
+                }
                 st.rd += bytes as u64;
             }
             OP_WRITE => {
@@ -404,6 +422,7 @@ fn usage() -> ! {
         "usage: mockusb serve [options]\n\
          \n\
            --img <path>     pristine model image   (default ../../model/out/sd.img)\n\
+           --throttle <MB/s> pace read payloads (emulate a slower stick)\n\
            --work <path>    writable copy served   (default ../../model/out/mock-work.img)\n\
            --audio <path>   inject a wav/raw clip as the recording, skipping the mic\n\
            --no-audio       clear a previous injection (device records from the mic)\n\
@@ -433,6 +452,7 @@ fn main() -> Result<()> {
     let mut port: Option<PathBuf> = None;
     let mut fresh = false;
     let mut prep_only = false;
+    let mut throttle = 0.0f64;
 
     let mut i = 1;
     while i < args.len() {
@@ -467,6 +487,10 @@ fn main() -> Result<()> {
                 fresh = true;
                 i += 1;
             }
+            "--throttle" => {
+                throttle = need(i).parse::<f64>().context("--throttle wants MB/s")?;
+                i += 2;
+            }
             "--prep-only" => {
                 prep_only = true;
                 i += 1;
@@ -494,7 +518,7 @@ fn main() -> Result<()> {
             Some(p) => (p.clone(), 0),
             None => wait_for_port(600, stale)?,
         };
-        match serve(&p, &work, total) {
+        match serve(&p, &work, total, throttle) {
             Ok(()) => {}
             Err(e) => println!("mockusb: link down ({e}); waiting for the device again"),
         }

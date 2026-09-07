@@ -675,3 +675,67 @@ and PV matmuls as NPU blobs with the keys/values as runtime-patched
 weights, several seconds but the int8 requantized scores need a gate);
 the encoder's residual/layernorm passes (IO-bound on the stick, ~1.5 s
 of CPU that a tile pipeline could hide).
+
+## 15. 2026-09-05/06: speed pass 8, 4-bit decoder blobs landed and expanded behind the NPU
+
+Mock rig, JFK clip, ctx 582, 25 decoder passes, same-session baseline of
+the pass-7 firmware. Every row: transcript identical, all 24 token ids
+identical, mel / residual / encoder output / cross K/V bit-identical
+(mock_diff.py 0 of 5480 blocks). The decode is a numeric change (4-bit
+decoder weights), gated on eight clips (7 of 8 transcripts identical to
+the int8 decoder, the eighth a degenerate repetition that ends earlier;
+NOTES.md). Wall times from the sd[phase] timestamps, "total" the
+firmware's processing time from the end of the clip.
+
+| change (cumulative) | encoder | cross | decode | /step | total |
+|---|---|---|---|---|---|
+| baseline (pass 7) | 28.1 s | 2.4 s | 17.0 s | 0.683 s | 47.7 s |
+| 1. LAY5 blobs (56 x 87.9 KB vs 152.4 KB), next blob's read landed during the NPU run, expanded after it completes | 28.1 | 2.3 | 15.3 | 0.610 | 45.9 |
+| 2. expansion and byte sum chasing the landing DMA (storage::landed) | 28.1 | 2.3 | 15.0 | 0.600 | 45.5 |
+
+Decode reads 371 -> 283 MB per utterance (the blob stream 8.53 -> 4.92
+MB per token); storage stall 10.0 -> 4.6 s. Decode CPU (cpu[decode]):
+attention 0.98 s, LM head 2.02, expansion 3.62 (new), sums 0.99 -> 0.60,
+NPU 2.33. Per step: expansion 0.145 + NPU 0.093 + LM head 0.081 +
+attention 0.039 + sums 0.024 + stall 0.186 + misc 0.03.
+
+Why row 2 is small on the rig: the daemon's payload arrives at USB high
+speed, so 75 of a blob's 86 KB have landed when the NPU run ends (the
+"chase:" line of the cpu[] stats); 43 of 72 KB of nibbles still get
+expanded before the transfer completes, but the transfer's tail is short
+and most of the 2.6 ms of expansion stays on the critical path. The
+stall that remains is the mock protocol's synchronous request and
+response per read (~1.5 ms x 56 per token) and the LM head's read-bound
+chunks.
+
+Paced like a stick (mockusb --throttle 28, read payloads at 28 MB/s,
+same session):
+
+| firmware, image | encoder | cross | decode | /step | total |
+|---|---|---|---|---|---|
+| pass 7, int8 image | 28.6 s | 2.4 s | 21.5 s | 0.858 s | 52.6 s |
+| pass 8, LAY5 image | 28.7 s | 2.3 s | 16.8 s | 0.671 s | 47.8 s |
+
+Decode reads 371 -> 283 MB, stall 14.5 -> 6.3 s, token ids identical:
+4.8 s per utterance where the unpaced rig shows 2.2. That is the number
+to expect on the stick, give or take its command latency.
+
+Under pacing the chase line reads 55 KB landed at the first poll, 34 of
+72 KB of nibbles expanded before completion, 3.0 polls per blob: half of
+the expansion is inside the transfer. The pacing does not model the
+stick's ~2.7 ms command latency, which the NPU run also hides.
+
+What the rig cannot show even paced: the stick's ~2.7 ms of command
+latency per read (the NPU run hides part of it) and its slower writes.
+The stick itself is unmeasured since pass 5 (image re-dd needed: LAY5
+entries, blobs linked at the decode base, embc8, dc entries).
+
+Remaining levers, in order: the expander at ~2.3 cycles per weight (an
+asm version with the four table loads back to back, ~1.8 ms per blob:
+~1 s on the rig, nothing on the stick where it is DMA-bound); the mock
+protocol's synchronous response (payload first, response after, one DMA:
+~2 s on the rig only, but a truer stand-in for the stick, whose command
+latency the data phase already overlaps); the LM head's 4.7 MB per token
+(a nibble dot kernel over 4-bit rows, ~1 s, numeric, lm16_check gate);
+the encoder items of section 14 (attention kernels, residual/layernorm
+passes) unchanged.

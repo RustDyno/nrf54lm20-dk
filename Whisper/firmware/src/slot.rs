@@ -30,12 +30,33 @@ pub static mut VALIDATE_CYCLES: u64 = 0;
 /// absolute arena addresses (0 = the model's own interlayer locations, per
 /// the driver's NULL contract).
 pub unsafe fn run(input: u32, output: u32, name: &str) -> i32 {
-    let hdr = &*(SLOT_BASE as *const SlotHeader);
+    run_at(SLOT_BASE, input, output, name)
+}
+
+/// The blob's declared interlayer use in bytes (from its descriptor), or
+/// None if no valid blob header sits at `base`. Decode parks tables in
+/// the interlayer above what its blobs touch and checks this.
+pub unsafe fn interlayer_needed(base: usize) -> Option<u32> {
+    let hdr = &*(base as *const SlotHeader);
+    if hdr.magic != SLOT_MAGIC {
+        return None;
+    }
+    let model = hdr.model as usize;
+    if model < base || model >= SLOT_BASE + SLOT_BYTES {
+        return None;
+    }
+    Some((*hdr.model).interlayer_buffer_needed)
+}
+
+/// Same for a blob linked and loaded at `base` inside the slot (the
+/// per-token decoder blobs live at the top of it, app.rs DEC_BASE).
+pub unsafe fn run_at(base: usize, input: u32, output: u32, name: &str) -> i32 {
+    let hdr = &*(base as *const SlotHeader);
     if hdr.magic != SLOT_MAGIC {
         return -101;
     }
     let model = hdr.model;
-    if (model as usize) < SLOT_BASE || (model as usize) >= SLOT_BASE + SLOT_BYTES {
+    if (model as usize) < base || (model as usize) >= SLOT_BASE + SLOT_BYTES {
         return -102;
     }
     let t0 = cortex_m::peripheral::DWT::cycle_count();

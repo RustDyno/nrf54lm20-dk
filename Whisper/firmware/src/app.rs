@@ -132,10 +132,6 @@ const SL_STAGE: usize = SL_V16 + 2 * kernels::KV16_LEN; // one head's tile block
 // blob is 166 KB), so it survives the block's blob loads and is rebuilt
 // per block for that block's score multiplier.
 const SL_EXPTAB: usize = SL_STAGE + N_TILES * HB;
-// Decode cross-attention: two alternating stages of one head's key
-// blocks (int8, consumed as is), in the room of the encoder's widened
-// keys and values.
-const SL_XK: usize = 0;
 const _: () = assert!(SL_EXPTAB % 4 == 0);
 const _: () = assert!(SL_EXPTAB + kernels::EXP_TABLE_BYTES <= slot::SLOT_BYTES);
 // Interlayer buffer during CPU attention: the two-query scratch, then
@@ -298,7 +294,7 @@ fn lookup_idx(name: &str) -> Option<(Entry, usize)> {
 /// so blob loads are verified against these and retried on mismatch.
 static mut SUMS: [u32; 256] = [0; 256];
 /// Packed entries whose expansion has been checked this boot (raw-sum
-/// carried in the LAY4 header; drift is a hard error, checked once).
+/// carried in the LAY5 header; drift is a hard error, checked once).
 static mut Q4_VERIFIED: [u32; 8] = [0; 8];
 
 fn load_sums() {
@@ -608,7 +604,7 @@ impl Ctxt {
         rc
     }
 
-    /// Blob into the slot (cached by address, sum-verified, LAY4 expanded).
+    /// Blob into the slot (cached by address, sum-verified).
     fn load(&mut self, blob: &str) -> i32 {
         let (e, idx) = match lookup_idx(blob) {
             Some(x) => x,
@@ -642,13 +638,6 @@ impl Ctxt {
             }
             if !ok {
                 return -905;
-            }
-            // "LAY4" packed entry: expand in place to the raw blob.
-            let magic = unsafe { core::ptr::read(slot::SLOT_BASE as *const u32) };
-            if magic == crate::q4::MAGIC {
-                if let Err(rc) = unpack_slot(e, idx) {
-                    return rc;
-                }
             }
             self.loaded = e;
         }
@@ -780,73 +769,6 @@ fn io_start(read: bool, lba: u32, buf: &[u8], what: &str) -> Result<(), i32> {
     if rc != 0 {
         rprintln!("FAIL {} rc={}", what, rc);
         return Err(rc);
-    }
-    Ok(())
-}
-
-/// Largest weight region a packable blob may carry, in 64-weight groups
-/// (bounds the amax staging copy; slot-sized blobs fit).
-const AMAX_MAX: usize = 3328;
-
-/// Expand a "LAY4" packed blob, just read (and sum-verified) at
-/// SLOT_BASE, into the raw blob it encodes -- in place in the slot.
-///
-/// The packed bytes are first moved to the slot tail; the head is copied
-/// back verbatim and the weights expand forward from w_off. The writer
-/// advances 2 bytes per nibble byte consumed, so it never catches the
-/// reader as long as the nibble stream starts >= n/2 bytes past the
-/// weight region start -- checked below, guaranteed by the image builder
-/// with ~56 KB of margin for the current blobs. The amax table is staged
-/// out first (in the idle interlayer, NOT the stack -- see attn_scratch)
-/// because the writer DOES cross it.
-fn unpack_slot(e: Entry, idx: usize) -> Result<(), i32> {
-    let blocks = e.len.div_ceil(storage::BLOCK as u32) as usize;
-    let tail = slot::SLOT_BYTES - blocks * storage::BLOCK;
-    unsafe {
-        core::ptr::copy(slot::SLOT_BASE as *const u8,
-                        (slot::SLOT_BASE + tail) as *mut u8, e.len as usize);
-        let p = (slot::SLOT_BASE + tail) as *const u8;
-        let word = |i: usize| -> usize {
-            u32::from_le_bytes(core::slice::from_raw_parts(p.add(i * 4), 4)
-                .try_into().unwrap()) as usize
-        };
-        let (raw_len, w_off, n) = (word(1), word(2), word(3));
-        let raw_sum = word(4) as u32;
-        let n_groups = n / crate::q4::G;
-        let nib_off = tail + crate::q4::HDR + w_off + n_groups;
-        if w_off + n != raw_len
-            || raw_len > slot::SLOT_BYTES
-            || n % (2 * crate::q4::G) != 0
-            || n_groups > AMAX_MAX
-            || crate::q4::HDR + w_off + n_groups + n / 2 != e.len as usize
-            || raw_len > nib_off + n / 2
-            || w_off > tail
-        {
-            rtt_target::rprintln!("blob unpack: bad LAY4 header");
-            return Err(-906);
-        }
-        let amax = interlayer(n_groups);
-        amax.copy_from_slice(
-            core::slice::from_raw_parts(p.add(crate::q4::HDR + w_off), n_groups));
-        core::ptr::copy_nonoverlapping(p.add(crate::q4::HDR),
-                                       slot::SLOT_BASE as *mut u8, w_off);
-        crate::q4::unpack_raw(amax,
-                              (slot::SLOT_BASE + nib_off) as *const u8,
-                              (slot::SLOT_BASE + w_off) as *mut i8, n);
-        // once per boot per entry: catch packer/unpacker drift exactly
-        let seen = (*core::ptr::addr_of!(Q4_VERIFIED))[idx >> 5]
-            & (1 << (idx & 31)) != 0;
-        if !seen {
-            let raw = core::slice::from_raw_parts(slot::SLOT_BASE as *const u8,
-                                                  raw_len);
-            let sum = dsp::byte_sum(raw);
-            if sum != raw_sum {
-                rtt_target::rprintln!(
-                    "blob unpack sum mismatch (got {:#x} want {:#x})", sum, raw_sum);
-                return Err(-907);
-            }
-            (*core::ptr::addr_of_mut!(Q4_VERIFIED))[idx >> 5] |= 1 << (idx & 31);
-        }
     }
     Ok(())
 }
@@ -1136,7 +1058,18 @@ fn fp(c: &Ctxt, region: u32, label: &str) {
 /// the session's first-utterance numbers implicate the card, not code.
 /// The ms figures are CPU time spent in storage calls: split-phase
 /// transfers only count the part that was not hidden behind compute.
+fn chase_stats() {
+    let st = unsafe { &mut *core::ptr::addr_of_mut!(CHASE_STATS) };
+    if st[0] > 0 {
+        rprintln!("chase: {} blobs, first poll {} KB landed, {} KB of {} KB nibbles expanded before completion, {}.{} polls per blob",
+                  st[0], st[1] / st[0] / 1024, st[2] / st[0] / 1024,
+                  C * C / 2 / 1024, st[3] / st[0], st[3] * 10 / st[0] % 10);
+    }
+    *st = [0; 4];
+}
+
 fn sd_stats(phase: &str) {
+    chase_stats();
     let (rb, rc, wb, wc) = storage::stats_take();
     rprintln!(
         "sd[{}]: rd {} KB / {} ms, wr {} KB / {} ms",
@@ -2096,28 +2029,394 @@ const D_V: usize = 7680;
 const D_CTX: usize = 9216;
 const D_O: usize = 10752;
 const D_P: usize = 12288; // 4 x 1536
-// 18432..25088 free (the layer constants moved to D_DC)
-// LM head: one 64-row chunk of the embedding widened to int16 (49152 B,
-// to 74240; the arena's top 8 bytes are the crash breadcrumb). Cross K/V
-// no longer stage here: they go through the idle weight slot.
-const D_ROWS: usize = 25088;
-// 4-bit reconstruction tables for every amax (16 KB, built once per
-// decode), to 90624.
-const D_LUT16: usize = 74240;
-const _: () = assert!(D_LUT16 + 4 * crate::q4::TABLES16 <= crate::ARENA_BYTES - 8);
 // One decoder layer's constants ("dc<l>" image entry: ln1, xln and ln2
 // gamma/beta, then the four GELU tables), read once per layer per step
-// instead of seven small reads. Above everything else the decode uses.
-const D_DC: usize = 90624;
+// instead of seven small reads.
+const D_DC: usize = 18432;
 const DC_LN1: usize = 0;
 const DC_XLN: usize = 4 * 2 * C;
 const DC_LN2: usize = 2 * 4 * 2 * C;
 const DC_LUT: usize = 3 * 4 * 2 * C; // 4 x 256
 const DC_BYTES: usize = DC_LUT + 4 * 256; // 10240
-const _: () = assert!(D_DC + DC_BYTES <= crate::ARENA_BYTES - 8);
+// The rest of the arena (from 28672) is the landing zone below.
+
+// --- decode blob pipeline -----------------------------------------------------
+//
+// The per-token decoder blobs are stored 4-bit ("LAY5", model/quant4.py)
+// and linked at DEC_BASE, the top DEC_BYTES of the slot. A packed entry
+// is read by DMA into the landing zone LAND (the free top of the arena
+// and the bottom of the slot, which are contiguous) while the NPU runs
+// the previous blob at DEC_BASE; the CPU then expands it into DEC_BASE
+// through the level table. The cross-attention K/V stages and the
+// LM head's chunk buffers borrow the DEC region between blob runs. A raw
+// int8 decoder blob (an older image, linked at the slot base) does not
+// fit the landing zone and runs through the unpipelined Ctxt::npu.
+const ARENA_BASE: usize = 0x2003_2000; // memory.x ARENA (checked at decode start)
+const DEC_BYTES: usize = 152 * 1024; // largest per-token blob: 152356 B
+const DEC_OFF: usize = slot::SLOT_BYTES - DEC_BYTES; // 57344
+const DEC_BASE: usize = slot::SLOT_BASE + DEC_OFF; // 0x20059000
+const LAND_ARENA: usize = D_DC + DC_BYTES; // 28672
+const LAND_BASE: usize = ARENA_BASE + LAND_ARENA;
+const LAND_BYTES: usize = (crate::ARENA_BYTES - LAND_ARENA) + DEC_OFF; // 131072
+const _: () = assert!(ARENA_BASE + crate::ARENA_BYTES == slot::SLOT_BASE);
+const _: () = assert!(LAND_BASE % 4 == 0 && DEC_BASE % 4 == 0);
+// the crash breadcrumbs at the top of the slot are written during every
+// NPU run: nothing the decode lands, expands or stages may reach them
+const CRUMB_OFF: usize = crate::CRUMB_BASE - slot::SLOT_BASE;
+const _: () = assert!(LAND_BASE + LAND_BYTES <= crate::CRUMB_BASE);
+const _: () = assert!(SL_EXPTAB + kernels::EXP_TABLE_BYTES <= CRUMB_OFF);
+// DEC region between blob runs: the cross-attention key stages (two
+// heads alternate) and value stage; the LM head's chunk double buffer
+// (up to 49 blocks each) and its int16 rows for the 4-bit chunks.
+const DE_XK0: usize = DEC_OFF;
+const DE_XV: usize = DEC_OFF + 2 * STAGE_BYTES;
+const _: () = assert!(DE_XV + STAGE_BYTES <= CRUMB_OFF);
+const DE_CHUNK: usize = DEC_OFF;
+const DE_ROWS: usize = DEC_OFF + 2 * 49 * storage::BLOCK;
+const _: () = assert!(DE_ROWS + 2 * 64 * C <= CRUMB_OFF);
+// Interlayer buffer during decode: attention scratch below IL_KEEP (what
+// a blob may touch: checked against each blob's declared use), then the
+// level expansion table and the 4-bit LM-head tables, persistent for the
+// whole decode (nothing else touches the interlayer between the runs).
+const IL_KEEP: usize = 16384;
+const IL_LVL: usize = IL_KEEP;
+const IL_LUT16: usize = IL_LVL + 2 * crate::q4::LVL_TABLE_LEN; // 49152
+const _: () = assert!(IL_LUT16 + 4 * crate::q4::TABLES16 <= crate::INTERLAYER_BUFFER_BYTES);
+const _: () = assert!(core::mem::size_of::<kernels::AttnScratch>() <= IL_KEEP);
+const _: () = assert!(core::mem::size_of::<kernels::AttnScratch2>() <= IL_KEEP);
 
 fn lut16_tables() -> &'static mut [u32; crate::q4::TABLES16] {
-    unsafe { &mut *(arena_addr(D_LUT16) as *mut [u32; crate::q4::TABLES16]) }
+    let b = interlayer_at(IL_LUT16, 4 * crate::q4::TABLES16);
+    unsafe { &mut *(b.as_mut_ptr() as *mut [u32; crate::q4::TABLES16]) }
+}
+
+fn lvl_table() -> &'static mut [u16; crate::q4::LVL_TABLE_LEN] {
+    let b = interlayer_at(IL_LVL, 2 * crate::q4::LVL_TABLE_LEN);
+    unsafe { &mut *(b.as_mut_ptr() as *mut [u16; crate::q4::LVL_TABLE_LEN]) }
+}
+
+fn land_u8(len: usize) -> &'static mut [u8] {
+    assert!(len <= LAND_BYTES);
+    unsafe { core::slice::from_raw_parts_mut(LAND_BASE as *mut u8, len) }
+}
+
+/// Packed decoder blobs flow through here (see the constants above).
+struct Pipe {
+    /// Entry whose packed bytes are complete in LAND.
+    landed: Option<(Entry, usize)>,
+    /// Entry whose read into LAND is in flight.
+    pending: Option<(Entry, usize)>,
+}
+
+impl Pipe {
+    const fn new() -> Pipe {
+        Pipe { landed: None, pending: None }
+    }
+
+    /// Whether an entry fits the landing zone (packed); raw blobs do not.
+    fn packed(e: Entry) -> bool {
+        (e.len as usize) <= LAND_BYTES
+    }
+
+    /// Start reading `name` into LAND (nothing else may be pending).
+    fn prefetch(&mut self, name: &str) -> Result<(), i32> {
+        let (e, idx) = match lookup_idx(name) {
+            Some(x) => x,
+            None => {
+                rprintln!("no blob {}", name);
+                return Err(-904);
+            }
+        };
+        if !Self::packed(e) || self.pending.is_some() {
+            return Ok(());
+        }
+        let bytes = e.len.div_ceil(storage::BLOCK as u32) as usize * storage::BLOCK;
+        io_start(true, e.lba, land_u8(bytes), "blob prefetch")?;
+        self.pending = Some((e, idx));
+        Ok(())
+    }
+
+    /// Wait for a pending prefetch, so blocking transfers may follow.
+    fn settle(&mut self) -> Result<(), i32> {
+        if let Some(p) = self.pending.take() {
+            io_wait("blob prefetch")?;
+            self.landed = Some(p);
+        }
+        Ok(())
+    }
+
+    /// Run blob `name` on arena offsets: land it if it is not yet (read,
+    /// sum-verified with retries), expand it into DEC_BASE, start the
+    /// read of `next`, then infer.
+    fn run(&mut self, c: &mut Ctxt, name: &str, input: usize, output: usize,
+           next: Option<&str>) -> i32 {
+        let (e, idx) = match lookup_idx(name) {
+            Some(x) => x,
+            None => {
+                rprintln!("no blob {}", name);
+                return -904;
+            }
+        };
+        // this entry's read in flight: expand it behind the DMA (any
+        // other pending read is waited for first)
+        let chase = self.pending.map(|(p, _)| p.lba) == Some(e.lba);
+        if !chase {
+            if let Err(rc) = self.settle() {
+                return rc;
+            }
+        }
+        if !Self::packed(e) {
+            self.landed = None;
+            return c.npu(name, input, output);
+        }
+        let blocks = e.len.div_ceil(storage::BLOCK as u32);
+        let expect = unsafe { (*core::ptr::addr_of!(SUMS))[idx] };
+        let mut ok = false;
+        if chase {
+            self.pending = None;
+            self.landed = None;
+            match chase_landing(e) {
+                Ok(sum) if expect == 0 || sum == expect => ok = true,
+                Ok(sum) => rprintln!("blob {} sum mismatch (got {:#x} want {:#x}, chased)",
+                                     name, sum, expect),
+                Err(rc) => return rc,
+            }
+            if ok {
+                if let Err(rc) = verify_expanded(idx) {
+                    return rc;
+                }
+            }
+        }
+        for attempt in 0..3 {
+            if ok {
+                break;
+            }
+            if self.landed.map(|(l, _)| l.lba) != Some(e.lba) {
+                let rc = storage::read_blocks(e.lba, LAND_BASE as *mut u8, blocks);
+                if rc != 0 {
+                    return rc;
+                }
+                self.landed = Some((e, idx));
+            }
+            let t0 = cycles();
+            let sum = dsp::byte_sum(land_u8(e.len as usize));
+            prof_add(P_SUM, t0);
+            if expect == 0 || sum == expect {
+                let t0 = cycles();
+                let rc = expand_landed(e);
+                prof_add(P_UNPACK, t0);
+                if let Err(rc) = rc {
+                    return rc;
+                }
+                if let Err(rc) = verify_expanded(idx) {
+                    return rc;
+                }
+                ok = true;
+                break;
+            }
+            rprintln!("blob {} sum mismatch (got {:#x} want {:#x}, try {})",
+                      name, sum, expect, attempt + 1);
+            self.landed = None;
+        }
+        if !ok {
+            return -905;
+        }
+        self.landed = None;
+        if let Some(n) = next {
+            if let Err(rc) = self.prefetch(n) {
+                return rc;
+            }
+        }
+        let _wd = crate::WdogGuard::arm();
+        let t0 = cycles();
+        let rc = unsafe {
+            slot::run_at(DEC_BASE, arena_addr(input), arena_addr(output), name)
+        };
+        prof_add(P_NPU, t0);
+        rc
+    }
+}
+
+/// Check every expansion against the header's raw sum instead of once
+/// per boot per entry (validation builds: proves the DMA chase never
+/// reads a byte before it has landed; ~0.9 ms per blob).
+const VERIFY_EVERY_EXPANSION: bool = false;
+
+/// The validated "LAY5" header of the entry in LAND:
+/// (raw_len, w_off, n_weights, raw_sum).
+fn lay5_header(e: Entry) -> Result<(usize, usize, usize, u32), i32> {
+    let p = LAND_BASE as *const u8;
+    let word = |i: usize| -> usize { unsafe { *(p.add(i * 4) as *const u32) as usize } };
+    if word(0) != crate::q4::MAGIC5 as usize {
+        rprintln!("blob: not a LAY5 entry ({:#x})", word(0));
+        return Err(-906);
+    }
+    let (raw_len, w_off, n) = (word(1), word(2), word(3));
+    let raw_sum = word(4) as u32;
+    let base = word(5);
+    let n_groups = n / crate::q4::GL;
+    if base != DEC_BASE
+        || w_off + n != raw_len
+        || DEC_OFF + raw_len > CRUMB_OFF
+        || w_off % 4 != 0
+        || n % (2 * crate::q4::GL) != 0
+        || crate::q4::HDR5 + w_off + n_groups + n / 2 != e.len as usize
+    {
+        rprintln!("blob unpack: bad LAY5 header");
+        return Err(-906);
+    }
+    Ok((raw_len, w_off, n, raw_sum))
+}
+
+/// Expand groups [from, to) of the entry in LAND into the raw blob at
+/// DEC_BASE (the head has been copied).
+fn expand_groups(w_off: usize, n_groups: usize, from: usize, to: usize) {
+    let p = LAND_BASE as *const u8;
+    let codes = crate::q4::HDR5 + w_off;
+    let nibs = codes + n_groups;
+    unsafe {
+        crate::q4::expand_lvl(
+            lvl_table(),
+            p.add(codes + from),
+            to - from,
+            p.add(nibs + from * crate::q4::GL / 2),
+            (DEC_BASE + w_off + from * crate::q4::GL) as *mut u8,
+        );
+    }
+}
+
+/// Expand the "LAY5" entry that is complete in LAND into the raw blob at
+/// DEC_BASE: head verbatim, then the level-coded weights through the
+/// table.
+fn expand_landed(e: Entry) -> Result<(), i32> {
+    let (_, w_off, n, _) = lay5_header(e)?;
+    let n_groups = n / crate::q4::GL;
+    unsafe {
+        core::ptr::copy_nonoverlapping((LAND_BASE + crate::q4::HDR5) as *const u8,
+                                       DEC_BASE as *mut u8, w_off);
+    }
+    expand_groups(w_off, n_groups, 0, n_groups);
+    Ok(())
+}
+
+/// Expand the "LAY5" entry whose read into LAND is in flight, behind the
+/// DMA: header, head and each group as soon as storage::landed() covers
+/// it, and the packed byte sum the same way. Waits for the transfer at
+/// the end and returns the sum (the caller compares it with the image's).
+/// On the rig this hides the expansion (2.6 ms) and the sum (0.4 ms) of
+/// an 88 KB blob under its own 4 ms read.
+/// Chase statistics for the phase line: blobs chased, bytes landed at
+/// the first poll, nibble bytes expanded before the transfer completed,
+/// loop iterations. Tells how much of a blob's read the NPU run hid and
+/// how much of the expansion the read hid.
+static mut CHASE_STATS: [u64; 4] = [0; 4];
+
+fn chase_landing(e: Entry) -> Result<u32, i32> {
+    let len = e.len as usize;
+    let mut first_got: Option<usize> = None;
+    let mut pre_done_groups = 0usize;
+    let mut iters = 0u64;
+    let mut hdr: Option<(usize, usize)> = None; // (w_off, n_groups)
+    let mut head_done = false;
+    let mut groups = 0usize;
+    let mut summed = 0usize;
+    let mut sum = 0u32;
+    loop {
+        let done = storage::poll();
+        // whole 32-byte units, for the word-wise byte sum
+        let got = if done { len } else { storage::landed().min(len) & !31 };
+        iters += 1;
+        if first_got.is_none() {
+            first_got = Some(got);
+        }
+        if hdr.is_none() && got >= crate::q4::HDR5 {
+            match lay5_header(e) {
+                Ok((_, w_off, n, _)) => hdr = Some((w_off, n / crate::q4::GL)),
+                Err(rc) => {
+                    let _ = storage::finish();
+                    return Err(rc);
+                }
+            }
+        }
+        if let Some((w_off, n_groups)) = hdr {
+            let nib_off = crate::q4::HDR5 + w_off + n_groups;
+            if !head_done && got >= nib_off {
+                unsafe {
+                    core::ptr::copy_nonoverlapping((LAND_BASE + crate::q4::HDR5) as *const u8,
+                                                   DEC_BASE as *mut u8, w_off);
+                }
+                head_done = true;
+            }
+            if head_done {
+                let avail = (got.saturating_sub(nib_off) / (crate::q4::GL / 2)).min(n_groups);
+                if avail > groups {
+                    let t0 = cycles();
+                    expand_groups(w_off, n_groups, groups, avail);
+                    prof_add(P_UNPACK, t0);
+                    groups = avail;
+                }
+            }
+        }
+        if got > summed {
+            let t0 = cycles();
+            sum = sum.wrapping_add(dsp::byte_sum(&land_u8(got)[summed..got]));
+            prof_add(P_SUM, t0);
+            summed = got;
+        }
+        if done {
+            break;
+        }
+        pre_done_groups = groups;
+    }
+    let rc = storage::finish();
+    if rc != 0 {
+        rprintln!("FAIL blob prefetch rc={}", rc);
+        return Err(rc);
+    }
+    unsafe {
+        let st = &mut *core::ptr::addr_of_mut!(CHASE_STATS);
+        st[0] += 1;
+        st[1] += first_got.unwrap_or(0) as u64;
+        st[2] += (pre_done_groups * crate::q4::GL / 2) as u64;
+        st[3] += iters;
+    }
+    match hdr {
+        Some((_, n_groups)) if head_done && groups == n_groups && summed == len => Ok(sum),
+        _ => {
+            rprintln!("blob chase: incomplete ({} of {} B)", summed, len);
+            Err(-906)
+        }
+    }
+}
+
+/// Once per boot per entry (or always, VERIFY_EVERY_EXPANSION): the
+/// expansion at DEC_BASE against the header's raw sum (packer/expander
+/// drift, a byte read before it landed) and the blob's declared
+/// interlayer use against IL_KEEP (the tables parked above it must
+/// survive its run).
+fn verify_expanded(idx: usize) -> Result<(), i32> {
+    let seen = unsafe { (*core::ptr::addr_of!(Q4_VERIFIED))[idx >> 5] & (1 << (idx & 31)) != 0 };
+    if seen && !VERIFY_EVERY_EXPANSION {
+        return Ok(());
+    }
+    let p = LAND_BASE as *const u8;
+    let word = |i: usize| -> usize { unsafe { *(p.add(i * 4) as *const u32) as usize } };
+    let (raw_len, raw_sum) = (word(1), word(4) as u32);
+    let raw = unsafe { core::slice::from_raw_parts(DEC_BASE as *const u8, raw_len) };
+    let sum = dsp::byte_sum(raw);
+    if sum != raw_sum {
+        rprintln!("blob unpack sum mismatch (got {:#x} want {:#x})", sum, raw_sum);
+        return Err(-907);
+    }
+    match unsafe { slot::interlayer_needed(DEC_BASE) } {
+        Some(need) if need as usize <= IL_KEEP => {}
+        other => {
+            rprintln!("blob: interlayer use {:?} exceeds the decode limit {}", other, IL_KEEP);
+            return Err(-909);
+        }
+    }
+    unsafe { (*core::ptr::addr_of_mut!(Q4_VERIFIED))[idx >> 5] |= 1 << (idx & 31) };
+    Ok(())
 }
 
 fn sd_read_bytes(e: Entry, byte_off: usize, dst: &mut [u8]) -> i32 {
@@ -2161,9 +2460,17 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
             m.fill(0);
         }
     }
+    if arena_addr(0) as usize != ARENA_BASE {
+        rprintln!("FAIL arena not at {:#x}", ARENA_BASE);
+        return Err(-910);
+    }
+    // the slot is scratch and pipeline space from here on
+    c.loaded = Entry::default();
+    crate::q4::table_lvl(lvl_table());
     if embc8.is_none() {
         crate::q4::tables16(lut16_tables());
     }
+    let mut pipe = Pipe::new();
     let mut n_tok = 0usize; // cache length
     let mut token = plan.sot[0];
     let mut next_sot = 1usize;
@@ -2173,6 +2480,9 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
     let mut tlen = 0usize;
 
     for step in 0..(plan.n_sot - 1 + MAX_TOKENS) {
+        // the first blob's prefetch (from the previous step) must land
+        // before these blocking reads
+        pipe.settle()?;
         // x16 = quantize(embf[kept_pos(token)] + posdec[step])
         let pos_kept = kept_position(ids, token)?;
         let mut row = [0f32; C];
@@ -2198,6 +2508,7 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
         let mut sq = plan.dec_x;
         for l in 0..BLOCKS {
             let bq = plan.dec[l];
+            pipe.settle()?;
             if bundled {
                 c.asset(Name::of(&["dc", DIGITS[l]]).s(), D_DC)?;
             } else {
@@ -2210,9 +2521,11 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
                 }
             }
             dec_ln(D_X16, sq, D_DC + DC_LN1, D_LN, bq.ln1);
-            try_rc!(c.npu(dec_blob(l, "q", 0).s(), D_LN, D_Q), "dq");
-            try_rc!(c.npu(dec_blob(l, "k", 0).s(), D_LN, D_K), "dk");
-            try_rc!(c.npu(dec_blob(l, "v", 0).s(), D_LN, D_V), "dv");
+            let (nk, nv, nout) = (dec_blob(l, "k", 0), dec_blob(l, "v", 0), dec_blob(l, "out", 0));
+            let (nxq, nxout) = (dec_blob(l, "xq", 0), dec_blob(l, "xout", 0));
+            try_rc!(pipe.run(c, dec_blob(l, "q", 0).s(), D_LN, D_Q, Some(nk.s())), "dq");
+            try_rc!(pipe.run(c, nk.s(), D_LN, D_K, Some(nv.s())), "dk");
+            try_rc!(pipe.run(c, nv.s(), D_LN, D_V, Some(nout.s())), "dv");
             // append column n_tok to the cache (planar stride MAX_TOKENS)
             unsafe {
                 let kv = &mut (*core::ptr::addr_of_mut!(SELF_KV)).0;
@@ -2238,31 +2551,29 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
                     );
                 }
             }
-            try_rc!(c.npu(dec_blob(l, "out", 0).s(), D_CTX, D_O), "dout");
+            try_rc!(pipe.run(c, nout.s(), D_CTX, D_O, Some(nxq.s())), "dout");
             dec_add(D_X16, sq, D_O, bq.out_out, bq.res1);
             sq = bq.res1;
 
             // cross-attention
             dec_ln(D_X16, sq, D_DC + DC_XLN, D_LN, bq.xln);
-            try_rc!(c.npu(dec_blob(l, "xq", 0).s(), D_LN, D_Q), "dxq");
+            try_rc!(pipe.run(c, nxq.s(), D_LN, D_Q, Some(nxout.s())), "dxq");
+            // the stage reads below need the channel: let dxout land first
+            pipe.settle()?;
             let smx = bq.xq_out.scale * bq.xk_out.scale / 8.0;
             // each head's K and V tile blocks: one read each, K (key-major
-            // as cross_kv wrote it) staged in the slot, which is idle
-            // between dxq and dxout, V in the arena's LM-head rows; the
-            // kernels consume both int8 layouts directly. Head h's V
-            // read runs under head h-1's compute, head h+1's K read
-            // under head h's.
+            // as cross_kv wrote it) and V staged in the DEC region, which
+            // is idle between dxq and dxout; the kernels consume both int8
+            // layouts directly. Head h's V read runs under head h-1's
+            // compute, head h+1's K read under head h's.
             let stage = c.tiles * HB;
             c.loaded = Entry::default();
             let kreg = S_XKV + (l as u32 * 2) * HREG_BLOCKS;
             let vreg = S_XKV + (l as u32 * 2 + 1) * HREG_BLOCKS;
-            // the two K stages sit where the encoder keeps its widened
-            // keys and values, unused at decode
-            const _: () = assert!(2 * STAGE_BYTES <= SL_STAGE);
-            let kbuf = |h: usize| slot_u8(SL_XK + (h % 2) * STAGE_BYTES, stage);
+            let kbuf = |h: usize| slot_u8(DE_XK0 + (h % 2) * STAGE_BYTES, stage);
             io_start(true, c.lba(kreg, 0), kbuf(0), "xk rd")?;
             io_wait("xk rd")?;
-            io_start(true, c.lba(vreg, 0), arena(D_ROWS, stage), "xv rd")?;
+            io_start(true, c.lba(vreg, 0), slot_u8(DE_XV, stage), "xv rd")?;
             for h in 0..HEADS {
                 io_wait("xv rd")?;
                 if h + 1 < HEADS {
@@ -2271,8 +2582,8 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
                 let t0 = cycles();
                 kernels::attn_head_x1_i8(
                     &as_i8(D_Q, C * W4)[h * HD * W4..(h + 1) * HD * W4],
-                    slot_i8(SL_XK + (h % 2) * STAGE_BYTES, stage),
-                    as_i8(D_ROWS, stage), c.ctx,
+                    slot_i8(DE_XK0 + (h % 2) * STAGE_BYTES, stage),
+                    slot_i8(DE_XV, stage), c.ctx,
                     &mut as_i8_mut(D_CTX, C * W4)[h * HD * W4..(h + 1) * HD * W4],
                     W4, bq.xq_out.zp, bq.xk_out.zp, bq.xv_out.zp,
                     smx, bq.xv_out.scale, bq.xctx, attn_scratch2(),
@@ -2282,19 +2593,31 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
                 if h + 1 < HEADS {
                     io_wait("xk rd")?;
                     io_start(true, c.lba(vreg, (h + 1) * N_TILES * HB),
-                             arena(D_ROWS, stage), "xv rd")?;
+                             slot_u8(DE_XV, stage), "xv rd")?;
                 }
             }
-            try_rc!(c.npu(dec_blob(l, "xout", 0).s(), D_CTX, D_O), "dxout");
+            let nf = dec_blob(l, "fc1", 0);
+            try_rc!(pipe.run(c, nxout.s(), D_CTX, D_O, Some(nf.s())), "dxout");
             dec_add(D_X16, sq, D_O, bq.xout_out, bq.res2);
             sq = bq.res2;
 
             // mlp
             dec_ln(D_X16, sq, D_DC + DC_LN2, D_LN, bq.ln2);
             for j in 0..4usize {
-                try_rc!(c.npu(dec_blob(l, "fc1", j).s(), D_LN, D_Q), "dfc1");
+                let n2 = dec_blob(l, "fc2p", j);
+                try_rc!(pipe.run(c, dec_blob(l, "fc1", j).s(), D_LN, D_Q, Some(n2.s())),
+                        "dfc1");
                 lut_apply(D_DC + DC_LUT + j * 256, D_Q, C * W4);
-                try_rc!(c.npu(dec_blob(l, "fc2p", j).s(), D_Q, D_P + j * C * W4),
+                // after the last partial: the next layer's q, or the next
+                // step's first blob
+                let after = if j < 3 {
+                    dec_blob(l, "fc1", j + 1)
+                } else if l + 1 < BLOCKS {
+                    dec_blob(l + 1, "q", 0)
+                } else {
+                    dec_blob(0, "q", 0)
+                };
+                try_rc!(pipe.run(c, n2.s(), D_Q, D_P + j * C * W4, Some(after.s())),
                         "dfc2p");
             }
             {
@@ -2321,7 +2644,10 @@ fn decode(plan: &Plan, c: &mut Ctxt) -> Result<(), i32> {
             continue;
         }
 
-        // LM head on the CPU: f32 layernorm + pruned-vocab argmax
+        // LM head on the CPU: f32 layernorm + pruned-vocab argmax (its
+        // reads need the channel; the chunk buffers sit in DEC)
+        pipe.settle()?;
+        c.loaded = Entry::default();
         let mut gb = [0u8; 3072];
         try_rc!(storage::read_blocks(fin.lba, gb.as_mut_ptr(), 6), "fin gb");
         let mut hid = [0f32; C];
@@ -2419,10 +2745,9 @@ fn lm_head(plan: &Plan, embc4: Entry, embc8: Option<Entry>, hid: &[f32; C],
     const CH_ROWS: usize = 2 * ROWS * 4; // i8[64][384]
     const CH8_BLOCKS: usize = (CH_ROWS + ROWS * C) / storage::BLOCK;
     const _: () = assert!((CH_ROWS + ROWS * C) % storage::BLOCK == 0 && CH8_BLOCKS == 49);
-    // packed chunks alternate between two interlayer buffers (transient
-    // use between NPU runs): chunk i+1 streams in while chunk i is
-    // unpacked and dotted
-    const _: () = assert!(2 * CH8_BLOCKS * storage::BLOCK <= crate::INTERLAYER_BUFFER_BYTES);
+    // chunks alternate between two buffers in the idle DEC region: chunk
+    // i+1 streams in while chunk i is unpacked and dotted
+    const _: () = assert!(DE_CHUNK + 2 * CH8_BLOCKS * storage::BLOCK <= DE_ROWS);
 
     let (embc, ch_blocks) = match embc8 {
         Some(e) => (e, CH8_BLOCKS),
@@ -2449,16 +2774,16 @@ fn lm_head(plan: &Plan, embc4: Entry, embc8: Option<Entry>, hid: &[f32; C],
     let mut best2 = f32::MIN;
     let mut best_id = plan.eot;
     let mut best_pos = 0usize; // its kept position (= row index)
-    let rows16 = as_i16_mut(D_ROWS, ROWS * C);
+    let rows16 = slot_i16(DE_ROWS, ROWS * C);
     let n_chunks = plan.vocab_n.div_ceil(ROWS);
-    io_start(true, embc.lba, interlayer_at(0, ch_bytes), "embc rd")?;
+    io_start(true, embc.lba, slot_u8(DE_CHUNK, ch_bytes), "embc rd")?;
     for chunk in 0..n_chunks {
         io_wait("embc rd")?;
         if chunk + 1 < n_chunks {
             io_start(true, embc.lba + ((chunk + 1) * ch_blocks) as u32,
-                     interlayer_at(((chunk + 1) % 2) * ch_bytes, ch_bytes), "embc rd")?;
+                     slot_u8(DE_CHUNK + ((chunk + 1) % 2) * ch_bytes, ch_bytes), "embc rd")?;
         }
-        let il = interlayer_at((chunk % 2) * ch_bytes, ch_bytes);
+        let il = slot_u8(DE_CHUNK + (chunk % 2) * ch_bytes, ch_bytes);
         if !int8 {
             let t0 = cycles();
             crate::q4::unpack16(lut16_tables(), &il[CH_AMAX..CH_NIBS], &il[CH_NIBS..CH4_USED],

@@ -74,7 +74,8 @@ class Tape:
         self.off = (self.off + align - 1) & ~(align - 1)
         addr = ARENA_BASE + self.off
         self.off += size
-        # top 8 bytes are the firmware's crash breadcrumb
+        # top 8 bytes stay reserved (they held the crash breadcrumbs
+        # before those moved to the top of the slot)
         assert self.off <= ARENA_BYTES - 8, "arena overflow"
         return addr
 

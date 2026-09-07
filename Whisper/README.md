@@ -94,6 +94,10 @@ activations| ORCH
         layered.py       the layered engine: float / calib / int8 backends
         simulate.py      4-stage feasibility ladder (see below)
         export.py        int8 TFLite submodel emission for the Axon compiler
+        quant4.py        4-bit weight codings (LM-head chunks, decoder blobs)
+        quant4_gate.py   multi-clip transcript gate for the 4-bit decoder;
+                         writes the requantized tflites compile_q4l.sh compiles
+        make_sd_image.py the storage image (blobs, tables, plan, vocabulary)
     firmware/   bare-metal Rust step executor: mailbox protocol, CPU glue
                 kernels, runtime slot loader; reuses ../npu platform layer
         tools/make-blob.sh   Axon header -> runtime-loadable slot blob
@@ -280,7 +284,9 @@ can read it (mel, encoder output, cross K/V, and the recorded PCM).
 
 The daemon waits for the board to enumerate and survives reflashes, so the
 loop is just `cargo run` again. `--no-audio` clears the injection and the
-device records from the microphone as usual. Analysis:
+device records from the microphone as usual; `--throttle 28` paces read
+payloads like a 28 MB/s stick (the pipelines that hide work under a
+transfer show their stick behavior only then). Analysis:
 
     cd model && pixi run python mock_compare.py out/mock-work.img
 
@@ -309,6 +315,11 @@ calibration set is future work (see NOTES).
     # Axon-compile a submodel (uses the npu project's container):
     INSTALL_DIR=$PWD/out/axon-headers \
       ../../npu/tools/compile-model.sh out/submodels/wq0.tflite wq0 131072 32768
+    # 4-bit decoder blobs: gate the coding on several clips (writes the
+    # requantized tflites), compile them, then build the image
+    PYTHONPATH=. pixi run python quant4_gate.py
+    ./compile_q4l.sh
+    pixi run python make_sd_image.py
 
     cd ../firmware
     cargo build           # the step executor (no model linked at build time)

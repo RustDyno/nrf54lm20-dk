@@ -905,6 +905,15 @@ fn recv_arm_next(x: &mut Xfer) {
     x.want = ep_out_arm(x.dma + x.off as u32, n);
 }
 
+/// Bytes of a running receive known to be in memory: the packets the core
+/// has written out of its FIFO (DOEPTSIZ.XferSize counts the programmed
+/// run down per packet) behind a two-packet margin for a write still on
+/// its way through the bus.
+pub fn recv_landed(x: &Xfer) -> usize {
+    let left = unsafe { read_volatile(doep(EP_BULK, EP_TSIZ)) } as usize & 0x7FFFF;
+    (x.off + x.want.saturating_sub(left)).saturating_sub(2 * MPS_BULK).min(x.len)
+}
+
 /// None while still receiving; Some(rc) once `len` bytes have landed.
 pub fn recv_check(x: &mut Xfer) -> Option<i32> {
     match ep_out_check(x.want, &mut x.budget)? {

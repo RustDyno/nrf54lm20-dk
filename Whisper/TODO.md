@@ -150,6 +150,32 @@ at G=32 with a word-wise expansion, regated; or batched positions), the
 LM head reads, encoder attention at ~1.2 cycles/MAC (2x3 blocking or
 NPU-side QK/PV), the residual/layernorm passes on the stick.
 
+## 9. DONE 2026-09-06: speed pass 8 (rig 47.7 -> 45.5 s; 52.6 -> 47.8 s paced like a stick)
+
+Per-token decoder blobs ship 4-bit again ("LAY5": level-coded, groups of
+16 with an odd scale chosen by error search, 87.9 KB per blob against
+152.4), compiled from the requantized tflites because the Axon compiler
+folds -zp_in * sum(w) into the command stream's bias words (the real
+cause of the 2026-09-01 constant-token decode; the in-place expander was
+innocent). Blobs linked at the top of the slot; the next blob's packed
+bytes land in a 128 KB zone across the arena top and slot bottom during
+the NPU run and are expanded behind the DMA (storage::landed reads the
+DWC2 transfer counter). Gate: quant4_gate.py, 7 of 8 clips identical to
+int8. Every chased expansion verified on the rig (VERIFY_EVERY_EXPANSION
+build, also with the daemon paced to 28 MB/s). Numbers in speedup.md 15,
+design in NOTES.md, summary in TODO_complete.md.
+
+Not measured on the stick: the whole pass (4.8 s per utterance with the
+mock daemon paced to 28 MB/s, pass-7 firmware + int8 image against pass
+8 + LAY5 image; the stick's command latency is not modeled). The stick image
+needs a re-dd (LAY5 entries; blobs linked at 0x20059000) with the release
+firmware; run a VERIFY_EVERY_EXPANSION build there once to confirm the
+chase margin against the host-mode counter.
+
+Next levers (speedup.md 15): asm expander (~1 s rig only), payload-first
+mock protocol (rig fidelity), a nibble dot kernel for 4-bit LM-head rows
+(~1 s, gated), the encoder items of section 14.
+
 ## 1. Application-class SD card (zero code)
 
 Reads run at 3.3 MB/s everywhere, but writes crawl at 103-278 KB/s
@@ -162,7 +188,17 @@ numbers in the `sd[encoder]` / `sd[cross]` lines are the only ones to
 watch; expect most of the 22 s back if the card is the limit.
 
 ## RESOLVED 2026-09-01: constant-token decode = in-place 4-bit
-## expansion (unpack_slot)
+## expansion (unpack_slot) -- CORRECTED 2026-09-05, see below
+
+Correction (speed pass 8): the in-place expansion was not the cause. The
+Axon compiler folds -zp_in * sum(w) per output channel into the command
+stream's bias words, so any requantized filter inside a compiled int8
+blob runs with a stale bias (1-2 LSB per channel, exactly the "broad,
+sum-preserving" error below). The 4-bit LM head worked because it never
+went through the NPU. Fix shipped in pass 8: compile the blobs from the
+requantized tflites (compile_q4l.sh). The analysis below is kept as the
+record of the hunt; options B and C were never needed, D became
+quant4_gate.py.
 
 The since-the-4-bit-change freeze (one token every step -- " Pitt"/"uss"
 -- regardless of audio) is the IN-PLACE per-token weight expansion

@@ -243,3 +243,35 @@ rebuilt (embc4 replaces embp4; old cards need a re-dd).
 - Rig (JFK clip, ctx 582): processing 53.4 -> 47.6 s, encoder 32.8 ->
   28.1 s, decode 0.733 -> 0.683 s/step; every scratch region, hidden
   vector and token id identical to the baseline (speedup.md 14).
+
+## 2026-09-06: speed pass 8
+
+- Root cause of the 2026-09-01 constant-token decode found: the Axon
+  compiler folds -zp_in * sum(w) into per-channel bias words of the
+  command stream, so requantized filter bytes inside a compiled blob ran
+  with a stale bias. 4-bit blobs are now compiled from requantized
+  tflites (quant4_gate.py -> out/submodels-q4l, compile_q4l.sh ->
+  out/blobs-q4l linked at DEC_BASE).
+- quant4.py / q4.rs: level coding "LAY5" (GL = 16, odd scale as a 6-bit
+  code, error-searched), pair-table expander q4::expand_lvl; q4check
+  replays level-coded vectors and the table bit for bit.
+- quant4_gate.py: eight-clip transcript gate (JFK, three perturbations,
+  four microphone captures): 7 of 8 identical to int8, the eighth a
+  degenerate repetition ending earlier.
+- app.rs decode: blobs at the slot top (DEC_BASE), 128 KB landing zone
+  across the arena top and slot bottom (D_DC moved, stages and LM-head
+  buffers into the DEC region, interlayer split at IL_KEEP with a
+  per-blob check), Pipe (prefetch / settle / run), chase_landing behind
+  storage::landed() (DWC2 XferSize in usb.rs and usbdev.rs), verify once
+  per boot or always (VERIFY_EVERY_EXPANSION); "chase:" statistics line.
+- main.rs: crash breadcrumbs moved from the arena top to the slot top
+  (they corrupted landing transfers); make-blob.sh takes a link base and
+  keeps blobs below them.
+- make_sd_image.py: packs the q4l blobs as LAY5 (Q4L=0 for int8); image
+  47.8 MB. mockusb --throttle <MB/s> paces read payloads.
+- Rig (JFK clip, ctx 582): processing 47.7 -> 45.5 s, decode 0.683 ->
+  0.600 s/step, reads 371 -> 283 MB; transcript and token ids identical,
+  encoder-side scratch bit-identical; 1200 chased expansions verified
+  against their raw sums at USB speed and at 28 MB/s. Paced to 28 MB/s
+  (stick-like): 52.6 -> 47.8 s, decode 0.858 -> 0.671 s/step
+  (speedup.md 15).

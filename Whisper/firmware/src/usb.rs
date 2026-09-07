@@ -1101,6 +1101,26 @@ fn async_arm_chunk() {
     a.start = cortex_m::peripheral::DWT::cycle_count();
 }
 
+/// Bytes of the pending read known to be in memory: the finished chunks
+/// plus what the channel has written of the current one (HCTSIZ.XferSize
+/// counts down per packet written out of the RxFIFO), behind a two-packet
+/// margin for a write still on its way through the bus. Meaningful while
+/// xfer_poll() is false.
+pub fn xfer_landed() -> usize {
+    let a = unsafe { &*core::ptr::addr_of!(ASYNC) };
+    if !a.active {
+        return 0;
+    }
+    match a.stage {
+        Stage::Data if a.read => {
+            let left = unsafe { read_volatile(core_reg(HCTSIZ0)) } as usize & 0x7FFFF;
+            let mps = unsafe { (*core::ptr::addr_of!(DEV)).msc.mps_in } as usize;
+            (a.off + a.prog.saturating_sub(left)).saturating_sub(2 * mps).min(a.bytes)
+        }
+        _ => a.bytes,
+    }
+}
+
 /// True when the command has run to completion (rc ready for xfer_finish()).
 pub fn xfer_poll() -> bool {
     let a = unsafe { &*core::ptr::addr_of!(ASYNC) };

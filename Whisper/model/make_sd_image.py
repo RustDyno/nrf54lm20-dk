@@ -38,6 +38,11 @@ HEADER_BLOCKS = 16
 CMD_SD_INIT, CMD_SD_READ, CMD_SD_WRITE = 20, 21, 22
 ARENA_BASE = 0x2003_2000
 SLOT_BYTES = 208 * 1024  # must match firmware memory.x SLOT
+# firmware app.rs decode blob pipeline: per-token blobs are linked at the
+# top DEC_BYTES of the slot and their packed entries land in LAND_BYTES
+DEC_BYTES = 152 * 1024
+DEC_BASE = 0x2004_B000 + SLOT_BYTES - DEC_BYTES  # 0x20059000
+LAND_BYTES = 128 * 1024
 PLAN_MAGIC = 0x4E4C_5057  # "WPLN"
 VOCAB_KEEP = 12288
 MAX_TOKENS = 32
@@ -82,6 +87,21 @@ def build_vocab(sd, ref, suppress, tok):
         "embf": emb.astype("<f4").tobytes(),
         "vocabtb": vocabtb,
     }, len(kept)
+
+
+def filter_bytes(tflite_path):
+    """The bytes of a submodel's one 384x384 int8 filter tensor."""
+    import tensorflow as tf
+
+    interp = tf.lite.Interpreter(model_path=tflite_path)
+    interp.allocate_tensors()
+    for d in interp.get_tensor_details():
+        if d["dtype"] == np.int8 and int(np.prod(d["shape"])) == 384 * 384:
+            try:
+                return interp.get_tensor(d["index"]).tobytes()
+            except ValueError:
+                pass
+    raise AssertionError(f"no filter tensor in {tflite_path}")
 
 
 def pack_emb8(q, scl, ids):
@@ -228,13 +248,16 @@ def main():
     entries += sorted(vocab.items())
     entries += sorted(encoder_assets(sd, scales, mq_enc, conv1, conv2).items())
 
-    # 4-bit pack the per-token decoder blobs (quality gate: quant4_check,
-    # transcript identical at G=64). The stored entry becomes "LAY4"
-    # header (incl. the raw-content sum) + verbatim head + amax/nibbles;
-    # the firmware expands it in place in the slot and verifies the
-    # expansion once per boot. Weight offsets are found by exact
-    # byte-search of each submodel's filter tensor (verified verbatim +
-    # tail-positioned in every decoder blob).
+    # The per-token decoder blobs ship 4-bit ("LAY5", quant4.py): the
+    # level-coded weights are requantized in the tflite (quant4_gate.py ->
+    # out/submodels-q4l) and the blob recompiled from that (compile_q4l.sh
+    # -> out/blobs-q4l, linked at DEC_BASE), because the Axon compiler
+    # folds -zp_in * sum(w) per output channel into the command stream's
+    # bias words: patching the filter bytes of the int8 blob would leave
+    # that term stale (the 2026-09-01 constant-token decode). The firmware
+    # reads the packed entry into a landing zone and expands it at
+    # DEC_BASE while the NPU runs the previous blob. Q4L=0 ships the int8
+    # blobs instead (the firmware runs them unpipelined at the slot base).
     per_token = {}
     for l in range(common.N_LAYERS):
         for k, name in common.decoder_submodel_names(l).items():
@@ -242,41 +265,22 @@ def main():
                 per_token[name] = mq_dec[l][k]
     packed_n = 0
     saved = 0
-    # Decoder blobs ship RAW int8 by default. The in-place slot expansion
-    # (unpack_slot) feeds the NPU slightly-wrong weights and freezes decode
-    # into a constant token (verified 2026-09-01; raw int8 decodes cleanly,
-    # 4-bit does not). The LM-head chunks (embc4) expand into a disjoint
-    # buffer and are fine, so they stay 4-bit below. Set Q4_PACK=1 to re-enable per-token
-    # packing once the in-place path is fixed (disjoint expansion / barrier).
-    pack_q4 = bool(os.environ.get("Q4_PACK"))
+    pack_q4 = os.environ.get("Q4L", "1") != "0"
     for i, (name, data) in enumerate(entries):
-        sm = per_token.get(name)
-        if sm is None:
+        if name not in per_token or not pack_q4:
             continue
-        if not pack_q4:
-            continue
-        w = None
-        for d in sm.interp.get_tensor_details():
-            if d["dtype"] == np.int8 and int(np.prod(d["shape"])) == 384 * 384:
-                try:
-                    w = sm.interp.get_tensor(d["index"])
-                except ValueError:
-                    pass
-        assert w is not None, name
-        b = w.tobytes()
-        assert data.count(b) == 1, name
-        w_off = data.find(b)
-        assert w_off + len(b) == len(data), f"{name}: weights not at tail"
-        packed = quant4.pack_blob(data, w_off)
-        n = len(data) - w_off
-        # firmware expands from the slot tail: nibble stream must start
-        # at least n/2 bytes past the weight region (see app.rs)
-        tail = SLOT_BYTES - (len(packed) + BLOCK - 1) // BLOCK * BLOCK
-        hdr = 20
-        assert len(data) <= tail + hdr + w_off + n // quant4.G + n // 2, name
-        assert w_off <= tail, name
+        with open(os.path.join(out, "blobs-q4l", f"{name}.bin"), "rb") as f:
+            blob = f.read()
+        w = filter_bytes(os.path.join(out, "submodels-q4l", f"{name}.tflite"))
+        assert blob.count(w) == 1, f"{name}: level-coded filter not in the q4l blob"
+        w_off = blob.find(w)
+        assert w_off + len(w) == len(blob), f"{name}: weights not at tail"
+        assert w_off % 4 == 0 and len(blob) <= DEC_BYTES, name
+        assert data.count(w) == 0, f"{name}: int8 blob carries the q4l filter?"
+        packed = quant4.pack_blob_lvl(blob, w_off, DEC_BASE)
+        assert len(packed) <= LAND_BYTES, name
         packed_n += 1
-        saved += len(data) - len(packed)
+        saved += len(blob) - len(packed)
         entries[i] = (name, packed)
     emb_q = np.frombuffer(vocab["embp"], np.int8).reshape(-1, 384)
     embc = quant4.pack_emb(emb_q,
@@ -289,8 +293,8 @@ def main():
         entries.append(("embc8", pack_emb8(
             emb_q, np.frombuffer(vocab["embpscl"], "<f4"),
             np.frombuffer(vocab["embpids"], "<u4"))))
-    print(f"q4: {packed_n} decoder blobs + embc4 packed, "
-          f"{saved / 1e6:.1f} MB less SD traffic per token cycle")
+    print(f"q4: {packed_n} decoder blobs (LAY5) + embc4 packed, "
+          f"{saved / 1e6:.1f} MB less storage traffic per token cycle")
 
     # firmware match id: the buffer addresses of the ELF the blobs were
     # linked against; the firmware refuses a stale card at boot.

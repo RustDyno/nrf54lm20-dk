@@ -2,13 +2,18 @@
 #
 # Turn a generated Axon model header into a runtime-loadable slot blob.
 #
-#   tools/make-blob.sh <nrf_axon_model_NAME_.h> <firmware.elf> <out.bin>
+#   tools/make-blob.sh <nrf_axon_model_NAME_.h> <firmware.elf> <out.bin> [base]
 #
 # The header is compiled into a TU whose first bytes are a slot header
 # (magic + pointer to the model descriptor), linked at the fixed SLOT address
 # against the firmware ELF's symbol table (interlayer buffer, driver-internal
 # tables), and objcopy'd to a flat binary. The host streams the binary to
 # SLOT_BASE and issues CMD_RUN_NPU.
+#
+# `base` (hex, default the slot start 0x2004B000) links the blob at another
+# RAM address: the per-token decoder blobs live at the top of the slot
+# (firmware app.rs DEC_BASE) so the bottom can receive the next blob's
+# packed bytes while the NPU runs.
 #
 # Blobs bind to one exact firmware ELF: regenerate them after every firmware
 # change.
@@ -22,13 +27,14 @@ interlayer=65536
 psum=4096
 slot_magic=0x4C415952
 
-if [[ $# -ne 3 ]]; then
-	echo "usage: $0 <nrf_axon_model_NAME_.h> <firmware.elf> <out.bin>" >&2
+if [[ $# -lt 3 || $# -gt 4 ]]; then
+	echo "usage: $0 <nrf_axon_model_NAME_.h> <firmware.elf> <out.bin> [base]" >&2
 	exit 2
 fi
 header="$1"
 elf="$2"
 out="$3"
+base="${4:-0x2004B000}"
 
 name="$(basename "$header")"
 name="${name#nrf_axon_model_}"
@@ -69,7 +75,13 @@ arm-none-eabi-gcc -c -mcpu=cortex-m33 -mthumb -mfloat-abi=hard \
 # --just-symbols resolves interlayer/psum/driver symbols to the firmware's
 # addresses; the driver archive fills in any driver-internal data the
 # firmware image happened to garbage-collect.
-arm-none-eabi-ld -T "$here/tools/slot.ld" --just-symbols="$elf" \
+# slot.ld with the requested origin; the length shrinks by the offset so
+# the blob still ends inside the slot
+slot_end=$((0x2004B000 + 208 * 1024))
+sed -e "s/ORIGIN = 0x2004B000, LENGTH = 208K/ORIGIN = ${base}, LENGTH = $((slot_end - base))/" \
+	"$here/tools/slot.ld" >"$work/slot.ld"
+grep -q "ORIGIN = ${base}," "$work/slot.ld" || { echo "error: slot.ld rewrite failed" >&2; exit 1; }
+arm-none-eabi-ld -T "$work/slot.ld" --just-symbols="$elf" \
 	-o "$work/blob.elf" "$work/blob.o" \
 	"$vendor/lib/libnrf-axon-driver-internal-fpu.a"
 
@@ -82,9 +94,10 @@ fi
 
 arm-none-eabi-objcopy -O binary "$work/blob.elf" "$out"
 
+# the slot's top 8 bytes are the firmware's crash breadcrumbs
 size=$(stat -c%s "$out")
-if ((size > 208 * 1024)); then
-	echo "error: blob ${size} B exceeds the 208K slot" >&2
+if ((base + size > slot_end - 8)); then
+	echo "error: blob ${size} B at ${base} runs into the slot's breadcrumb words" >&2
 	exit 1
 fi
 desc=$(arm-none-eabi-nm "$work/blob.elf" | awk "/ model_${name}\$/ {print \$1}")

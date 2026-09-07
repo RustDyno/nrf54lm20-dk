@@ -197,6 +197,22 @@ pub fn poll() -> bool {
     }
 }
 
+/// Bytes of the pending read that are already in memory (a conservative
+/// count read from the DMA engine), so a consumer can start on the head
+/// of a transfer while its tail is still landing. Meaningful while
+/// poll() is false; backends without a live count report everything.
+pub fn landed() -> usize {
+    if !busy() {
+        return usize::MAX;
+    }
+    match backend() {
+        Backend::Usb => usb::xfer_landed(),
+        #[cfg(feature = "mock-usb")]
+        Backend::Mock => mockblk::xfer_landed(),
+        _ => usize::MAX,
+    }
+}
+
 /// Wait for the pending transfer and return its result (0 if none).
 pub fn finish() -> i32 {
     if !busy() {

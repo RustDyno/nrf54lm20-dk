@@ -109,14 +109,19 @@ const fn vector_table() -> [unsafe extern "C" fn(); VECTOR_SLOTS] {
 pub static __INTERRUPTS: [unsafe extern "C" fn(); VECTOR_SLOTS] = vector_table();
 
 // --- Crash breadcrumb ---------------------------------------------------------
-// Last word of the ARENA region (NOLOAD -> survives reset; the tape
-// generator never allocates it). Written at each execution milestone and
-// reported at the next boot, so a watchdog reset names its victim.
+// The last two words of the SLOT region (no section is placed there, so
+// they survive a reset; no blob or slot-borrowing phase reaches the top
+// 8 bytes -- app.rs asserts it). Written at each execution milestone and
+// reported at the next boot, so a watchdog reset names its victim. They
+// used to sit at the top of the arena, until the decode blob pipeline
+// made that part of a DMA landing zone: an NPU-phase crumb written while
+// a blob was landing corrupted the transfer.
 
-const BREADCRUMB: *mut u32 = 0x2004_AFF8 as *mut u32;
+pub const CRUMB_BASE: usize = slot::SLOT_BASE + slot::SLOT_BYTES - 8;
+const BREADCRUMB: *mut u32 = CRUMB_BASE as *mut u32;
 /// Second noinit word: the NPU slot phase (0x201 entering infer,
 /// 0x202 returned), so it no longer overwrites the pipeline stage.
-const BREADCRUMB2: *mut u32 = 0x2004_AFFC as *mut u32;
+const BREADCRUMB2: *mut u32 = (CRUMB_BASE + 4) as *mut u32;
 
 pub fn crumb(v: u32) {
     unsafe { core::ptr::write_volatile(BREADCRUMB, v) };

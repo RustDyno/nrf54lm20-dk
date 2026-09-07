@@ -2,22 +2,35 @@
 //! (keep the two in lockstep; tools/q4check cross-checks them against
 //! shared test vectors).
 //!
-//! Groups of 64 consecutive int8 weights share one u8 amax; nibbles are
+//! Groups of consecutive int8 weights share one scale byte; nibbles are
 //! stored biased (+8). Reconstruction, round-half-away-from-zero in pure
 //! integers:  w' = sign(nib) * min(127, (|nib| * amax * 2 + 7) / 14).
+//! Two codings: the LM-head chunks ("embc4") use G = 64 and the raw amax;
+//! the decoder blobs ("LAY5") use GL = 16 and a 6-bit code for an odd
+//! scale (chosen by the packer's error search), so a 64 x 256 pair table
+//! expands two weights per lookup (expand_lvl).
 //!
 //! Packed blob entry layout (little-endian u32 header words):
-//!   "LAY4" | raw_len | w_off | n_weights | raw_sum
-//!   raw[0..w_off] verbatim | amax[n/64] | nibbles[n/2]
+//!   "LAY5" | raw_len | w_off | n_weights | raw_sum | base
+//!   raw[0..w_off] verbatim | codes[n/GL] | nibbles[n/2]
 //! raw_sum is the wrapping u32 byte-sum of the RAW blob the entry
 //! expands to (head + reconstructed weights); the loader checks the
-//! expansion against it once per boot. The embedding entry (embp4) is
-//! chunks of 64 rows x 384 with the same amax|nibbles layout and no
-//! header (block-padded per chunk).
+//! expansion against it once per boot; base is the RAM address the raw
+//! blob was linked at. The embedding entry (embc4) is chunks of 64 rows
+//! x 384 with the G = 64 amax|nibbles layout and no header (block-padded
+//! per chunk).
 
 pub const G: usize = 64;
-pub const MAGIC: u32 = 0x3459_414C; // "LAY4"
-pub const HDR: usize = 20; // five u32 header words
+/// Level-coded decoder blobs ("LAY5", see model/quant4.py): groups of GL
+/// weights sharing an odd scale 1..127, stored as the 6-bit code
+/// (scale >> 1). Header: magic, raw_len, w_off, n_weights, raw_sum,
+/// base (RAM address the raw blob was linked at).
+pub const GL: usize = 16;
+pub const MAGIC5: u32 = 0x3559_414C; // "LAY5"
+pub const HDR5: usize = 24;
+/// Expansion table: u16[64 codes][256 nibble-byte values], low byte the
+/// weight of the low nibble, high byte the weight of the high nibble.
+pub const LVL_TABLE_LEN: usize = 64 * 256;
 /// Blocks per LM-head embedding chunk ("embc4": 64 f32 scales, 64 u32
 /// ids, 384 amax bytes, 12288 nibble bytes = 13184 B, block-padded).
 pub const EMB_CHUNK_BLOCKS: usize = 26;
@@ -71,12 +84,64 @@ pub fn unpack(amax: &[u8], nibs: &[u8], dst: &mut [i8]) {
     unsafe { unpack_raw(amax, nibs.as_ptr(), dst.as_mut_ptr(), n) }
 }
 
-/// `lut` widened to int16, for unpacking straight into the SMLAD
-/// operand layout of the LM head.
-#[inline]
-pub fn lut16(amax: u8) -> [i16; 16] {
-    let t = lut(amax);
-    core::array::from_fn(|k| t[k] as i16)
+/// Build the level-coded expansion table (32 KB, once per decode).
+pub fn table_lvl(out: &mut [u16; LVL_TABLE_LEN]) {
+    for c in 0..64 {
+        let a = (2 * c + 1) as i32;
+        let lut: [u8; 16] = core::array::from_fn(|k| {
+            let n = k as i32 - 8;
+            let v = (n.abs() * a * 2 + 7) / 14;
+            let v = if v > 127 { 127 } else { v };
+            (if n < 0 { -v } else { v }) as i8 as u8
+        });
+        for b in 0..256 {
+            out[c * 256 + b] = lut[b & 15] as u16 | ((lut[b >> 4] as u16) << 8);
+        }
+    }
+}
+
+/// Expand `n_groups` level-coded groups (GL weights each) from `codes`
+/// and `nibs` into `dst` (n_groups * GL bytes, 4-byte aligned).
+///
+/// Hot path of the decode blob pipeline (147456 weights per blob, 56
+/// blobs per token): each source word (8 nibbles) becomes two words of
+/// four int8 weights through the group's 256-entry pair table.
+///
+/// # Safety
+/// `codes` readable for n_groups bytes, `nibs` for n_groups * GL / 2
+/// bytes (any alignment), `dst` writable for n_groups * GL bytes and
+/// disjoint from `nibs`.
+#[inline(never)]
+pub unsafe fn expand_lvl(table: &[u16; LVL_TABLE_LEN], codes: *const u8, n_groups: usize,
+                         nibs: *const u8, dst: *mut u8) {
+    debug_assert!(dst as usize % 4 == 0);
+    let mut sp = nibs as *const u32;
+    let mut dp = dst as *mut u32;
+    for g in 0..n_groups {
+        let c = (*codes.add(g) & 63) as usize;
+        let t = table.as_ptr().add(c * 256);
+        for _ in 0..GL / 8 {
+            let b = sp.read_unaligned();
+            let w0 = *t.add((b & 255) as usize) as u32
+                | ((*t.add(((b >> 8) & 255) as usize) as u32) << 16);
+            let w1 = *t.add(((b >> 16) & 255) as usize) as u32
+                | ((*t.add((b >> 24) as usize) as u32) << 16);
+            *dp = w0;
+            *dp.add(1) = w1;
+            sp = sp.add(1);
+            dp = dp.add(2);
+        }
+    }
+}
+
+/// Safe wrapper for disjoint buffers (tools/q4check).
+#[allow(dead_code)]
+pub fn expand_lvl_slice(table: &[u16; LVL_TABLE_LEN], codes: &[u8], nibs: &[u8],
+                        dst: &mut [i8]) {
+    let n = dst.len();
+    assert!(n % GL == 0 && codes.len() >= n / GL && nibs.len() >= n / 2);
+    assert!(dst.as_ptr() as usize % 4 == 0);
+    unsafe { expand_lvl(table, codes.as_ptr(), n / GL, nibs.as_ptr(), dst.as_mut_ptr() as *mut u8) }
 }
 
 /// Reconstruction tables for every possible amax, as the u16 bit patterns
