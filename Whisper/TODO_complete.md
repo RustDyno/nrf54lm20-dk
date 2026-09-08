@@ -294,3 +294,17 @@ rebuilt (embc4 replaces embp4; old cards need a re-dd).
 - Seven feature builds pass; mock-usb release build verified on the rig
   (transcript identical, 45.17 s), USB stick and OLED verified on the
   default build (see NOTES.md "embassy-nrf HAL / PAC migration").
+
+## Drivers in embassy-nrf's form (2026-09-07/08)
+
+- vendor/embassy-nrf 0.11.0 + patches/embassy-nrf-0.11.0-nrf54lm20.patch
+  (gpio port 3, P3 alias, PDM20/PDM21 singletons) via [patch.crates-io];
+  OLED back on the HAL Twim.
+- board.rs: singletons from init(); hal/: pdm (nRF54L, blocking
+  double-buffer stream), usbhs (Platform/Host/Device, polled), spim
+  (SpimSoftCs: software CS, bit-bang phase, erratum 8), axons (chiptool
+  form + SVD patch), gpio helpers. usb.rs, usbdev.rs, sd.rs, display.rs,
+  platform.rs rebased on them; APIs toward storage.rs/mockblk.rs/app.rs
+  unchanged.
+- Verified: OLED + live utterance on hal::pdm. Pending hardware: stick
+  (hal::usbhs::host), rig (hal::usbhs::device), SD (hal::spim).

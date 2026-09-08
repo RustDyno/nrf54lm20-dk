@@ -26,3 +26,5 @@
 pub mod axons;
 pub mod gpio;
 pub mod pdm;
+pub mod spim;
+pub mod usbhs;

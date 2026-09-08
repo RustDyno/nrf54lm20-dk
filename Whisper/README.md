@@ -55,6 +55,9 @@ LN, GELU LUT, softmax,
 attn matmuls, argmax]
       SLOT[weight slot RAM]
       IL[interlayer buffer]
+      HAL[hal/: pdm, usbhs host+device,
+spim soft-CS, axons;
+embassy-nrf Twim, board.rs]
     end
     OLED[SSD1306 OLED
 TWIM22, optional]
@@ -68,6 +71,7 @@ forced-device, CDC-ACM)]
     EXEC <-->|512 B blocks, storage.rs:
 blocking or split-phase
 start/poll/finish DMA| STOR
+    EXEC -.->|peripherals| HAL
     subgraph axon [Axon NPU]
       DRV[Nordic driver blob]
       ENG[cmd-buffer engine]
@@ -100,9 +104,12 @@ activations| ORCH
         make_sd_image.py the storage image (blobs, tables, plan, vocabulary)
     firmware/   bare-metal Rust step executor: mailbox protocol, CPU glue
                 kernels, runtime slot loader; reuses ../npu platform layer.
-                System bring-up through embassy-nrf init(), peripherals
-                through its nrf-pac re-export (typed registers, polled);
-                no executor, no HAL drivers (see NOTES.md for why)
+                embassy-nrf for bring-up, GPIO and TWIM; no executor
+        board.rs         the peripheral singletons, parked from init()
+        hal/             drivers in embassy-nrf's form, upstream candidates:
+                         pdm (nRF54L), usbhs host + device (polled),
+                         spim with software CS, the AXONS block
+        vendor/embassy-nrf   0.11.0 + patches/ (port 3, PDM singletons)
         tools/make-blob.sh   Axon header -> runtime-loadable slot blob
     host/       probe-rs driver: flashes, streams blobs/activations over SWD,
                 runs the golden-vector selftest (seed of the tape orchestrator)
