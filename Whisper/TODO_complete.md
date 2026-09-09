@@ -298,8 +298,11 @@ rebuilt (embc4 replaces embp4; old cards need a re-dd).
 ## Drivers in embassy-nrf's form (2026-09-07/08)
 
 - vendor/embassy-nrf 0.11.0 + patches/embassy-nrf-0.11.0-nrf54lm20.patch
-  (gpio port 3, P3 alias, PDM20/PDM21 singletons) via [patch.crates-io];
-  OLED back on the HAL Twim.
+  (gpio port 3, P3 alias, PDM20/PDM21 singletons, PLL.CURRENTFREQ wait in
+  init(), Config::cache for the instruction cache) via [patch.crates-io],
+  with patches/README.md for the upstream rationale; OLED back on the HAL
+  Twim, main() free of OSCILLATORS/ICACHE pokes and of literal SCB
+  addresses.
 - board.rs: singletons from init(); hal/: pdm (nRF54L, blocking
   double-buffer stream), usbhs (Platform/Host/Device, polled), spim
   (SpimSoftCs: software CS, bit-bang phase, erratum 8), axons (chiptool

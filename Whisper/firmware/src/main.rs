@@ -193,15 +193,16 @@ unsafe fn HardFault(ef: &ExceptionFrame) -> ! {
         ef.r3(),
         ef.r12()
     );
-    unsafe {
-        rprintln!(
-            "  CFSR={:#010x} HFSR={:#010x} MMFAR={:#010x} BFAR={:#010x}",
-            core::ptr::read_volatile(0xE000_ED28 as *const u32),
-            core::ptr::read_volatile(0xE000_ED2C as *const u32),
-            core::ptr::read_volatile(0xE000_ED34 as *const u32),
-            core::ptr::read_volatile(0xE000_ED38 as *const u32)
-        );
-    }
+    // SAFETY: read-only access to the fault status registers, from the
+    // fault handler itself.
+    let scb = unsafe { &*cortex_m::peripheral::SCB::PTR };
+    rprintln!(
+        "  CFSR={:#010x} HFSR={:#010x} MMFAR={:#010x} BFAR={:#010x}",
+        scb.cfsr.read(),
+        scb.hfsr.read(),
+        scb.mmfar.read(),
+        scb.bfar.read()
+    );
     loop {}
 }
 
@@ -590,37 +591,28 @@ unsafe fn record(dst: *mut i16, n: usize) -> i32 {
 
 #[entry]
 fn main() -> ! {
-    // HAL bring-up. OSCILLATORS.PLL.FREQ selects the MCU-domain (CPU)
-    // clock: the device BOOTS AT 64 MHz (datasheet 5.5.3) and must be
-    // switched to 128 MHz when the CPU starts, before any high-frequency
-    // peripheral is enabled. Found the hard way: the 3 s host-grace window
-    // took 48 s on hardware. init() requests it (CK128) and also applies
-    // the FICR trim values, unlocks the debug port, disables the glitch
-    // detectors, enables the DC/DC regulator and starts the RC LFCLK --
-    // the system bring-up Zephyr does on this part. The FLPR coprocessor
-    // is left alone: nothing here loads it.
+    // HAL bring-up, all of it through init():
+    //
+    // - CK128: the device BOOTS AT 64 MHz (datasheet 5.5.3) and must be
+    //   switched to 128 MHz when the CPU starts, before any high-frequency
+    //   peripheral is enabled. Found the hard way: the 3 s host-grace
+    //   window took 48 s on hardware. init() waits for the switch.
+    // - icache: the instruction cache is DISABLED at reset, and without it
+    //   every taken branch refetches from RRAM through fixed wait states.
+    //   Measured on this loop-heavy firmware: ~16 CPU cycles per
+    //   2-instruction delay iteration, i.e. code ran ~5x slower than the
+    //   core clock suggests. Nothing here writes RRAM and then executes
+    //   it, so the cache needs no invalidation of ours.
+    // - FLPR left alone: nothing here loads the coprocessor.
+    //
+    // init() also applies the FICR trim values, unlocks the debug port,
+    // disables the glitch detectors, enables the DC/DC regulator and
+    // starts the RC LFCLK: the system bring-up Zephyr does on this part.
     let mut config = embassy_nrf::config::Config::default();
     config.clock_speed = embassy_nrf::config::ClockSpeed::CK128;
     config.flpr_reset = embassy_nrf::config::FlprReset::Leave;
+    config.cache.icache = true;
     let p = embassy_nrf::init(config);
-    // The switch takes a moment: wait for it before enabling anything
-    // clocked from it.
-    for _ in 0..1_000_000 {
-        if pac::OSCILLATORS.pll().currentfreq().read().currentfreq()
-            == pac::oscillators::vals::Currentfreq::Ck128m
-        {
-            break;
-        }
-    }
-    // The instruction cache (ICACHE, PPB region) is DISABLED at reset;
-    // without it every taken branch refetches from RRAM through fixed
-    // wait states. Measured on this loop-heavy firmware: ~16 CPU cycles
-    // per 2-instruction delay iteration, i.e. code ran ~5x slower than
-    // the core clock suggests.
-    pac::ICACHE.tasks_invalidatecache().write_value(1);
-    cortex_m::asm::delay(64);
-    pac::ICACHE.enable().write(|w| w.set_enable(true));
-    cortex_m::asm::isb();
 
     // The peripheral singletons: every driver is built from them, where
     // it is needed.

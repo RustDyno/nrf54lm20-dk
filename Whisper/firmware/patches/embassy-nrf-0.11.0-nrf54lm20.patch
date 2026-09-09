@@ -79,3 +79,80 @@ diff -ruN '--exclude=Cargo.toml.orig' '--exclude=.cargo_vcs_info.json' '--exclud
              _ => unsafe { unreachable_unchecked() },
          }
      }
+diff -ruN '--exclude=Cargo.toml.orig' '--exclude=.cargo_vcs_info.json' '--exclude=Cargo.lock' ./src/lib.rs /home/tmpk/nrf54LM20-DK/Whisper/firmware/vendor/embassy-nrf/src/lib.rs
+--- a/embassy-nrf/src/lib.rs	2006-07-23 18:21:28.000000000 -0700
++++ b/embassy-nrf/src/lib.rs	2026-09-08 18:36:18.264356244 -0700
+@@ -365,6 +365,21 @@
+         Leave,
+     }
+ 
++    /// Instruction cache configuration.
++    ///
++    /// The instruction cache is disabled at reset. With it off, every taken
++    /// branch refetches from non-volatile memory through fixed wait states,
++    /// which costs several times the core clock on branch-heavy code.
++    ///
++    /// It is left off by default because code that writes and then executes
++    /// non-volatile memory (a bootloader, a firmware updater) must invalidate
++    /// the cache itself; enable it in any application that does not.
++    #[cfg(all(feature = "_nrf54l", feature = "_s"))]
++    pub struct CacheConfig {
++        /// Enable the instruction cache.
++        pub icache: bool,
++    }
++
+     /// High frequency clock source.
+     pub enum HfclkSource {
+         /// Internal source
+@@ -646,6 +661,9 @@
+         /// FLPR (VPR coprocessor) startup behavior.
+         #[cfg(all(feature = "_nrf54l", feature = "_s"))]
+         pub flpr_reset: FlprReset,
++        /// Instruction cache configuration.
++        #[cfg(all(feature = "_nrf54l", feature = "_s"))]
++        pub cache: CacheConfig,
+     }
+ 
+     impl Default for Config {
+@@ -690,6 +708,8 @@
+                 clock_speed: ClockSpeed::CK64,
+                 #[cfg(all(feature = "_nrf54l", feature = "_s"))]
+                 flpr_reset: FlprReset::Reset,
++                #[cfg(all(feature = "_nrf54l", feature = "_s"))]
++                cache: CacheConfig { icache: false },
+             }
+         }
+     }
+@@ -821,13 +841,25 @@
+         #[cfg(feature = "_ns")]
+         let regs = pac::OSCILLATORS_NS;
+ 
+-        use pac::oscillators::vals::Freq;
+-        regs.pll().freq().write(|w| {
+-            w.set_freq(match config.clock_speed {
+-                config::ClockSpeed::CK64 => Freq::Ck64m,
+-                config::ClockSpeed::CK128 => Freq::Ck128m,
+-            });
+-        });
++        use pac::oscillators::vals::{Currentfreq, Freq};
++        let (freq, current) = match config.clock_speed {
++            config::ClockSpeed::CK64 => (Freq::Ck64m, Currentfreq::Ck64m),
++            config::ClockSpeed::CK128 => (Freq::Ck128m, Currentfreq::Ck128m),
++        };
++        regs.pll().freq().write(|w| w.set_freq(freq));
++        // The switch is not instant: peripherals clocked from this domain
++        // (and any cycle-counted delay) must not be set up until it has
++        // taken effect.
++        while regs.pll().currentfreq().read().currentfreq() != current {}
++    }
++
++    // Instruction cache. ICACHE lives in the PPB region and is secure-only.
++    #[cfg(all(feature = "_nrf54l", feature = "_s"))]
++    if config.cache.icache {
++        pac::ICACHE.tasks_invalidatecache().write_value(1);
++        cortex_m::asm::delay(64);
++        pac::ICACHE.enable().write(|w| w.set_enable(true));
++        cortex_m::asm::isb();
+     }
+ 
+     // Workaround used in the nrf mdk: file system_nrf91.c , function SystemInit(), after `#if !defined(NRF_SKIP_UICR_HFXO_WORKAROUND)`
